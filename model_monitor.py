@@ -23,12 +23,13 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
@@ -112,6 +113,11 @@ def resolve_settings(args):
         "backends": cfg.get("backends", []),  # [{name,url,type}]
         "probe_backends": args.probe_backends or bool(cfg.get("probe_backends")),
         "timeout": args.timeout,
+        # /health 는 백엔드를 전부 ping 해서 느림(수십 초) -> 별도 큰 타임아웃
+        "health": (not getattr(args, "no_health", False)
+                   and litellm.get("health", True)),
+        "health_timeout": float(
+            args.health_timeout or litellm.get("health_timeout") or 90.0),
         # --- backend 개수(LB 뒤 Pod 수) 수집 설정 ---
         "backend_count": bc_enabled,
         "k8s_api_server": (args.k8s_api_server or bc.get("api_server")),
@@ -145,11 +151,21 @@ def _classify_backend(model_name, underlying, api_base):
     return "-"
 
 
-def collect_litellm(url, api_key, timeout):
+def fetch_health(url, api_key, timeout):
+    """LiteLLM /health 만 단독 조회 (느려서 비동기로 돌릴 때 사용). dict|None."""
+    ok, data, err = http_get_json(url.rstrip("/") + "/health", api_key, timeout)
+    return data if (ok and isinstance(data, dict)) else None
+
+
+def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True):
     """LiteLLM 게이트웨이에서 모델 그룹 + deployment(api_base) + health 수집.
 
     핵심: api_base 는 /v1/models 가 아니라 /model/info 에서 나온다.
+    /health 는 모든 백엔드를 실제 ping 하므로 느리다(수십 초). with_health=False 면
+    건너뛰고, 호출측에서 fetch_health 로 비동기 수집해 주입한다.
     """
+    if health_timeout is None:
+        health_timeout = max(timeout, 90.0)
     base = url.rstrip("/")
     result = {
         "url": base,
@@ -188,12 +204,14 @@ def collect_litellm(url, api_key, timeout):
     elif err:
         result["errors"].append("model/info: %s" % err)
 
-    ok, data, err = http_get_json(base + "/health", api_key, timeout)
-    if ok and isinstance(data, dict):
-        result["reachable"] = True
-        result["health"] = data
-    elif err:
-        result["errors"].append("health: %s" % err)
+    if with_health:
+        ok, data, err = http_get_json(base + "/health", api_key, health_timeout)
+        if ok and isinstance(data, dict):
+            result["reachable"] = True
+            result["health"] = data
+        elif err:
+            result["errors"].append(
+                "health: %s (모델 많으면 --health-timeout 늘리기)" % err)
 
     ok, data, err = http_get_json(base + "/v1/models", api_key, timeout)
     if ok and isinstance(data, dict):
@@ -472,7 +490,7 @@ def count_via_endpoints(client, ns, svc):
 
 
 def detect_mode_and_revision(client, ns, svc):
-    """service 이름에서 ISVC 추정 -> deploymentMode + latestReadyRevision."""
+    """service 이름에서 ISVC 추정 -> deploymentMode + revision + found 여부."""
     isvc = svc
     for suffix in ("-predictor", "-transformer", "-explainer"):
         if isvc.endswith(suffix):
@@ -482,14 +500,52 @@ def detect_mode_and_revision(client, ns, svc):
         "/apis/serving.kserve.io/v1beta1/namespaces/%s/inferenceservices/%s"
         % (ns, isvc))
     if not ok:
-        return {"mode": "Unknown", "revision": None, "isvc": isvc}, err
+        return {"mode": "Unknown", "revision": None, "isvc": isvc,
+                "found": False}, err
     status = data.get("status") or {}
     mode = status.get("deploymentMode") or (
         data.get("metadata", {}).get("annotations", {})
         .get("serving.kserve.io/deploymentMode")) or "Unknown"
-    rev = ((status.get("components") or {}).get("predictor") or {}).get(
-        "latestReadyRevision")
-    return {"mode": mode, "revision": rev, "isvc": isvc}, None
+    pred = (status.get("components") or {}).get("predictor") or {}
+    # revision 필드는 KServe/Knative 버전마다 달라 여러 후보를 순차 시도
+    rev = (pred.get("latestReadyRevision")
+           or pred.get("latestCreatedRevision")
+           or pred.get("latestRolledoutRevision"))
+    if not rev:
+        for t in (pred.get("traffic") or []):
+            if t.get("revisionName"):
+                rev = t["revisionName"]
+                break
+    return {"mode": mode, "revision": rev, "isvc": isvc, "found": True}, None
+
+
+def _is_serverless(mode, revision):
+    """Knative/Serverless 여부. revision 이 있으면 Knative-backed 으로 본다."""
+    if revision:
+        return True
+    m = (mode or "").lower()
+    return ("serverless" in m) or ("knative" in m)
+
+
+def count_via_deployment_label(client, ns, isvc):
+    """KServe Deployment 들을 라벨로 합산 — raw/serverless 공통, revision 이름 불필요.
+
+    KServe 가 predictor Deployment 에 serving.kserve.io/inferenceservice=<isvc>
+    라벨을 붙이므로, Knative 네이밍/activator 를 몰라도 ready Pod 수를 합산할 수 있다.
+    """
+    sel = "serving.kserve.io/inferenceservice=%s" % isvc
+    ok, data, err = client.get(
+        "/apis/apps/v1/namespaces/%s/deployments?labelSelector=%s" % (ns, sel))
+    if not ok:
+        return None, "deployments(label): %s" % err
+    items = data.get("items") or []
+    if not items:
+        return None, "deployments(label): no match (%s)" % sel
+    ready = sum(int((d.get("status") or {}).get("readyReplicas") or 0)
+                for d in items)
+    desired = sum(int((d.get("spec") or {}).get("replicas") or 0)
+                  for d in items)
+    return {"ready": ready, "desired": desired, "source": "deployment"}, None
 
 
 def count_via_knative(client, ns, revision):
@@ -507,17 +563,18 @@ def count_via_knative(client, ns, revision):
             return {"ready": int(actual), "desired": _int_or_none(desired),
                     "source": "knative-pa",
                     "scale_to_zero": int(actual) == 0}, None
-    ok, data, err = client.get(
+    ok2, data2, err2 = client.get(
         "/apis/serving.knative.dev/v1/namespaces/%s/revisions/%s" % (ns, revision))
-    if ok:
-        st = data.get("status") or {}
+    if ok2:
+        st = data2.get("status") or {}
         actual = st.get("actualReplicas")
         if actual is not None:
             return {"ready": int(actual),
                     "desired": _int_or_none(st.get("desiredReplicas")),
                     "source": "knative-revision",
                     "scale_to_zero": int(actual) == 0}, None
-    return None, err
+        return None, "pa/revision 에 actualScale 필드 없음"
+    return None, (err or err2 or "knative 조회 실패")
 
 
 def count_via_deployment(client, ns, svc):
@@ -541,8 +598,12 @@ def _int_or_none(v):
         return None
 
 
-def resolve_backend_count(deployment, client, settings):
-    """우선순위 체인으로 한 deployment 의 LB 뒤 backend 개수 산출 -> 필드 dict."""
+def resolve_backend_count(deployment, client, settings, cache=None):
+    """우선순위 체인으로 한 deployment 의 LB 뒤 backend 개수 산출 -> 필드 dict.
+
+    cache={(ns,svc): out} 를 주면 같은 Service 를 가리키는 여러 model_name 이
+    한 스냅샷 빌드 안에서 k8s API 를 중복 조회하지 않고 결과를 재사용한다.
+    """
     out = {"backends_ready": None, "backends_desired": None,
            "backend_source": "none", "mode": "Unknown",
            "scale_to_zero": False, "namespace": None, "service": None,
@@ -559,64 +620,85 @@ def resolve_backend_count(deployment, client, settings):
         out["backend_source"] = "external"
         return out
 
+    if not client.enabled:
+        return out
+
     ns, svc = parsed["namespace"], parsed["service"]
+    if cache is not None and (ns, svc) in cache:
+        return dict(cache[(ns, svc)])   # 같은 Service 는 재조회 생략
     activator_ns = settings.get("activator_namespace", "knative-serving")
+    errors = []
 
-    # 모드 감지(실패해도 치명적 아님)
-    mode_info, _ = (detect_mode_and_revision(client, ns, svc)
-                    if client.enabled else ({"mode": "Unknown", "revision": None}, None))
-    out["mode"] = mode_info.get("mode", "Unknown")
-    revision = mode_info.get("revision")
+    info, _ = detect_mode_and_revision(client, ns, svc)
+    out["mode"] = info["mode"]
+    isvc, revision = info["isvc"], info["revision"]
+    serverless = _is_serverless(info["mode"], revision)
 
-    if client.enabled:
-        # [1] EndpointSlice
+    def setres(r):
+        out["backends_ready"] = r["ready"]
+        if r.get("desired") is not None:
+            out["backends_desired"] = r["desired"]
+        out["backend_source"] = r["source"]
+        if r.get("scale_to_zero"):
+            out["scale_to_zero"] = True
+
+    if info["found"]:
+        # --- KServe ISVC: Deployment 라벨 합산이 raw/serverless 공통으로 가장 견고 ---
+        dep, err = count_via_deployment_label(client, ns, isvc)
+        if dep is not None:
+            setres(dep)
+        else:
+            errors.append(err)
+            # serverless 면 Knative PodAutoscaler/Revision 으로 보강
+            if revision:
+                kn, kerr = count_via_knative(client, ns, revision)
+                if kn is not None:
+                    setres(kn)
+                else:
+                    errors.append("knative: %s" % kerr)
+            else:
+                errors.append("no revision (ISVC status 에 revision 없음)")
+        # serverless 이고 0 이면 scale-to-zero 로 표기(장애 아님)
+        if serverless and out["backends_ready"] == 0:
+            out["scale_to_zero"] = True
+    else:
+        # --- 일반 Service(비 KServe): EndpointSlice 의 ready 주소 수 ---
         es, err = count_via_endpointslice(client, ns, svc, activator_ns)
-        if es is not None and not es.get("activator_only") and es["ready"] > 0:
+        if es is not None and not es.get("activator_only"):
             out["backends_ready"] = es["ready"]
             out["backend_source"] = "endpointslice"
-        elif es is not None and not es.get("activator_only") and out["mode"] != "Serverless":
-            # RawDeployment 인데 0개 -> 진짜 0 (Deployment 로 desired 보강)
-            out["backends_ready"] = 0
-            out["backend_source"] = "endpointslice"
+        elif es is not None and es.get("activator_only"):
+            errors.append("endpointslice: activator only (serverless?)")
+        elif es is None and err and "404" in err:
+            eps, eerr = count_via_endpoints(client, ns, svc)
+            if eps is not None:
+                out["backends_ready"] = eps["ready"]
+                out["backend_source"] = "endpoints"
+            else:
+                errors.append("endpoints: %s" % eerr)
         else:
-            # [1-fallback] EndpointSlice 404 -> core/v1 Endpoints
-            if es is None and err and "404" in err:
-                eps, _ = count_via_endpoints(client, ns, svc)
-                if eps is not None:
-                    out["backends_ready"] = eps["ready"]
-                    out["backend_source"] = "endpoints"
-
-        # [2] Serverless 보정: 비었거나 activator 만 -> Knative
-        need_correction = (
-            out["backend_source"] in ("none",)
-            or (es is not None and es.get("activator_only"))
-            or (out["mode"] == "Serverless" and (out["backends_ready"] or 0) == 0)
-        )
-        if need_correction and revision:
-            kn, _ = count_via_knative(client, ns, revision)
-            if kn is not None:
-                out["backends_ready"] = kn["ready"]
-                out["backends_desired"] = kn.get("desired")
-                out["backend_source"] = kn["source"]
-                out["scale_to_zero"] = kn.get("scale_to_zero", False)
-
-        # [3] RawDeployment desired 보강 / 여전히 미상이면 Deployment 직접
-        if out["mode"] != "Serverless" and out["backends_desired"] is None:
-            dep, err = count_via_deployment(client, ns, svc)
-            if dep is not None:
-                if out["backend_source"] in ("none", "external"):
-                    out["backends_ready"] = dep["ready"]
+            errors.append("endpointslice: %s" % err)
+        # desired 보강(같은 이름 Deployment), ready 미상이면 그걸로 대체
+        dep, derr = count_via_deployment(client, ns, svc)
+        if dep is not None:
+            if out["backends_desired"] is None:
                 out["backends_desired"] = dep.get("desired")
-                if out["backend_source"] == "none":
-                    out["backend_source"] = dep["source"]
-            elif err and out["backend_source"] == "none":
-                out["k8s_error"] = err
+            if out["backends_ready"] is None:
+                out["backends_ready"] = dep["ready"]
+                out["backend_source"] = "deployment"
 
+    if out["backends_ready"] is None and errors:
+        out["k8s_error"] = "; ".join(errors)
+    if cache is not None:
+        cache[(ns, svc)] = dict(out)
     return out
 
 
-def build_snapshot(settings):
-    """전체 수집 -> 스냅샷 dict."""
+def build_snapshot(settings, with_health=True):
+    """전체 수집 -> 스냅샷 dict.
+
+    with_health=False 면 느린 /health 를 건너뛴다(웹은 health 를 별도 스레드로 주입).
+    """
     snap = {
         "version": __version__,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -627,7 +709,8 @@ def build_snapshot(settings):
 
     if settings["litellm_url"]:
         snap["litellm"] = collect_litellm(
-            settings["litellm_url"], settings["api_key"], settings["timeout"]
+            settings["litellm_url"], settings["api_key"], settings["timeout"],
+            settings.get("health_timeout"), with_health=with_health
         )
 
     if settings["probe_backends"]:
@@ -642,11 +725,17 @@ def build_snapshot(settings):
     client = K8sClient.from_settings(settings)
     snap["backend_count_enabled"] = bool(client)
     if client and snap["litellm"]:
+        bc_cache = {}  # (ns,svc) -> 결과: 같은 Service 중복 k8s 조회 방지
         for d in snap["litellm"].get("deployments") or []:
             try:
-                d.update(resolve_backend_count(d, client, settings))
+                d.update(resolve_backend_count(d, client, settings, bc_cache))
             except Exception as e:  # noqa: BLE001  (한 건 실패가 전체를 막지 않게)
                 d["k8s_error"] = "%s: %s" % (type(e).__name__, e)
+
+    # /health 상태 + backend readiness 를 합쳐 deployment 에 status 부여
+    # (TUI/웹/JSON 모두 동일한 status 를 쓰도록 여기서 한 번에 적용)
+    if snap["litellm"]:
+        snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
 
     snap["summary"] = summarize(snap)
     return snap
@@ -665,12 +754,22 @@ def merge_deployments_with_health(ll):
     for d in ll.get("deployments") or []:
         base = _strip_openai_suffix(d["api_base"]) if d.get("api_base") else None
         if base in healthy:
-            status = "UP"
+            status, src = "UP", "health"
         elif base in unhealthy:
-            status = "DOWN"
+            status, src = "DOWN", "health"
         else:
-            status = "?"   # /health 미조회(권한/비활성)거나 매칭 실패
-        merged.append({**d, "status": status})
+            # /health 미조회(타임아웃/권한)거나 매칭 실패 -> backend readiness 로 추정
+            r = d.get("backends_ready")
+            if r is not None and d.get("backend_source") != "external":
+                if r > 0:
+                    status, src = "UP", "k8s"
+                elif d.get("scale_to_zero"):
+                    status, src = "?", "k8s"      # scale-to-zero = 정상 idle
+                else:
+                    status, src = "DOWN", "k8s"
+            else:
+                status, src = "?", "unknown"
+        merged.append({**d, "status": status, "status_source": src})
     return merged
 
 
@@ -692,17 +791,27 @@ def summarize(snap):
     ll = snap.get("litellm")
     if ll:
         s["model_groups"] = len(ll.get("groups") or [])
-        s["deployments_registered"] = len(ll.get("deployments") or [])
+        deps = ll.get("deployments") or []
+        s["deployments_registered"] = len(deps)
         health = ll.get("health") or {}
-        hc = health.get("healthy_count")
-        uc = health.get("unhealthy_count")
-        if hc is None:
-            hc = len(health.get("healthy_endpoints") or [])
-        if uc is None:
-            uc = len(health.get("unhealthy_endpoints") or [])
-        s["deployments_healthy"] = hc
-        s["deployments_unhealthy"] = uc
-        s["deployments_total"] = hc + uc
+
+        # 카드 수치를 표(merge_deployments_with_health 의 per-row status)와 항상
+        # 일치시킨다. deployment 가 있으면 merged status 로 집계(=/health 가
+        # 타임아웃해도 k8s readiness 보정이 반영됨), 없으면 /health 카운트로 폴백.
+        if deps and any("status" in d for d in deps):
+            s["deployments_healthy"] = sum(1 for d in deps if d.get("status") == "UP")
+            s["deployments_unhealthy"] = sum(1 for d in deps if d.get("status") == "DOWN")
+            s["deployments_total"] = len(deps)
+        else:
+            hc = health.get("healthy_count")
+            uc = health.get("unhealthy_count")
+            if hc is None:
+                hc = len(health.get("healthy_endpoints") or [])
+            if uc is None:
+                uc = len(health.get("unhealthy_endpoints") or [])
+            s["deployments_healthy"] = hc
+            s["deployments_unhealthy"] = uc
+            s["deployments_total"] = hc + uc
 
         # LB 뒤 backend Pod 집계 (값이 있는 deployment 만)
         for d in ll.get("deployments") or []:
@@ -1023,6 +1132,7 @@ def demo_snapshot():
          "url": "http://qwen3-32b-vllm.serving.svc:8000",
          "type": "vllm", "up": False, "models": [], "error": "connection error"},
     ]
+    snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
     snap["summary"] = summarize(snap)
     return snap
 
@@ -1073,6 +1183,9 @@ _DASHBOARD_HTML = r"""<!doctype html>
   .toggle{font-family:var(--sans);font-size:12px;color:var(--muted);cursor:pointer;
     user-select:none;display:flex;align-items:center;gap:6px}
   .toggle input{accent-color:var(--accent)}
+  a.exp{font-family:var(--sans);font-size:12px;color:var(--muted);text-decoration:none;
+    border:1px solid var(--border);border-radius:6px;padding:3px 9px;cursor:pointer}
+  a.exp:hover{color:var(--text);border-color:var(--accent)}
 
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
     gap:12px;margin-bottom:22px}
@@ -1134,6 +1247,10 @@ _DASHBOARD_HTML = r"""<!doctype html>
   .err{color:var(--down);font-family:var(--mono);font-size:12px;
     background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.25);
     border-radius:7px;padding:9px 12px;margin-top:8px}
+  #banner:not(:empty){margin-bottom:16px}
+  .note-banner{color:var(--warn);font-family:var(--mono);font-size:12px;
+    background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.3);
+    border-radius:7px;padding:9px 12px}
   footer{margin-top:30px;color:var(--faint);font-size:11.5px;font-family:var(--mono);
     border-top:1px solid var(--border);padding-top:14px}
 </style>
@@ -1146,10 +1263,14 @@ _DASHBOARD_HTML = r"""<!doctype html>
     <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
+    <a class="exp" href="/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
+    <a class="exp" href="/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
     <div class="meta">
       <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
     </div>
   </header>
+
+  <div id="banner"></div>
 
   <div class="cards" id="cards"></div>
 
@@ -1180,14 +1301,13 @@ function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
 
 function backendCell(d){
   const r=d.backends_ready, des=d.backends_desired, src=d.backend_source||"none";
+  const errTip = d.k8s_error ? ' title="'+esc(d.k8s_error)+'"' : '';
   if(src==="external") return '<span class="srccol">external</span>';
   if(d.scale_to_zero) return '<div class="bk zero"><span class="num">0</span>'
     +'<span class="note">scaled-to-zero</span></div>';
   if(r==null){
-    if(d.status==="UP" && src==="none")
-      return '<div class="bk warn"><span class="num">?</span>'
-        +'<span class="note">via activator?</span></div>';
-    return '<span class="srccol">?</span>';
+    // 수집 실패 -> ? 에 마우스 올리면 원인(k8s_error) 표시
+    return '<span class="srccol"'+errTip+'>?'+(d.k8s_error?' ⚠':'')+'</span>';
   }
   let cls="good";
   if(r===0) cls="bad"; else if(des!=null && r<des) cls="warn";
@@ -1211,6 +1331,19 @@ function card(label,val,cls,sub){
 function render(snap){
   const s = snap.summary||{};
   const ll = snap.litellm;
+  // 수집 상태 배너: 초기 로딩 / 백그라운드 수집 실패를 화면에 노출한다.
+  const banner = $("#banner");
+  if(snap.loading){
+    banner.innerHTML = '<div class="note-banner">⏳ 첫 스냅샷 수집 중…'
+      + (snap.error ? ' ('+esc(snap.error)+')' : '') + '</div>';
+    $("#updated").textContent = "loading…";
+    $("#livedot").style.background = "var(--warn)";
+    return;
+  }
+  banner.innerHTML = snap.collect_error
+    ? '<div class="err">⚠ 백그라운드 수집 실패(직전 스냅샷 표시 중): '
+      + esc(snap.collect_error) + '</div>'
+    : "";
   // summary cards
   let cards = "";
   cards += card("Model Groups", s.model_groups||0, "accent");
@@ -1220,7 +1353,7 @@ function render(snap){
   if(s.backend_pods_known)
     cards += card("Backend Pods", (s.backend_pods_ready||0)
       +'<span style="color:var(--faint);font-size:16px"> / '
-      +(s.backend_pods_desired||0)+'</span>', "",
+      +(s.backend_pods_desired||"?")+'</span>', "",
       "LB 뒤 ready / desired");
   $("#cards").innerHTML = cards;
 
@@ -1270,6 +1403,15 @@ function render(snap){
 }
 
 async function tick(){
+  // 정지 스냅샷(/snapshot.html)으로 열렸으면 폴링 없이 박제된 데이터만 렌더한다.
+  if(window.__SNAPSHOT__){
+    render(window.__SNAPSHOT__);
+    $("#livedot").style.background = "var(--warn)";
+    document.querySelectorAll(".exp").forEach(e=>e.style.display="none");
+    const a=$("#auto"); if(a){ a.checked=false; a.disabled=true; }
+    const u=$("#updated"); if(u) u.textContent += "  · saved snapshot (frozen)";
+    return;
+  }
   try{
     const r = await fetch("/api/snapshot",{cache:"no-store"});
     const snap = await r.json();
@@ -1282,7 +1424,8 @@ async function tick(){
 }
 
 let timer=null;
-function loop(){ if(timer) clearInterval(timer);
+function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
+  if(timer) clearInterval(timer);
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
 tick(); loop();
@@ -1293,37 +1436,123 @@ tick(); loop();
 
 
 def serve_dashboard(settings, host, port, interval, demo):
-    """웹 대시보드 서버 실행. /api/snapshot 은 TTL 캐시로 백엔드 부하 억제."""
-    cache = {"snap": None, "at": 0.0}
-    ttl = max(1.0, min(interval, 3.0))
+    """웹 대시보드 서버.
+
+    수집(특히 LiteLLM /health 는 느림)을 백그라운드 스레드에서 주기적으로 수행하고,
+    HTTP 요청에는 마지막으로 수집한 스냅샷을 즉시 돌려준다 -> 브라우저가 멈추거나
+    BrokenPipe 가 나지 않는다.
+    """
     html = _DASHBOARD_HTML.replace("__INTERVAL_MS__", str(int(interval * 1000)))
 
-    def get_snapshot():
-        now = time.time()
-        if cache["snap"] is None or (now - cache["at"]) > ttl:
-            snap = demo_snapshot() if demo else build_snapshot(settings)
-            snap["demo"] = bool(demo)
-            cache["snap"] = snap
-            cache["at"] = now
-        return cache["snap"]
+    def frozen_html(snap):
+        """현재 스냅샷을 페이지에 박제 -> 폴링 없이 그대로 렌더되는 self-contained HTML.
+
+        '<' 를 이스케이프해 데이터 안의 </script> 등이 HTML 을 깨지 않게 한다.
+        라이브 대시보드와 같은 렌더 코드를 쓰므로 stale 될 일이 없다.
+        """
+        blob = json.dumps(snap, ensure_ascii=False).replace("<", "\\u003c")
+        inject = "<script>window.__SNAPSHOT__=%s;</script>\n</head>" % blob
+        return html.replace("</head>", inject, 1)
+
+    state = {"snap": None, "err": None}
+    lock = threading.Lock()
+    # /health 는 수십 초 걸려서 메인 수집을 막지 않도록 별도 스레드가 캐시에 채운다.
+    hcache = {"data": None}
+    hlock = threading.Lock()
+
+    def collect_once():
+        # 메인 수집은 health 없이(빠름). backend 개수·모델 목록은 interval 마다 갱신.
+        snap = demo_snapshot() if demo else build_snapshot(settings, with_health=False)
+        snap["demo"] = bool(demo)
+        if not demo and snap.get("litellm"):
+            with hlock:
+                h = hcache["data"]
+            if h is not None:
+                # 비동기로 받아둔 /health 를 주입하고 status/summary 재계산
+                snap["litellm"]["health"] = h
+                snap["litellm"]["deployments"] = merge_deployments_with_health(
+                    snap["litellm"])
+                snap["summary"] = summarize(snap)
+        with lock:
+            state["snap"] = snap
+            state["err"] = None
+
+    def health_loop():
+        # 느린 /health 를 천천히(>=30s) 따로 수집. 도착하면 다음 collect 에 반영됨.
+        url, key = settings.get("litellm_url"), settings.get("api_key")
+        ht = settings.get("health_timeout", 90.0)
+        while True:
+            try:
+                h = fetch_health(url, key, ht)
+                if h is not None:
+                    with hlock:
+                        hcache["data"] = h
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(max(30.0, interval))
+
+    # 첫 페이지 로드에 데이터가 바로 보이도록 1회 동기 수집(health 제외 -> 즉시)
+    try:
+        collect_once()
+    except Exception as e:  # noqa: BLE001
+        state["err"] = "%s: %s" % (type(e).__name__, e)
+
+    def refresh_loop():
+        while True:
+            time.sleep(max(1.0, interval))
+            try:
+                collect_once()
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    state["err"] = "%s: %s" % (type(e).__name__, e)
+
+    threading.Thread(target=refresh_loop, daemon=True).start()
+    # health 수집은 settings.health 가 켜져 있고 데모가 아닐 때만
+    if not demo and settings.get("health", True) and settings.get("litellm_url"):
+        threading.Thread(target=health_loop, daemon=True).start()
 
     class Handler(http.server.BaseHTTPRequestHandler):
-        def _send(self, code, body, ctype):
+        def _send(self, code, body, ctype, extra_headers=None):
             data = body.encode("utf-8") if isinstance(body, str) else body
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                for k, v in (extra_headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # 클라이언트가 응답 전에 끊음(폴링 취소 등) — 무시
+
+        def _snapshot(self):
+            """캐시된 스냅샷(없으면 loading, 수집오류면 collect_error 부착)."""
+            with lock:
+                snap, err = state["snap"], state["err"]
+            if snap is None:
+                return {"version": __version__, "loading": True,
+                        "error": err, "summary": {}, "litellm": None}
+            if err:
+                return dict(snap, collect_error=err)
+            return snap
 
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             if path in ("/", "/index.html"):
                 self._send(200, html, "text/html; charset=utf-8")
             elif path == "/api/snapshot":
-                snap = get_snapshot()
-                self._send(200, json.dumps(snap, ensure_ascii=False),
+                self._send(200, json.dumps(self._snapshot(), ensure_ascii=False),
                            "application/json; charset=utf-8")
+            elif path == "/snapshot.json":
+                # 브라우저에서 클릭 한 번에 파일로 받게 attachment 로 내려준다.
+                self._send(200, json.dumps(self._snapshot(), ensure_ascii=False),
+                           "application/json; charset=utf-8",
+                           {"Content-Disposition":
+                            'attachment; filename="model-monitor-snapshot.json"'})
+            elif path in ("/snapshot.html", "/export"):
+                # 데이터가 박제된 self-contained 페이지(폴링 없음) — 저장해서 공유용.
+                self._send(200, frozen_html(self._snapshot()),
+                           "text/html; charset=utf-8")
             elif path in ("/healthz", "/readyz"):
                 self._send(200, "ok", "text/plain")
             else:
@@ -1336,6 +1565,8 @@ def serve_dashboard(settings, host, port, interval, demo):
     url = "http://%s:%d" % ("localhost" if host == "0.0.0.0" else host, port)
     print("Model Monitor 웹 대시보드: %s  (%.0fs 갱신, Ctrl+C 종료)"
           % (url, interval))
+    print("  스냅샷 내보내기: %s/snapshot.json (raw JSON 다운로드)"
+          "  ·  %s/snapshot.html (정지 페이지)" % (url, url))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -1353,7 +1584,8 @@ def clear_screen():
 
 
 def run_once(settings, as_json, demo):
-    snap = demo_snapshot() if demo else build_snapshot(settings)
+    snap = (demo_snapshot() if demo
+            else build_snapshot(settings, with_health=settings.get("health", True)))
     if as_json:
         print(json.dumps(snap, ensure_ascii=False, indent=2))
     else:
@@ -1375,6 +1607,10 @@ def main():
     p.add_argument("--interval", type=float, default=5.0, help="watch/웹 갱신 주기(초)")
     p.add_argument("--json", action="store_true", help="JSON 출력")
     p.add_argument("--timeout", type=float, default=10.0, help="HTTP 타임아웃(초)")
+    p.add_argument("--health-timeout", type=float,
+                   help="LiteLLM /health 타임아웃(초, 기본 90 — 모델 많으면 늘리기)")
+    p.add_argument("--no-health", action="store_true",
+                   help="LiteLLM /health 호출 안 함 (status 는 k8s backend readiness 로 판정)")
     p.add_argument("--demo", action="store_true", help="샘플 데이터로 미리보기")
     # 웹 UI
     p.add_argument("--serve", action="store_true",

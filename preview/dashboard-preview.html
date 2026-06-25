@@ -1,3 +1,9 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Monitor — LiteLLM / KServe / vLLM·SGLang</title>
 <style>
   :root{
     --bg:#0d1117; --surface:#161b22; --surface2:#1b222c; --border:#232c38;
@@ -32,6 +38,9 @@
   .toggle{font-family:var(--sans);font-size:12px;color:var(--muted);cursor:pointer;
     user-select:none;display:flex;align-items:center;gap:6px}
   .toggle input{accent-color:var(--accent)}
+  a.exp{font-family:var(--sans);font-size:12px;color:var(--muted);text-decoration:none;
+    border:1px solid var(--border);border-radius:6px;padding:3px 9px;cursor:pointer}
+  a.exp:hover{color:var(--text);border-color:var(--accent)}
 
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
     gap:12px;margin-bottom:22px}
@@ -93,22 +102,16 @@
   .err{color:var(--down);font-family:var(--mono);font-size:12px;
     background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.25);
     border-radius:7px;padding:9px 12px;margin-top:8px}
+  #banner:not(:empty){margin-bottom:16px}
+  .note-banner{color:var(--warn);font-family:var(--mono);font-size:12px;
+    background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.3);
+    border-radius:7px;padding:9px 12px}
   footer{margin-top:30px;color:var(--faint);font-size:11.5px;font-family:var(--mono);
     border-top:1px solid var(--border);padding-top:14px}
 </style>
-<script>
-const __SNAP__ = {"version": "0.1.0", "ts": "2026-06-25 03:19:53", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 4, "deployments_total": 4, "deployments_healthy": 3, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 4, "backend_pods_desired": 8, "backend_pods_known": true}, "demo": true};
-const _f = window.fetch ? window.fetch.bind(window) : null;
-window.fetch = function(u,o){
-  if(typeof u==='string' && u.indexOf('/api/snapshot')>=0){
-    var d = new Date();
-    __SNAP__.ts = d.toISOString().slice(0,19).replace('T',' ');
-    return Promise.resolve(new Response(JSON.stringify(__SNAP__),
-      {headers:{'Content-Type':'application/json'}}));
-  }
-  return _f ? _f(u,o) : Promise.reject('no fetch');
-};
-</script>
+<script>window.__SNAPSHOT__={"version": "0.1.2", "ts": "2026-06-25 06:08:44", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "status": "UP", "status_source": "health"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "status": "DOWN", "status_source": "health"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "status": "UP", "status_source": "health"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 4, "deployments_total": 4, "deployments_healthy": 3, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 4, "backend_pods_desired": 8, "backend_pods_known": true}, "demo": true};</script>
+</head>
+<body>
 <div class="wrap">
   <header>
     <h1>Model Monitor <span class="ver" id="ver"></span>
@@ -116,10 +119,14 @@ window.fetch = function(u,o){
     <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
+    <a class="exp" href="/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
+    <a class="exp" href="/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
     <div class="meta">
       <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
     </div>
   </header>
+
+  <div id="banner"></div>
 
   <div class="cards" id="cards"></div>
 
@@ -150,14 +157,13 @@ function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
 
 function backendCell(d){
   const r=d.backends_ready, des=d.backends_desired, src=d.backend_source||"none";
+  const errTip = d.k8s_error ? ' title="'+esc(d.k8s_error)+'"' : '';
   if(src==="external") return '<span class="srccol">external</span>';
   if(d.scale_to_zero) return '<div class="bk zero"><span class="num">0</span>'
     +'<span class="note">scaled-to-zero</span></div>';
   if(r==null){
-    if(d.status==="UP" && src==="none")
-      return '<div class="bk warn"><span class="num">?</span>'
-        +'<span class="note">via activator?</span></div>';
-    return '<span class="srccol">?</span>';
+    // 수집 실패 -> ? 에 마우스 올리면 원인(k8s_error) 표시
+    return '<span class="srccol"'+errTip+'>?'+(d.k8s_error?' ⚠':'')+'</span>';
   }
   let cls="good";
   if(r===0) cls="bad"; else if(des!=null && r<des) cls="warn";
@@ -181,6 +187,19 @@ function card(label,val,cls,sub){
 function render(snap){
   const s = snap.summary||{};
   const ll = snap.litellm;
+  // 수집 상태 배너: 초기 로딩 / 백그라운드 수집 실패를 화면에 노출한다.
+  const banner = $("#banner");
+  if(snap.loading){
+    banner.innerHTML = '<div class="note-banner">⏳ 첫 스냅샷 수집 중…'
+      + (snap.error ? ' ('+esc(snap.error)+')' : '') + '</div>';
+    $("#updated").textContent = "loading…";
+    $("#livedot").style.background = "var(--warn)";
+    return;
+  }
+  banner.innerHTML = snap.collect_error
+    ? '<div class="err">⚠ 백그라운드 수집 실패(직전 스냅샷 표시 중): '
+      + esc(snap.collect_error) + '</div>'
+    : "";
   // summary cards
   let cards = "";
   cards += card("Model Groups", s.model_groups||0, "accent");
@@ -190,7 +209,7 @@ function render(snap){
   if(s.backend_pods_known)
     cards += card("Backend Pods", (s.backend_pods_ready||0)
       +'<span style="color:var(--faint);font-size:16px"> / '
-      +(s.backend_pods_desired||0)+'</span>', "",
+      +(s.backend_pods_desired||"?")+'</span>', "",
       "LB 뒤 ready / desired");
   $("#cards").innerHTML = cards;
 
@@ -240,6 +259,15 @@ function render(snap){
 }
 
 async function tick(){
+  // 정지 스냅샷(/snapshot.html)으로 열렸으면 폴링 없이 박제된 데이터만 렌더한다.
+  if(window.__SNAPSHOT__){
+    render(window.__SNAPSHOT__);
+    $("#livedot").style.background = "var(--warn)";
+    document.querySelectorAll(".exp").forEach(e=>e.style.display="none");
+    const a=$("#auto"); if(a){ a.checked=false; a.disabled=true; }
+    const u=$("#updated"); if(u) u.textContent += "  · saved snapshot (frozen)";
+    return;
+  }
   try{
     const r = await fetch("/api/snapshot",{cache:"no-store"});
     const snap = await r.json();
@@ -252,9 +280,11 @@ async function tick(){
 }
 
 let timer=null;
-function loop(){ if(timer) clearInterval(timer);
+function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
+  if(timer) clearInterval(timer);
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
 tick(); loop();
 </script>
-
+</body>
+</html>

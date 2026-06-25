@@ -15,3 +15,14 @@ config.local.*
 *.swp
 .idea/
 .vscode/
+
+# 임시/진단/산출물 (커밋 불필요) — gitignore 는 인라인 주석 미지원, 주석은 별도 줄
+# 브라우저로 저장한 대시보드 진단용 페이지 + 부속 폴더
+ui.html
+*_files/
+# /snapshot.json 다운로드 산출물
+model-monitor-snapshot*.json
+# docker save 이미지 번들
+*.tar
+*.log
+*.tmp

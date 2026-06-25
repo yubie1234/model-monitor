@@ -32,8 +32,8 @@ rules:
     resources: ["endpoints", "services"]   # 구버전 폴백 + selector 확인
     verbs: ["get", "list"]
   - apiGroups: ["apps"]
-    resources: ["deployments"]             # RawDeployment 보정
-    verbs: ["get", "list"]
+    resources: ["deployments"]             # 라벨 합산 + RawDeployment 보정
+    verbs: ["get", "list"]                  # list: serving.kserve.io/inferenceservice 라벨 조회
   - apiGroups: ["serving.kserve.io"]
     resources: ["inferenceservices"]       # deploymentMode / revision 감지
     verbs: ["get", "list"]
@@ -83,7 +83,7 @@ metadata:
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/version: "0.1.2"
 spec:
   replicas: 1
   selector:
@@ -93,7 +93,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "0.1.0"
+        app.kubernetes.io/version: "0.1.2"
     spec:
       serviceAccountName: model-monitor
       containers:

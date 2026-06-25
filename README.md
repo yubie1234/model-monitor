@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.1.0**
+**버전: v0.1.2**
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 모니터. 터미널(TUI)과 웹 대시보드(`--serve`)를 모두 제공합니다.
 
@@ -56,6 +56,9 @@ python3 model_monitor.py --config config.yaml --probe-backends --watch
 # 웹 대시보드 (브라우저로 조회, 5초 자동 갱신)
 python3 model_monitor.py --config config.yaml --serve --port 8088
 #   -> http://localhost:8088  (/api/snapshot 으로 JSON 도 제공)
+#   현재 상태 내보내기(공유/디버깅용 — 헤더의 [💾 JSON]/[정지 페이지] 버튼과 동일):
+#     http://localhost:8088/snapshot.json   # raw JSON 파일 다운로드(클릭 한 번)
+#     http://localhost:8088/snapshot.html   # 데이터가 박제된 self-contained 정지 페이지(저장해 공유)
 
 # 라이브 엔드포인트 없이 출력 미리보기 (TUI / 웹 둘 다 가능)
 python3 model_monitor.py --demo
@@ -96,6 +99,8 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 | `--timeout N` | HTTP 타임아웃(초, 기본 10) |
 | `--demo` | 샘플 데이터로 미리보기 |
 | `--no-backend-count` | LB 뒤 backend Pod 개수 수집 끄기 |
+| `--health-timeout N` | LiteLLM `/health` 타임아웃(초, 기본 90 — 모델 많으면 늘리기) |
+| `--no-health` | `/health` 호출 안 함 (status 는 k8s backend readiness 로만 판정) |
 | `--k8s-api-server` / `--k8s-token-file` / `--k8s-ca-file` | k8s 접근 오버라이드 |
 | `--k8s-insecure` | k8s API TLS 검증 비활성 |
 
@@ -122,8 +127,21 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 > Deployment 는 `image: 10.92.20.77:5002/ai-tool/llm-monitor:latest` + `imagePullPolicy: Always` 라 latest 최신본을 매번 레지스트리에서 받습니다.
 > HTTP(비TLS) 레지스트리면 빌드 노드의 docker(`/etc/docker/daemon.json` 의 `insecure-registries`)와 클러스터 노드의 containerd 에 `10.92.20.77:5002` 를 insecure 레지스트리로 등록해야 push/pull 이 됩니다.
 
-### scale-to-zero / Knative 참고
-KServe Serverless 는 scale-to-zero 시 Service/EndpointSlice 가 activator 를 가리켜 실제 모델 Pod 수를 왜곡합니다.
-이 경우 Knative PodAutoscaler `actualScale` 로 보정해 `0 (scaled-to-zero)` 로 명확히 표기합니다(장애 아님).
-PodAutoscaler 는 internal API 라 RBAC 권한이 더 필요하며, 권한이 없으면 `?`/`via activator?` 로 솔직하게 표기합니다.
-InferenceService CRD `status` 에는 replica 개수 필드가 없어 개수 산출에는 쓰지 않고 mode/revision 감지에만 사용합니다.
+### backend 개수 산출 방식 (KServe)
+- **KServe ISVC**(api_base 가 `<isvc>-predictor...`): Deployment 를 `serving.kserve.io/inferenceservice=<isvc>`
+  라벨로 찾아 `readyReplicas`/`replicas` 를 합산합니다. RawDeployment·Serverless 공통으로 동작하고
+  Knative 네이밍/activator 를 몰라도 됩니다. 라벨 매칭이 안 되면 Knative PodAutoscaler `actualScale` 로 보강.
+- **일반 Service**(비 KServe): EndpointSlice 의 ready 주소 수.
+- scale-to-zero 면 `0 (scaled-to-zero)` 로 표기(장애 아님). 산출 실패 시 `?` 에 마우스를 올리면 원인을 보여줍니다.
+
+### Troubleshooting
+- **STATUS 가 전부 `?` + `health: timed out`**: LiteLLM `/health` 는 모든 백엔드를 실제 ping 해서
+  모델이 많으면 수십 초 걸립니다(실측 60s 사례 있음). 웹(`--serve`)은 `/health` 를 **별도 스레드로
+  비동기 수집**하므로 화면이 멈추지 않고, status 는 우선 **k8s backend readiness 로 즉시 판정**한 뒤
+  `/health` 가 도착하면 보강합니다. 그래도 부족하면 `--health-timeout`(기본 90s)을 늘리거나,
+  k8s readiness 만으로 충분하면 `--no-health` 로 끄세요. (KServe 모델은 `/health` 없이도 backend
+  Pod 가 ready 면 UP 으로 표시됩니다. 단 외부 IP 백엔드는 `/health` 가 있어야 status 가 나옵니다.)
+- **backend 가 `?`(원인 보기)**: 셀에 마우스를 올리면 `k8s_error`(예: `deployments(label): no match`,
+  `knative: HTTP 403`)가 뜹니다. RBAC([deploy/k8s.yaml](deploy/k8s.yaml) ClusterRole)나 라벨/네임스페이스를 점검하세요.
+- 웹 수집은 백그라운드 스레드에서 주기적으로 돌고 HTTP 는 마지막 스냅샷을 즉시 반환합니다
+  (요청 블로킹/BrokenPipe 없음).
