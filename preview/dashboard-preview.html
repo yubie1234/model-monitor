@@ -59,6 +59,14 @@
     color:var(--muted);margin:0 0 10px;display:flex;align-items:center;gap:8px}
   .sec-title .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
     color:var(--faint);font-size:11px}
+  .filters{display:flex;align-items:center;gap:7px;margin-left:auto;
+    text-transform:none;letter-spacing:0}
+  .filters label{font-size:10px;color:var(--faint)}
+  .filters select{font-family:var(--sans);font-size:12px;color:var(--text);
+    background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+    padding:3px 7px;cursor:pointer}
+  .filters .fcount{font-family:var(--mono);font-size:11px;color:var(--faint);
+    min-width:54px;text-align:right}
 
   .tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:9px;
     background:var(--surface)}
@@ -109,7 +117,7 @@
   footer{margin-top:30px;color:var(--faint);font-size:11.5px;font-family:var(--mono);
     border-top:1px solid var(--border);padding-top:14px}
 </style>
-<script>window.__SNAPSHOT__={"version": "0.1.2", "ts": "2026-06-25 06:08:44", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "status": "UP", "status_source": "health"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "status": "DOWN", "status_source": "health"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "status": "UP", "status_source": "health"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 4, "deployments_total": 4, "deployments_healthy": 3, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 4, "backend_pods_desired": 8, "backend_pods_known": true}, "demo": true};</script>
+<script>window.__SNAPSHOT__={"version": "0.1.3", "ts": "2026-06-25 06:35:54", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "status": "UP", "status_source": "health"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "status": "UP", "status_source": "health"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "status": "DOWN", "status_source": "health"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 4, "deployments_total": 4, "deployments_healthy": 3, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 4, "backend_pods_desired": 8, "backend_pods_known": true}, "demo": true};</script>
 </head>
 <body>
 <div class="wrap">
@@ -133,6 +141,24 @@
   <section id="deployments-sec">
     <div class="sec-title">Deployments
       <span class="src">/model/info api_base · /health status · k8s backend pods</span>
+      <span class="filters">
+        <label for="f-status">status</label>
+        <select id="f-status">
+          <option value="">all</option>
+          <option value="UP">UP</option>
+          <option value="DOWN">DOWN</option>
+          <option value="?">?</option>
+        </select>
+        <label for="f-type">type</label>
+        <select id="f-type">
+          <option value="">all</option>
+          <option value="vllm">vllm</option>
+          <option value="sglang">sglang</option>
+          <option value="kserve">kserve</option>
+          <option value="-">-</option>
+        </select>
+        <span class="fcount" id="f-count"></span>
+      </span>
     </div>
     <div class="tablewrap"><table id="deployments">
       <thead></thead><tbody></tbody>
@@ -151,6 +177,7 @@
 <script>
 const REFRESH_MS = 5000;
 const $ = (s)=>document.querySelector(s);
+let lastSnap = null;   // 필터 변경 시 재수집 없이 다시 렌더하려고 보관
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -200,6 +227,7 @@ function render(snap){
     ? '<div class="err">⚠ 백그라운드 수집 실패(직전 스냅샷 표시 중): '
       + esc(snap.collect_error) + '</div>'
     : "";
+  lastSnap = snap;
   // summary cards
   let cards = "";
   cards += card("Model Groups", s.model_groups||0, "accent");
@@ -217,12 +245,17 @@ function render(snap){
   const showBk = !!snap.backend_count_enabled;
   const dt = $("#deployments");
   if(ll && ll.deployments && ll.deployments.length){
-    const merged = ll.deployments;
+    const all = ll.deployments;
+    const fS = $("#f-status").value, fT = $("#f-type").value;
+    const merged = all.filter(d=>
+      (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT));
+    $("#f-count").textContent = (fS||fT)
+      ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
     if(showBk) head += '<th>BACKENDS (ready/desired)</th><th>MODE</th><th>SRC</th>';
     head += "<th>API_BASE</th></tr>";
     dt.querySelector("thead").innerHTML = head;
-    dt.querySelector("tbody").innerHTML = merged.map(d=>{
+    dt.querySelector("tbody").innerHTML = merged.length ? merged.map(d=>{
       let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
         +'<td class="name">'+esc(d.model_name)+"</td>"
         +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
@@ -231,8 +264,9 @@ function render(snap){
         +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
       row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
       return row;
-    }).join("");
+    }).join("") : '<tr><td class="empty" colspan="7">필터 결과 없음</td></tr>';
   } else {
+    $("#f-count").textContent="";
     dt.querySelector("thead").innerHTML="";
     dt.querySelector("tbody").innerHTML='<tr><td class="empty">deployment 없음 (LiteLLM /model/info 응답 비어있음 또는 미연결)</td></tr>';
   }
@@ -284,6 +318,9 @@ function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
   if(timer) clearInterval(timer);
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
+// 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
+$("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+$("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 tick(); loop();
 </script>
 </body>

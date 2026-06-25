@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
@@ -180,7 +180,10 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
     ok, data, err = http_get_json(base + "/model_group/info", api_key, timeout)
     if ok and isinstance(data, dict):
         result["reachable"] = True
-        result["groups"] = data.get("data", []) or []
+        # 이름순 정렬: LiteLLM 응답 순서가 replica 구성에 따라 바뀌어도 표시 고정
+        result["groups"] = sorted(
+            data.get("data", []) or [],
+            key=lambda g: str(g.get("model_group") or "").lower())
     elif err:
         result["errors"].append("model_group/info: %s" % err)
 
@@ -770,6 +773,9 @@ def merge_deployments_with_health(ll):
             else:
                 status, src = "?", "unknown"
         merged.append({**d, "status": status, "status_source": src})
+    # LiteLLM 은 replica 구성에 따라 model/info 순서가 매번 달라질 수 있어
+    # model_name 기준으로 정렬해 표시 순서를 안정화한다(TUI/웹/JSON 공통).
+    merged.sort(key=lambda x: str(x.get("model_name") or "").lower())
     return merged
 
 
@@ -1132,6 +1138,8 @@ def demo_snapshot():
          "url": "http://qwen3-32b-vllm.serving.svc:8000",
          "type": "vllm", "up": False, "models": [], "error": "connection error"},
     ]
+    snap["litellm"]["groups"].sort(
+        key=lambda g: str(g.get("model_group") or "").lower())
     snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
     snap["summary"] = summarize(snap)
     return snap
@@ -1204,6 +1212,14 @@ _DASHBOARD_HTML = r"""<!doctype html>
     color:var(--muted);margin:0 0 10px;display:flex;align-items:center;gap:8px}
   .sec-title .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
     color:var(--faint);font-size:11px}
+  .filters{display:flex;align-items:center;gap:7px;margin-left:auto;
+    text-transform:none;letter-spacing:0}
+  .filters label{font-size:10px;color:var(--faint)}
+  .filters select{font-family:var(--sans);font-size:12px;color:var(--text);
+    background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+    padding:3px 7px;cursor:pointer}
+  .filters .fcount{font-family:var(--mono);font-size:11px;color:var(--faint);
+    min-width:54px;text-align:right}
 
   .tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:9px;
     background:var(--surface)}
@@ -1277,6 +1293,24 @@ _DASHBOARD_HTML = r"""<!doctype html>
   <section id="deployments-sec">
     <div class="sec-title">Deployments
       <span class="src">/model/info api_base · /health status · k8s backend pods</span>
+      <span class="filters">
+        <label for="f-status">status</label>
+        <select id="f-status">
+          <option value="">all</option>
+          <option value="UP">UP</option>
+          <option value="DOWN">DOWN</option>
+          <option value="?">?</option>
+        </select>
+        <label for="f-type">type</label>
+        <select id="f-type">
+          <option value="">all</option>
+          <option value="vllm">vllm</option>
+          <option value="sglang">sglang</option>
+          <option value="kserve">kserve</option>
+          <option value="-">-</option>
+        </select>
+        <span class="fcount" id="f-count"></span>
+      </span>
     </div>
     <div class="tablewrap"><table id="deployments">
       <thead></thead><tbody></tbody>
@@ -1295,6 +1329,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
 <script>
 const REFRESH_MS = __INTERVAL_MS__;
 const $ = (s)=>document.querySelector(s);
+let lastSnap = null;   // 필터 변경 시 재수집 없이 다시 렌더하려고 보관
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -1344,6 +1379,7 @@ function render(snap){
     ? '<div class="err">⚠ 백그라운드 수집 실패(직전 스냅샷 표시 중): '
       + esc(snap.collect_error) + '</div>'
     : "";
+  lastSnap = snap;
   // summary cards
   let cards = "";
   cards += card("Model Groups", s.model_groups||0, "accent");
@@ -1361,12 +1397,17 @@ function render(snap){
   const showBk = !!snap.backend_count_enabled;
   const dt = $("#deployments");
   if(ll && ll.deployments && ll.deployments.length){
-    const merged = ll.deployments;
+    const all = ll.deployments;
+    const fS = $("#f-status").value, fT = $("#f-type").value;
+    const merged = all.filter(d=>
+      (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT));
+    $("#f-count").textContent = (fS||fT)
+      ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
     if(showBk) head += '<th>BACKENDS (ready/desired)</th><th>MODE</th><th>SRC</th>';
     head += "<th>API_BASE</th></tr>";
     dt.querySelector("thead").innerHTML = head;
-    dt.querySelector("tbody").innerHTML = merged.map(d=>{
+    dt.querySelector("tbody").innerHTML = merged.length ? merged.map(d=>{
       let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
         +'<td class="name">'+esc(d.model_name)+"</td>"
         +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
@@ -1375,8 +1416,9 @@ function render(snap){
         +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
       row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
       return row;
-    }).join("");
+    }).join("") : '<tr><td class="empty" colspan="7">필터 결과 없음</td></tr>';
   } else {
+    $("#f-count").textContent="";
     dt.querySelector("thead").innerHTML="";
     dt.querySelector("tbody").innerHTML='<tr><td class="empty">deployment 없음 (LiteLLM /model/info 응답 비어있음 또는 미연결)</td></tr>';
   }
@@ -1428,6 +1470,9 @@ function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
   if(timer) clearInterval(timer);
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
+// 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
+$("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+$("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 tick(); loop();
 </script>
 </body>

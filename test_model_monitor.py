@@ -210,6 +210,24 @@ class TestResolveBackendCount(unittest.TestCase):
         self.assertEqual(out2["backends_ready"], 1)
 
 
+class TestSorting(unittest.TestCase):
+    def test_merge_sorts_deployments_by_name_case_insensitive(self):
+        ll = {"health": None, "deployments": [
+            {"model_name": "zoo", "api_base": "http://z/v1"},
+            {"model_name": "Apple", "api_base": "http://a/v1"},
+            {"model_name": "mango", "api_base": "http://m/v1"},
+        ]}
+        out = m.merge_deployments_with_health(ll)
+        self.assertEqual([d["model_name"] for d in out], ["Apple", "mango", "zoo"])
+
+    def test_demo_groups_and_deployments_sorted(self):
+        snap = m.demo_snapshot()
+        groups = [g["model_group"] for g in snap["litellm"]["groups"]]
+        deps = [d["model_name"] for d in snap["litellm"]["deployments"]]
+        self.assertEqual(groups, sorted(groups, key=str.lower))
+        self.assertEqual(deps, sorted(deps, key=str.lower))
+
+
 class TestDemoSnapshot(unittest.TestCase):
     def test_demo_snapshot_consistent(self):
         snap = m.demo_snapshot()

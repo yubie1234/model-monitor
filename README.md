@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.1.2**
+**버전: v0.1.3**
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 모니터. 터미널(TUI)과 웹 대시보드(`--serve`)를 모두 제공합니다.
 
@@ -145,3 +145,8 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
   `knative: HTTP 403`)가 뜹니다. RBAC([deploy/k8s.yaml](deploy/k8s.yaml) ClusterRole)나 라벨/네임스페이스를 점검하세요.
 - 웹 수집은 백그라운드 스레드에서 주기적으로 돌고 HTTP 는 마지막 스냅샷을 즉시 반환합니다
   (요청 블로킹/BrokenPipe 없음).
+
+## 로드맵 / TODO
+
+- **사용자(키)별 대시보드** — 사용자가 본인 키를 입력하면 그 키로 접근 가능한 모델만 필터링해
+  보여주는 per-user 뷰. 계획은 [TODO.md](TODO.md) 참고.
