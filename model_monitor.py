@@ -1,0 +1,1406 @@
+#!/usr/bin/env python3
+"""
+model_monitor.py — LiteLLM -> KServe -> vLLM/SGLang 백엔드에서 실제로 떠 있는 모델 현황을 조회하는 모니터.
+
+특징
+  - 외부 패키지 0개 (Python 3.6+ 표준 라이브러리만 사용 -> air-gapped 노드에서 설치 없이 실행)
+  - 데이터 소스
+      * LiteLLM gateway:  GET /model_group/info  (등록된 모델 그룹)
+                          GET /health             (백엔드 실제 health = "떠 있음"의 근거)
+                          GET /v1/models          (OpenAI 호환 모델 목록)
+      * (옵션) 백엔드 직접 probe: 각 vLLM/SGLang 엔드포인트의 GET /v1/models, /health
+  - 출력: 1회 스냅샷 / --json / --watch(실시간) 지원
+  - --demo: 라이브 엔드포인트 없이 샘플 데이터로 출력 미리보기
+
+사용 예
+  python3 model_monitor.py --litellm-url http://litellm:4000 --api-key sk-1234
+  python3 model_monitor.py --config config.yaml --watch
+  python3 model_monitor.py --litellm-url http://litellm:4000 --api-key sk-1234 --json
+  python3 model_monitor.py --demo --watch
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
+# ----------------------------------------------------------------------------
+# HTTP (stdlib only)
+# ----------------------------------------------------------------------------
+
+
+def http_get_json(url, api_key=None, timeout=10):
+    """GET url -> (ok: bool, data: dict|list|None, error: str|None)."""
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer %s" % api_key
+        headers["x-api-key"] = api_key  # LiteLLM accepts either
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            try:
+                return True, json.loads(raw), None
+            except ValueError:
+                return False, None, "non-JSON response: %s" % raw[:200]
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        return False, None, "HTTP %s %s %s" % (e.code, e.reason, body)
+    except urllib.error.URLError as e:
+        return False, None, "connection error: %s" % e.reason
+    except Exception as e:  # noqa: BLE001
+        return False, None, "%s: %s" % (type(e).__name__, e)
+
+
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+
+
+def load_config(path):
+    """JSON 우선, .yaml/.yml 은 PyYAML 있으면 사용. 둘 다 안되면 안내."""
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    if path.endswith((".yaml", ".yml")):
+        try:
+            import yaml  # type: ignore
+        except ImportError:
+            sys.exit(
+                "config '%s' 는 YAML 인데 PyYAML 이 없습니다. "
+                "JSON 설정(.json)을 쓰거나 PyYAML 을 설치하세요." % path
+            )
+        return yaml.safe_load(text) or {}
+    return json.loads(text)
+
+
+def resolve_settings(args):
+    """CLI > env > config 파일 순으로 설정 병합."""
+    cfg = {}
+    if args.config:
+        cfg = load_config(args.config) or {}
+
+    litellm = cfg.get("litellm", {}) if isinstance(cfg.get("litellm"), dict) else {}
+    bc = cfg.get("backend_count", {}) if isinstance(cfg.get("backend_count"), dict) else {}
+
+    # backend 개수 수집(k8s API) 사용 여부:
+    #   --no-backend-count 면 off, 기본은 auto(= in-cluster SA 토큰 있으면 자동 on)
+    bc_enabled = True
+    if getattr(args, "no_backend_count", False):
+        bc_enabled = False
+
+    settings = {
+        "litellm_url": (
+            args.litellm_url
+            or os.environ.get("LITELLM_BASE_URL")
+            or litellm.get("url")
+        ),
+        "api_key": (
+            args.api_key
+            or os.environ.get("LITELLM_API_KEY")
+            or litellm.get("api_key")
+        ),
+        "backends": cfg.get("backends", []),  # [{name,url,type}]
+        "probe_backends": args.probe_backends or bool(cfg.get("probe_backends")),
+        "timeout": args.timeout,
+        # --- backend 개수(LB 뒤 Pod 수) 수집 설정 ---
+        "backend_count": bc_enabled,
+        "k8s_api_server": (args.k8s_api_server or bc.get("api_server")),
+        "k8s_token_file": (args.k8s_token_file or bc.get("token_file")
+                           or "/var/run/secrets/kubernetes.io/serviceaccount/token"),
+        "k8s_ca_file": (args.k8s_ca_file or bc.get("ca_file")
+                        or "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"),
+        "k8s_insecure": bool(args.k8s_insecure or bc.get("insecure")),
+        "k8s_timeout": float(args.k8s_timeout or bc.get("timeout") or 5.0),
+        "default_namespace": bc.get("default_namespace"),
+        "namespace_overrides": bc.get("namespace_overrides", {}) or {},
+        "activator_namespace": bc.get("activator_namespace", "knative-serving"),
+    }
+    return settings
+
+
+# ----------------------------------------------------------------------------
+# Collectors
+# ----------------------------------------------------------------------------
+
+
+def _classify_backend(model_name, underlying, api_base):
+    """model_name 접두사/underlying model 로 백엔드 종류 추정 (표시용)."""
+    blob = ("%s %s %s" % (model_name, underlying, api_base)).lower()
+    if "sglang" in blob:
+        return "sglang"
+    if "kserve" in blob:
+        return "kserve"
+    if "vllm" in blob:
+        return "vllm"
+    return "-"
+
+
+def collect_litellm(url, api_key, timeout):
+    """LiteLLM 게이트웨이에서 모델 그룹 + deployment(api_base) + health 수집.
+
+    핵심: api_base 는 /v1/models 가 아니라 /model/info 에서 나온다.
+    """
+    base = url.rstrip("/")
+    result = {
+        "url": base,
+        "reachable": False,
+        "groups": [],          # model_group/info data
+        "deployments": [],     # /model/info 정규화: model_name -> api_base 등
+        "health": None,        # /health raw
+        "models": [],          # /v1/models ids (이름만)
+        "errors": [],
+    }
+
+    ok, data, err = http_get_json(base + "/model_group/info", api_key, timeout)
+    if ok and isinstance(data, dict):
+        result["reachable"] = True
+        result["groups"] = data.get("data", []) or []
+    elif err:
+        result["errors"].append("model_group/info: %s" % err)
+
+    # /model/info -> 실제 api_base 가 여기서 나온다 (admin 권한 키 권장)
+    ok, data, err = http_get_json(base + "/model/info", api_key, timeout)
+    if ok and isinstance(data, dict):
+        result["reachable"] = True
+        for d in data.get("data", []) or []:
+            lp = d.get("litellm_params", {}) or {}
+            mi = d.get("model_info", {}) or {}
+            name = d.get("model_name", "?")
+            underlying = lp.get("model", "")
+            api_base = lp.get("api_base")
+            result["deployments"].append({
+                "model_name": name,
+                "underlying": underlying,
+                "api_base": api_base,
+                "id": mi.get("id"),
+                "type": _classify_backend(name, underlying, api_base or ""),
+            })
+    elif err:
+        result["errors"].append("model/info: %s" % err)
+
+    ok, data, err = http_get_json(base + "/health", api_key, timeout)
+    if ok and isinstance(data, dict):
+        result["reachable"] = True
+        result["health"] = data
+    elif err:
+        result["errors"].append("health: %s" % err)
+
+    ok, data, err = http_get_json(base + "/v1/models", api_key, timeout)
+    if ok and isinstance(data, dict):
+        result["reachable"] = True
+        result["models"] = [m.get("id") for m in data.get("data", []) if m.get("id")]
+    elif err:
+        result["errors"].append("v1/models: %s" % err)
+
+    return result
+
+
+def collect_backend(backend, timeout):
+    """개별 vLLM/SGLang 백엔드 직접 probe: /v1/models + /health."""
+    name = backend.get("name") or backend.get("url")
+    base = (backend.get("url") or "").rstrip("/")
+    api_key = backend.get("api_key")
+    btype = backend.get("type", "vllm")
+    out = {"name": name, "url": base, "type": btype, "up": False,
+           "models": [], "error": None}
+
+    ok, data, err = http_get_json(base + "/v1/models", api_key, timeout)
+    if ok and isinstance(data, dict):
+        out["up"] = True
+        out["models"] = [m.get("id") for m in data.get("data", []) if m.get("id")]
+    else:
+        out["error"] = err
+
+    if not out["up"]:  # /v1/models 실패 시 /health 라도 확인
+        ok, _, _ = http_get_json(base + "/health", api_key, timeout)
+        out["up"] = ok
+
+    return out
+
+
+def _strip_openai_suffix(api_base):
+    """api_base 에 붙은 OpenAI 경로(/v1, /openai/v1)를 떼어 베이스만 남긴다."""
+    base = api_base.rstrip("/")
+    for suffix in ("/openai/v1", "/v1"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
+
+
+def discover_backends(litellm_result):
+    """LiteLLM 에서 받은 api_base 로 probe 대상 백엔드를 자동 발견.
+
+    -> backends 를 수동으로 적을 필요가 없다. 주소의 원천은 LiteLLM 설정의
+       litellm_params.api_base 이며, /model/info(우선) 또는 /health 가 그대로 돌려준다.
+    """
+    discovered = {}
+    # 1순위: /model/info 의 deployments (api_base 평문 + 종류 분류 포함)
+    for d in litellm_result.get("deployments") or []:
+        api_base = d.get("api_base")
+        if not api_base:
+            continue
+        base = _strip_openai_suffix(api_base)
+        discovered.setdefault(base, {
+            "name": d.get("model_name") or base,
+            "url": base,
+            "type": d.get("type", "-"),
+        })
+    # 2순위 보강: /health 에만 있는 주소
+    health = litellm_result.get("health") or {}
+    for ep in (health.get("healthy_endpoints") or []) + (
+            health.get("unhealthy_endpoints") or []):
+        api_base = ep.get("api_base")
+        if not api_base:
+            continue
+        base = _strip_openai_suffix(api_base)
+        if base in discovered:
+            continue
+        model = ep.get("model", "")
+        btype = _classify_backend(model, model, base)
+        discovered[base] = {"name": model or base, "url": base, "type": btype}
+    return list(discovered.values())
+
+
+# ----------------------------------------------------------------------------
+# Backend 개수: api_base(LB) 뒤의 실제 Pod/replica 수
+#   1순위 EndpointSlice(ready 주소 수) -> Serverless 면 Knative PodAutoscaler
+#   -> RawDeployment Deployment -> none
+#   외부 패키지 0개: urllib + ssl(표준 라이브러리)로 in-cluster k8s API 호출
+# ----------------------------------------------------------------------------
+
+import ssl  # noqa: E402  (표준 라이브러리)
+import urllib.parse  # noqa: E402
+
+
+class K8sClient:
+    """in-cluster Kubernetes API 를 표준 라이브러리만으로 호출."""
+
+    def __init__(self, api_server, token, ssl_ctx, timeout, default_namespace):
+        self.api_server = api_server.rstrip("/") if api_server else None
+        self.token = token
+        self.ssl_ctx = ssl_ctx
+        self.timeout = timeout
+        self.default_namespace = default_namespace or "default"
+
+    @property
+    def enabled(self):
+        return bool(self.api_server)
+
+    @classmethod
+    def from_settings(cls, settings):
+        """in-cluster ServiceAccount 토큰/CA 가 있으면 활성, 없으면 None."""
+        if not settings.get("backend_count"):
+            return None
+
+        # API server 주소: 명시 > env > 기본 in-cluster DNS
+        api_server = settings.get("k8s_api_server")
+        if not api_server:
+            host = os.environ.get("KUBERNETES_SERVICE_HOST")
+            port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+            if host:
+                api_server = "https://%s:%s" % (host, port)
+
+        token = None
+        token_file = settings.get("k8s_token_file")
+        if token_file and os.path.exists(token_file):
+            try:
+                with open(token_file) as f:
+                    token = f.read().strip()
+            except OSError:
+                token = None
+
+        # 토큰이 없으면 클러스터 밖(개발환경)으로 보고 k8s API 비활성
+        if not token:
+            api_server = None
+
+        ssl_ctx = None
+        if api_server:
+            if settings.get("k8s_insecure"):
+                ssl_ctx = ssl._create_unverified_context()
+            else:
+                ca = settings.get("k8s_ca_file")
+                try:
+                    if ca and os.path.exists(ca):
+                        ssl_ctx = ssl.create_default_context(cafile=ca)
+                    else:
+                        ssl_ctx = ssl.create_default_context()
+                except Exception:
+                    ssl_ctx = ssl._create_unverified_context()
+
+        # 네임스페이스 폴백 최종값: 설정 > SA namespace 파일 > default
+        ns = settings.get("default_namespace")
+        if not ns:
+            ns_file = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+            if os.path.exists(ns_file):
+                try:
+                    with open(ns_file) as f:
+                        ns = f.read().strip()
+                except OSError:
+                    ns = None
+
+        if not api_server:   # 토큰/주소 없으면(클러스터 밖) backend 개수 수집 불가
+            return None
+        return cls(
+            api_server=api_server, token=token, ssl_ctx=ssl_ctx,
+            timeout=settings.get("k8s_timeout", 5.0), default_namespace=ns,
+        )
+
+    def get(self, path):
+        """k8s API GET -> (ok, data, err)."""
+        if not self.api_server:
+            return False, None, "k8s api server not configured"
+        url = self.api_server + path
+        headers = {"Accept": "application/json",
+                   "Authorization": "Bearer %s" % self.token}
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(
+                    req, timeout=self.timeout, context=self.ssl_ctx) as resp:
+                return True, json.loads(resp.read().decode("utf-8", "replace")), None
+        except urllib.error.HTTPError as e:
+            return False, None, "HTTP %s %s" % (e.code, e.reason)
+        except Exception as e:  # noqa: BLE001
+            return False, None, "%s: %s" % (type(e).__name__, e)
+
+
+def parse_api_base(api_base, default_namespace="default", overrides=None):
+    """api_base URL -> {service, namespace, port, kind}.
+
+    예: http://qwen36-35b-predictor.kserve.svc:8080/v1
+        -> service=qwen36-35b-predictor, namespace=kserve, port=8080, kind=k8s-svc
+    클러스터 Service 가 아니면 kind='external'.
+    """
+    overrides = overrides or {}
+    try:
+        parts = urllib.parse.urlsplit(api_base)
+    except Exception:
+        return {"service": None, "namespace": None, "port": None, "kind": "external"}
+    host = parts.hostname or ""
+    port = parts.port
+    if not host:
+        return {"service": None, "namespace": None, "port": port, "kind": "external"}
+
+    if host in overrides:  # host 통째 override 우선
+        return {"service": host.split(".")[0],
+                "namespace": overrides[host], "port": port, "kind": "k8s-svc"}
+
+    host = host.rstrip(".")            # FQDN 절대표기 'svc.cluster.local.' 처리
+    tokens = host.split(".")
+
+    # IP 주소거나 공인 도메인(.com/.net 등)이면 클러스터 Service 아님
+    if all(t.isdigit() for t in tokens) or ":" in host:
+        return {"service": None, "namespace": None, "port": port, "kind": "external"}
+
+    service = tokens[0]
+    namespace = None
+    if "svc" in tokens:
+        # [svc].[ns].svc[.cluster.local]
+        idx = tokens.index("svc")
+        if idx >= 2:
+            namespace = tokens[idx - 1]
+    elif len(tokens) >= 2 and tokens[-1] not in (
+            "com", "net", "org", "io", "ai", "co", "dev", "local"):
+        # [svc].[ns] 단축형 (위험 — overrides 권장)
+        namespace = tokens[1]
+    elif len(tokens) >= 3:
+        # 외부 도메인으로 판단
+        return {"service": None, "namespace": None, "port": port, "kind": "external"}
+
+    # service 이름 override (ns 추론 불가한 단축형 보강)
+    if service in overrides:
+        namespace = overrides[service]
+    if not namespace:
+        namespace = default_namespace
+    return {"service": service, "namespace": namespace, "port": port,
+            "kind": "k8s-svc"}
+
+
+def _is_activator(ep, activator_ns):
+    ref = ep.get("targetRef") or {}
+    if ref.get("namespace") == activator_ns:
+        return True
+    name = (ref.get("name") or "").lower()
+    return name.startswith("activator")
+
+
+def count_via_endpointslice(client, ns, svc, activator_ns):
+    """EndpointSlice ready 주소 수 합산. activator 만 있으면 activator_only=True."""
+    path = ("/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices"
+            "?labelSelector=kubernetes.io/service-name=%s" % (ns, svc))
+    ok, data, err = client.get(path)
+    if not ok:
+        return None, err
+    ready = 0
+    saw_activator = False
+    saw_real = False
+    for item in data.get("items", []) or []:
+        for ep in item.get("endpoints", []) or []:
+            cond = ep.get("conditions") or {}
+            if cond.get("ready") is False:
+                continue
+            addrs = ep.get("addresses") or []
+            if _is_activator(ep, activator_ns):
+                saw_activator = True
+                continue
+            saw_real = True
+            ready += len(addrs)
+    return {"ready": ready, "activator_only": saw_activator and not saw_real}, None
+
+
+def count_via_endpoints(client, ns, svc):
+    """core/v1 Endpoints 폴백(구버전 k8s): subsets addresses 고유 IP 수."""
+    ok, data, err = client.get(
+        "/api/v1/namespaces/%s/endpoints/%s" % (ns, svc))
+    if not ok:
+        return None, err
+    ips = set()
+    for sub in data.get("subsets", []) or []:
+        for a in sub.get("addresses", []) or []:
+            if a.get("ip"):
+                ips.add(a["ip"])
+    return {"ready": len(ips)}, None
+
+
+def detect_mode_and_revision(client, ns, svc):
+    """service 이름에서 ISVC 추정 -> deploymentMode + latestReadyRevision."""
+    isvc = svc
+    for suffix in ("-predictor", "-transformer", "-explainer"):
+        if isvc.endswith(suffix):
+            isvc = isvc[: -len(suffix)]
+            break
+    ok, data, err = client.get(
+        "/apis/serving.kserve.io/v1beta1/namespaces/%s/inferenceservices/%s"
+        % (ns, isvc))
+    if not ok:
+        return {"mode": "Unknown", "revision": None, "isvc": isvc}, err
+    status = data.get("status") or {}
+    mode = status.get("deploymentMode") or (
+        data.get("metadata", {}).get("annotations", {})
+        .get("serving.kserve.io/deploymentMode")) or "Unknown"
+    rev = ((status.get("components") or {}).get("predictor") or {}).get(
+        "latestReadyRevision")
+    return {"mode": mode, "revision": rev, "isvc": isvc}, None
+
+
+def count_via_knative(client, ns, revision):
+    """Knative PodAutoscaler actualScale(실시간) 우선, 실패 시 Revision."""
+    if not revision:
+        return None, "no revision"
+    ok, data, err = client.get(
+        "/apis/autoscaling.internal.knative.dev/v1alpha1/namespaces/%s/podautoscalers/%s"
+        % (ns, revision))
+    if ok:
+        st = data.get("status") or {}
+        actual = st.get("actualScale")
+        desired = st.get("desiredScale")
+        if actual is not None:
+            return {"ready": int(actual), "desired": _int_or_none(desired),
+                    "source": "knative-pa",
+                    "scale_to_zero": int(actual) == 0}, None
+    ok, data, err = client.get(
+        "/apis/serving.knative.dev/v1/namespaces/%s/revisions/%s" % (ns, revision))
+    if ok:
+        st = data.get("status") or {}
+        actual = st.get("actualReplicas")
+        if actual is not None:
+            return {"ready": int(actual),
+                    "desired": _int_or_none(st.get("desiredReplicas")),
+                    "source": "knative-revision",
+                    "scale_to_zero": int(actual) == 0}, None
+    return None, err
+
+
+def count_via_deployment(client, ns, svc):
+    """RawDeployment 보정: Deployment status.readyReplicas / spec.replicas."""
+    dep = svc  # KServe RawDeployment 는 보통 service 이름과 동일({isvc}-predictor)
+    ok, data, err = client.get(
+        "/apis/apps/v1/namespaces/%s/deployments/%s" % (ns, dep))
+    if not ok:
+        return None, err
+    spec = data.get("spec") or {}
+    st = data.get("status") or {}
+    return {"ready": int(st.get("readyReplicas") or 0),
+            "desired": _int_or_none(spec.get("replicas")),
+            "source": "deployment"}, None
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_backend_count(deployment, client, settings):
+    """우선순위 체인으로 한 deployment 의 LB 뒤 backend 개수 산출 -> 필드 dict."""
+    out = {"backends_ready": None, "backends_desired": None,
+           "backend_source": "none", "mode": "Unknown",
+           "scale_to_zero": False, "namespace": None, "service": None,
+           "k8s_error": None}
+    api_base = deployment.get("api_base")
+    if not api_base:
+        return out
+
+    parsed = parse_api_base(api_base, client.default_namespace,
+                            settings.get("namespace_overrides"))
+    out["namespace"] = parsed["namespace"]
+    out["service"] = parsed["service"]
+    if parsed["kind"] != "k8s-svc" or not parsed["service"]:
+        out["backend_source"] = "external"
+        return out
+
+    ns, svc = parsed["namespace"], parsed["service"]
+    activator_ns = settings.get("activator_namespace", "knative-serving")
+
+    # 모드 감지(실패해도 치명적 아님)
+    mode_info, _ = (detect_mode_and_revision(client, ns, svc)
+                    if client.enabled else ({"mode": "Unknown", "revision": None}, None))
+    out["mode"] = mode_info.get("mode", "Unknown")
+    revision = mode_info.get("revision")
+
+    if client.enabled:
+        # [1] EndpointSlice
+        es, err = count_via_endpointslice(client, ns, svc, activator_ns)
+        if es is not None and not es.get("activator_only") and es["ready"] > 0:
+            out["backends_ready"] = es["ready"]
+            out["backend_source"] = "endpointslice"
+        elif es is not None and not es.get("activator_only") and out["mode"] != "Serverless":
+            # RawDeployment 인데 0개 -> 진짜 0 (Deployment 로 desired 보강)
+            out["backends_ready"] = 0
+            out["backend_source"] = "endpointslice"
+        else:
+            # [1-fallback] EndpointSlice 404 -> core/v1 Endpoints
+            if es is None and err and "404" in err:
+                eps, _ = count_via_endpoints(client, ns, svc)
+                if eps is not None:
+                    out["backends_ready"] = eps["ready"]
+                    out["backend_source"] = "endpoints"
+
+        # [2] Serverless 보정: 비었거나 activator 만 -> Knative
+        need_correction = (
+            out["backend_source"] in ("none",)
+            or (es is not None and es.get("activator_only"))
+            or (out["mode"] == "Serverless" and (out["backends_ready"] or 0) == 0)
+        )
+        if need_correction and revision:
+            kn, _ = count_via_knative(client, ns, revision)
+            if kn is not None:
+                out["backends_ready"] = kn["ready"]
+                out["backends_desired"] = kn.get("desired")
+                out["backend_source"] = kn["source"]
+                out["scale_to_zero"] = kn.get("scale_to_zero", False)
+
+        # [3] RawDeployment desired 보강 / 여전히 미상이면 Deployment 직접
+        if out["mode"] != "Serverless" and out["backends_desired"] is None:
+            dep, err = count_via_deployment(client, ns, svc)
+            if dep is not None:
+                if out["backend_source"] in ("none", "external"):
+                    out["backends_ready"] = dep["ready"]
+                out["backends_desired"] = dep.get("desired")
+                if out["backend_source"] == "none":
+                    out["backend_source"] = dep["source"]
+            elif err and out["backend_source"] == "none":
+                out["k8s_error"] = err
+
+    return out
+
+
+def build_snapshot(settings):
+    """전체 수집 -> 스냅샷 dict."""
+    snap = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "litellm": None,
+        "backends": [],
+        "summary": {},
+    }
+
+    if settings["litellm_url"]:
+        snap["litellm"] = collect_litellm(
+            settings["litellm_url"], settings["api_key"], settings["timeout"]
+        )
+
+    if settings["probe_backends"]:
+        targets = settings["backends"]
+        # 수동 목록이 없으면 LiteLLM /model/info + /health 에서 자동 발견.
+        if not targets and snap["litellm"]:
+            targets = discover_backends(snap["litellm"])
+        for b in targets:
+            snap["backends"].append(collect_backend(b, settings["timeout"]))
+
+    # 각 deployment 의 LB(api_base) 뒤 backend Pod 개수 채우기
+    client = K8sClient.from_settings(settings)
+    snap["backend_count_enabled"] = bool(client)
+    if client and snap["litellm"]:
+        for d in snap["litellm"].get("deployments") or []:
+            try:
+                d.update(resolve_backend_count(d, client, settings))
+            except Exception as e:  # noqa: BLE001  (한 건 실패가 전체를 막지 않게)
+                d["k8s_error"] = "%s: %s" % (type(e).__name__, e)
+
+    snap["summary"] = summarize(snap)
+    return snap
+
+
+def merge_deployments_with_health(ll):
+    """/model/info(api_base) 와 /health(상태)를 api_base 기준으로 합친 뷰."""
+    health = ll.get("health") or {}
+    healthy = {_strip_openai_suffix(ep["api_base"])
+               for ep in (health.get("healthy_endpoints") or [])
+               if ep.get("api_base")}
+    unhealthy = {_strip_openai_suffix(ep["api_base"])
+                 for ep in (health.get("unhealthy_endpoints") or [])
+                 if ep.get("api_base")}
+    merged = []
+    for d in ll.get("deployments") or []:
+        base = _strip_openai_suffix(d["api_base"]) if d.get("api_base") else None
+        if base in healthy:
+            status = "UP"
+        elif base in unhealthy:
+            status = "DOWN"
+        else:
+            status = "?"   # /health 미조회(권한/비활성)거나 매칭 실패
+        merged.append({**d, "status": status})
+    return merged
+
+
+def summarize(snap):
+    """핵심 지표 계산: 모델 그룹 수, 등록 deployment, 떠 있는 모델(healthy) 수."""
+    s = {
+        "model_groups": 0,
+        "deployments_registered": 0,
+        "deployments_total": 0,
+        "deployments_healthy": 0,
+        "deployments_unhealthy": 0,
+        "backends_up": 0,
+        "backends_total": 0,
+        "backend_models": 0,
+        "backend_pods_ready": 0,     # 모든 LB 뒤 ready Pod 합계
+        "backend_pods_desired": 0,   # 목표 replica 합계
+        "backend_pods_known": False,
+    }
+    ll = snap.get("litellm")
+    if ll:
+        s["model_groups"] = len(ll.get("groups") or [])
+        s["deployments_registered"] = len(ll.get("deployments") or [])
+        health = ll.get("health") or {}
+        hc = health.get("healthy_count")
+        uc = health.get("unhealthy_count")
+        if hc is None:
+            hc = len(health.get("healthy_endpoints") or [])
+        if uc is None:
+            uc = len(health.get("unhealthy_endpoints") or [])
+        s["deployments_healthy"] = hc
+        s["deployments_unhealthy"] = uc
+        s["deployments_total"] = hc + uc
+
+        # LB 뒤 backend Pod 집계 (값이 있는 deployment 만)
+        for d in ll.get("deployments") or []:
+            if d.get("backends_ready") is not None:
+                s["backend_pods_ready"] += d["backends_ready"]
+                s["backend_pods_known"] = True
+            if d.get("backends_desired") is not None:
+                s["backend_pods_desired"] += d["backends_desired"]
+
+    backends = snap.get("backends") or []
+    s["backends_total"] = len(backends)
+    s["backends_up"] = sum(1 for b in backends if b.get("up"))
+    s["backend_models"] = sum(len(b.get("models") or []) for b in backends)
+    return s
+
+
+# ----------------------------------------------------------------------------
+# Rendering (ANSI, no deps)
+# ----------------------------------------------------------------------------
+
+_USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def c(text, color):
+    if not _USE_COLOR:
+        return text
+    codes = {"green": "32", "red": "31", "yellow": "33", "cyan": "36",
+             "bold": "1", "dim": "2", "magenta": "35"}
+    return "\033[%sm%s\033[0m" % (codes.get(color, "0"), text)
+
+
+def _fmt_backends(d):
+    """deployment 의 LB 뒤 backend 개수를 컬러 셀로 포맷."""
+    ready = d.get("backends_ready")
+    desired = d.get("backends_desired")
+    src = d.get("backend_source", "none")
+
+    if src == "external":
+        return c("external", "dim")
+    if d.get("scale_to_zero"):
+        return c("0 (scaled-to-zero)", "yellow")
+    if ready is None:
+        # /health UP 인데 0/미상이면 activator 경유 가능성 힌트
+        if d.get("status") == "UP" and src == "none":
+            return c("? (via activator?)", "yellow")
+        return c("?", "dim")
+
+    if desired is None:
+        body = "%d" % ready
+    else:
+        body = "%d/%d" % (ready, desired)
+
+    if ready == 0:
+        color = "red"
+    elif desired is not None and ready < desired:
+        color = "yellow"
+    else:
+        color = "green"
+    return c(body, color)
+
+
+def _table(headers, rows, aligns=None):
+    """간단한 모노스페이스 테이블 렌더."""
+    cols = len(headers)
+    aligns = aligns or ["l"] * cols
+    widths = [len(str(h)) for h in headers]
+    for row in rows:
+        for i in range(cols):
+            widths[i] = max(widths[i], len(_plain(str(row[i]))))
+
+    def fmt(cells, bold=False):
+        parts = []
+        for i in range(cols):
+            cell = str(cells[i])
+            pad = widths[i] - len(_plain(cell))
+            if aligns[i] == "r":
+                parts.append(" " * pad + cell)
+            else:
+                parts.append(cell + " " * pad)
+        line = "  ".join(parts)
+        return c(line, "bold") if bold else line
+
+    out = [fmt(headers, bold=True)]
+    out.append(c("-" * (sum(widths) + 2 * (cols - 1)), "dim"))
+    for row in rows:
+        out.append(fmt(row))
+    return "\n".join(out)
+
+
+def _plain(s):
+    """ANSI 코드 제거한 표시 길이 계산용."""
+    res = []
+    i = 0
+    while i < len(s):
+        if s[i] == "\033":
+            while i < len(s) and s[i] != "m":
+                i += 1
+            i += 1
+        else:
+            res.append(s[i])
+            i += 1
+    return "".join(res)
+
+
+def render(snap, settings):
+    lines = []
+    s = snap["summary"]
+    lines.append(c("=== Model Monitor ===", "bold") + c("  %s" % snap["ts"], "dim"))
+    lines.append("")
+
+    # 핵심 요약
+    running = c(str(s["deployments_healthy"]), "green")
+    unhealthy = c(str(s["deployments_unhealthy"]),
+                  "red" if s["deployments_unhealthy"] else "dim")
+    summary_bits = [
+        "model groups: %s" % c(str(s["model_groups"]), "cyan"),
+        "registered: %s" % c(str(s["deployments_registered"]), "cyan"),
+        "running(healthy): %s" % running,
+        "unhealthy: %s" % unhealthy,
+    ]
+    if s.get("backend_pods_known"):
+        summary_bits.append(
+            "backend pods: %s/%s" % (
+                c(str(s["backend_pods_ready"]), "green"),
+                s["backend_pods_desired"] or "?")
+        )
+    if settings["probe_backends"]:
+        summary_bits.append(
+            "backends up: %s/%s" % (
+                c(str(s["backends_up"]), "green"), s["backends_total"])
+        )
+    lines.append("  " + "   ".join(summary_bits))
+    lines.append("")
+
+    ll = snap.get("litellm")
+    if ll is None:
+        lines.append(c("  (LiteLLM URL 미설정 — --litellm-url 또는 config 필요)", "yellow"))
+    else:
+        if not ll["reachable"]:
+            lines.append(c("  [LiteLLM] 연결 실패: %s" % ll["url"], "red"))
+            for e in ll["errors"]:
+                lines.append(c("    - %s" % e, "red"))
+        else:
+            # 모델 그룹 테이블
+            rows = []
+            for g in ll["groups"]:
+                providers = ",".join(g.get("providers") or []) or "-"
+                rows.append([
+                    g.get("model_group", "?"),
+                    providers,
+                    g.get("mode") or "-",
+                ])
+            if rows:
+                lines.append(c("  [Model Groups] (LiteLLM /model_group/info)", "bold"))
+                lines.append(indent(_table(
+                    ["MODEL_GROUP", "PROVIDERS", "MODE"], rows), 2))
+                lines.append("")
+
+            # Deployments: model_name -> api_base (/model/info) + 상태(/health)
+            #              + LB 뒤 backend Pod 개수
+            merged = merge_deployments_with_health(ll)
+            show_backends = snap.get("backend_count_enabled")
+            if merged:
+                drows = []
+                for d in merged:
+                    color = {"UP": "green", "DOWN": "red"}.get(d["status"], "yellow")
+                    row = [
+                        c(d["status"], color),
+                        d.get("model_name", "?"),
+                        d.get("type", "-"),
+                    ]
+                    if show_backends:
+                        row.append(_fmt_backends(d))
+                        row.append(c(d.get("backend_source", "-"), "dim"))
+                    row.append(d.get("api_base") or "-")
+                    drows.append(row)
+                hdr = ["STATUS", "MODEL_NAME", "TYPE"]
+                if show_backends:
+                    hdr += ["BACKENDS", "SRC"]
+                hdr.append("API_BASE")
+                title = ("  [Deployments] (/model/info api_base + /health status"
+                         + (" + LB backend pods)" if show_backends else ")"))
+                lines.append(c(title, "bold"))
+                lines.append(indent(_table(hdr, drows), 2))
+                lines.append("")
+            else:
+                # /model/info 가 없으면 /health 의 raw 엔드포인트라도 표시
+                health = ll.get("health") or {}
+                hrows = []
+                for ep in health.get("healthy_endpoints") or []:
+                    hrows.append([c("UP", "green"), ep.get("model", "?"),
+                                  ep.get("api_base", "-")])
+                for ep in health.get("unhealthy_endpoints") or []:
+                    hrows.append([c("DOWN", "red"), ep.get("model", "?"),
+                                  ep.get("api_base", ep.get("error", "-"))])
+                if hrows:
+                    lines.append(c("  [Deployments Health] (LiteLLM /health)", "bold"))
+                    lines.append(indent(_table(
+                        ["STATUS", "MODEL", "API_BASE"], hrows), 2))
+                    lines.append("")
+            if ll["errors"]:
+                for e in ll["errors"]:
+                    lines.append(c("  ! %s" % e, "yellow"))
+
+    # 백엔드 직접 probe
+    if settings["probe_backends"]:
+        brows = []
+        for b in snap["backends"]:
+            status = c("UP", "green") if b["up"] else c("DOWN", "red")
+            models = ",".join(b["models"]) if b["models"] else (b.get("error") or "-")
+            brows.append([status, b["name"], b["type"], models])
+        lines.append(c("  [Backends] (direct /v1/models probe)", "bold"))
+        lines.append(indent(_table(
+            ["STATUS", "NAME", "TYPE", "MODELS"], brows), 2))
+
+    return "\n".join(lines)
+
+
+def indent(text, n):
+    pad = " " * n
+    return "\n".join(pad + ln for ln in text.split("\n"))
+
+
+# ----------------------------------------------------------------------------
+# Demo data
+# ----------------------------------------------------------------------------
+
+
+def demo_snapshot():
+    snap = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "litellm": {
+            "url": "http://litellm:4000 (demo)",
+            "reachable": True,
+            "groups": [
+                {"model_group": "KServe-Qwen3.6-35B-A3B-FP8",
+                 "providers": ["openai"], "mode": "chat"},
+                {"model_group": "SGlang-Qwen3.6-27B-FP8",
+                 "providers": ["openai"], "mode": "chat"},
+                {"model_group": "Qwen3-Embedding-8B",
+                 "providers": ["openai"], "mode": "embedding"},
+            ],
+            # /model/info: model_name -> api_base (여기서 실제 주소가 나온다)
+            #              + LB 뒤 backend Pod 개수 (k8s EndpointSlice 등)
+            "deployments": [
+                {"model_name": "KServe-Qwen3.6-35B-A3B-FP8",
+                 "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8",
+                 "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1",
+                 "id": "a1b2c3", "type": "kserve",
+                 "backends_ready": 3, "backends_desired": 3,
+                 "backend_source": "endpointslice", "mode": "RawDeployment",
+                 "scale_to_zero": False, "namespace": "kserve",
+                 "service": "qwen36-35b-predictor"},
+                {"model_name": "SGlang-Qwen3.6-27B-FP8",
+                 "underlying": "hosted_vllm/Qwen3.6-27B-FP8",
+                 "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1",
+                 "id": "d4e5f6", "type": "sglang",
+                 "backends_ready": 1, "backends_desired": 3,
+                 "backend_source": "endpointslice", "mode": "RawDeployment",
+                 "scale_to_zero": False, "namespace": "serving",
+                 "service": "qwen36-27b-sglang"},
+                {"model_name": "vLLM-Stack-Qwen3-32B-AWQ",
+                 "underlying": "hosted_vllm/Qwen3-32B-AWQ",
+                 "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1",
+                 "id": "g7h8i9", "type": "vllm",
+                 "backends_ready": 0, "backends_desired": 2,
+                 "backend_source": "deployment", "mode": "RawDeployment",
+                 "scale_to_zero": False, "namespace": "serving",
+                 "service": "qwen3-32b-vllm"},
+                {"model_name": "Qwen3-Embedding-8B",
+                 "underlying": "openai/Qwen3-Embedding-8B",
+                 "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1",
+                 "id": "j1k2l3", "type": "kserve",
+                 "backends_ready": 0, "backends_desired": 0,
+                 "backend_source": "knative-pa", "mode": "Serverless",
+                 "scale_to_zero": True, "namespace": "kserve",
+                 "service": "qwen3-embd-predictor"},
+            ],
+            "health": {
+                "healthy_count": 3,
+                "unhealthy_count": 1,
+                "healthy_endpoints": [
+                    {"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8",
+                     "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"},
+                    {"model": "hosted_vllm/Qwen3.6-27B-FP8",
+                     "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"},
+                    {"model": "openai/Qwen3-Embedding-8B",
+                     "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"},
+                ],
+                "unhealthy_endpoints": [
+                    {"model": "hosted_vllm/Qwen3-32B-AWQ",
+                     "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"},
+                ],
+            },
+            "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8",
+                       "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"],
+            "errors": [],
+        },
+        "backends": [],
+        "backend_count_enabled": True,
+        "summary": {},
+    }
+    # 데모에서도 자동 발견 + probe 결과처럼 보이게 backends 채움
+    snap["backends"] = [
+        {"name": "KServe-Qwen3.6-35B-A3B-FP8",
+         "url": "http://qwen36-35b-predictor.kserve.svc:8080",
+         "type": "kserve", "up": True,
+         "models": ["Qwen3.6-35B-A3B-FP8"], "error": None},
+        {"name": "SGlang-Qwen3.6-27B-FP8",
+         "url": "http://qwen36-27b-sglang.serving.svc:30000",
+         "type": "sglang", "up": True,
+         "models": ["Qwen3.6-27B-FP8"], "error": None},
+        {"name": "vLLM-Stack-Qwen3-32B-AWQ",
+         "url": "http://qwen3-32b-vllm.serving.svc:8000",
+         "type": "vllm", "up": False, "models": [], "error": "connection error"},
+    ]
+    snap["summary"] = summarize(snap)
+    return snap
+
+
+# ----------------------------------------------------------------------------
+# Web 대시보드 (--serve): stdlib http.server, 인라인 self-contained 페이지
+# ----------------------------------------------------------------------------
+
+import http.server  # noqa: E402
+
+_DASHBOARD_HTML = r"""<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Monitor — LiteLLM / KServe / vLLM·SGLang</title>
+<style>
+  :root{
+    --bg:#0d1117; --surface:#161b22; --surface2:#1b222c; --border:#232c38;
+    --text:#e6edf3; --muted:#8b97a7; --faint:#5b6675;
+    --accent:#6e8bff; --up:#3fb950; --down:#f85149; --warn:#d29922;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+    font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1240px;margin:0 auto;padding:20px 22px 60px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+    padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px}
+  h1{font-size:17px;font-weight:650;margin:0;letter-spacing:-.01em}
+  h1 .dim{color:var(--faint);font-weight:400}
+  .chain{font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    background:var(--surface);border:1px solid var(--border);border-radius:6px;
+    padding:3px 9px}
+  .spacer{flex:1}
+  .meta{font-family:var(--mono);font-size:12px;color:var(--muted);
+    display:flex;align-items:center;gap:14px}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
+  .dot.live{background:var(--up);box-shadow:0 0 0 0 rgba(63,185,80,.5);
+    animation:pulse 2s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}
+    70%{box-shadow:0 0 0 6px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+  @media (prefers-reduced-motion:reduce){.dot.live{animation:none}}
+  .toggle{font-family:var(--sans);font-size:12px;color:var(--muted);cursor:pointer;
+    user-select:none;display:flex;align-items:center;gap:6px}
+  .toggle input{accent-color:var(--accent)}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:12px;margin-bottom:22px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:9px;
+    padding:14px 16px}
+  .card .label{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;
+    color:var(--muted);margin-bottom:7px}
+  .card .val{font-family:var(--mono);font-size:26px;font-weight:600;
+    font-variant-numeric:tabular-nums;line-height:1}
+  .card .sub{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:6px}
+  .val.good{color:var(--up)} .val.bad{color:var(--down)} .val.warn{color:var(--warn)}
+  .val.accent{color:var(--accent)}
+
+  section{margin-bottom:26px}
+  .sec-title{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+    color:var(--muted);margin:0 0 10px;display:flex;align-items:center;gap:8px}
+  .sec-title .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
+    color:var(--faint);font-size:11px}
+
+  .tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:9px;
+    background:var(--surface)}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+    text-align:left;font-weight:500;padding:10px 14px;border-bottom:1px solid var(--border);
+    white-space:nowrap}
+  td{padding:10px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:var(--surface2)}
+  td.mono,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  td.api{font-family:var(--mono);font-size:12px;color:var(--muted);max-width:340px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  td.name{font-weight:550}
+
+  .pill{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);
+    font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px;
+    border:1px solid transparent}
+  .pill.up{color:var(--up);background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.3)}
+  .pill.down{color:var(--down);background:rgba(248,81,73,.10);border-color:rgba(248,81,73,.3)}
+  .pill.unk{color:var(--muted);background:rgba(139,151,167,.1);border-color:var(--border)}
+  .chip{font-family:var(--mono);font-size:11px;color:var(--muted);
+    background:var(--surface2);border:1px solid var(--border);border-radius:5px;
+    padding:1px 7px}
+
+  /* BACKENDS 셀: ready/desired 미니바 + 수치 */
+  .bk{display:flex;align-items:center;gap:9px}
+  .bk .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px;
+    min-width:46px}
+  .bk .bar{flex:1;max-width:90px;height:6px;border-radius:3px;background:var(--surface2);
+    overflow:hidden;border:1px solid var(--border)}
+  .bk .bar i{display:block;height:100%;border-radius:3px}
+  .bk.good .num{color:var(--up)} .bk.good .bar i{background:var(--up)}
+  .bk.warn .num{color:var(--warn)} .bk.warn .bar i{background:var(--warn)}
+  .bk.bad .num{color:var(--down)} .bk.bad .bar i{background:var(--down)}
+  .bk.zero .num{color:var(--warn)}
+  .bk .note{font-size:10.5px;color:var(--faint)}
+  .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
+
+  .empty{color:var(--muted);padding:18px;text-align:center;font-style:italic}
+  .err{color:var(--down);font-family:var(--mono);font-size:12px;
+    background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.25);
+    border-radius:7px;padding:9px 12px;margin-top:8px}
+  footer{margin-top:30px;color:var(--faint);font-size:11.5px;font-family:var(--mono);
+    border-top:1px solid var(--border);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Model Monitor <span class="dim">· 떠 있는 모델 &amp; LB 뒤 backend</span></h1>
+    <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
+    <span class="spacer"></span>
+    <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
+    <div class="meta">
+      <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
+    </div>
+  </header>
+
+  <div class="cards" id="cards"></div>
+
+  <section id="deployments-sec">
+    <div class="sec-title">Deployments
+      <span class="src">/model/info api_base · /health status · k8s backend pods</span>
+    </div>
+    <div class="tablewrap"><table id="deployments">
+      <thead></thead><tbody></tbody>
+    </table></div>
+    <div id="dep-err"></div>
+  </section>
+
+  <section id="groups-sec">
+    <div class="sec-title">Model Groups <span class="src">/model_group/info</span></div>
+    <div class="tablewrap"><table id="groups"><thead></thead><tbody></tbody></table></div>
+  </section>
+
+  <footer id="foot">model_monitor · 표준 라이브러리만 사용 · 데이터 출처는 LiteLLM + Kubernetes API</footer>
+</div>
+
+<script>
+const REFRESH_MS = __INTERVAL_MS__;
+const $ = (s)=>document.querySelector(s);
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function backendCell(d){
+  const r=d.backends_ready, des=d.backends_desired, src=d.backend_source||"none";
+  if(src==="external") return '<span class="srccol">external</span>';
+  if(d.scale_to_zero) return '<div class="bk zero"><span class="num">0</span>'
+    +'<span class="note">scaled-to-zero</span></div>';
+  if(r==null){
+    if(d.status==="UP" && src==="none")
+      return '<div class="bk warn"><span class="num">?</span>'
+        +'<span class="note">via activator?</span></div>';
+    return '<span class="srccol">?</span>';
+  }
+  let cls="good";
+  if(r===0) cls="bad"; else if(des!=null && r<des) cls="warn";
+  const num = des!=null ? (r+"/"+des) : (""+r);
+  let pct = des && des>0 ? Math.min(100, Math.round(r/des*100)) : (r>0?100:0);
+  return '<div class="bk '+cls+'"><span class="num">'+num+'</span>'
+    +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
+}
+
+function statusPill(s){
+  const cls = s==="UP"?"up":(s==="DOWN"?"down":"unk");
+  return '<span class="pill '+cls+'">'+esc(s)+'</span>';
+}
+
+function card(label,val,cls,sub){
+  return '<div class="card"><div class="label">'+esc(label)+'</div>'
+    +'<div class="val '+(cls||"")+'">'+val+'</div>'
+    +(sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
+}
+
+function render(snap){
+  const s = snap.summary||{};
+  const ll = snap.litellm;
+  // summary cards
+  let cards = "";
+  cards += card("Model Groups", s.model_groups||0, "accent");
+  cards += card("Registered", s.deployments_registered||0, "");
+  cards += card("Running (healthy)", s.deployments_healthy||0, "good",
+    "unhealthy "+(s.deployments_unhealthy||0));
+  if(s.backend_pods_known)
+    cards += card("Backend Pods", (s.backend_pods_ready||0)
+      +'<span style="color:var(--faint);font-size:16px"> / '
+      +(s.backend_pods_desired||0)+'</span>', "",
+      "LB 뒤 ready / desired");
+  $("#cards").innerHTML = cards;
+
+  // deployments
+  const showBk = !!snap.backend_count_enabled;
+  const dt = $("#deployments");
+  if(ll && ll.deployments && ll.deployments.length){
+    const merged = ll.deployments;
+    let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
+    if(showBk) head += '<th>BACKENDS (ready/desired)</th><th>MODE</th><th>SRC</th>';
+    head += "<th>API_BASE</th></tr>";
+    dt.querySelector("thead").innerHTML = head;
+    dt.querySelector("tbody").innerHTML = merged.map(d=>{
+      let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
+        +'<td class="name">'+esc(d.model_name)+"</td>"
+        +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
+      if(showBk) row += "<td>"+backendCell(d)+"</td>"
+        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
+        +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
+      row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
+      return row;
+    }).join("");
+  } else {
+    dt.querySelector("thead").innerHTML="";
+    dt.querySelector("tbody").innerHTML='<tr><td class="empty">deployment 없음 (LiteLLM /model/info 응답 비어있음 또는 미연결)</td></tr>';
+  }
+  $("#dep-err").innerHTML = (ll && ll.errors && ll.errors.length)
+    ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
+
+  // groups
+  const gt = $("#groups");
+  if(ll && ll.groups && ll.groups.length){
+    gt.querySelector("thead").innerHTML="<tr><th>MODEL_GROUP</th><th>PROVIDERS</th><th>MODE</th></tr>";
+    gt.querySelector("tbody").innerHTML = ll.groups.map(g=>
+      '<tr><td class="name">'+esc(g.model_group)+"</td>"
+      +'<td class="mono" style="color:var(--muted)">'+esc((g.providers||[]).join(", ")||"-")+"</td>"
+      +"<td>"+esc(g.mode||"-")+"</td></tr>").join("");
+  } else {
+    gt.querySelector("thead").innerHTML="";
+    gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
+  }
+
+  $("#updated").textContent = (snap.ts||"") + (snap.demo?"  (demo)":"");
+}
+
+async function tick(){
+  try{
+    const r = await fetch("/api/snapshot",{cache:"no-store"});
+    const snap = await r.json();
+    render(snap);
+    $("#livedot").style.background = "var(--up)";
+  }catch(e){
+    $("#livedot").style.background = "var(--down)";
+    $("#updated").textContent = "수집 실패: "+e;
+  }
+}
+
+let timer=null;
+function loop(){ if(timer) clearInterval(timer);
+  if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
+$("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
+tick(); loop();
+</script>
+</body>
+</html>
+"""
+
+
+def serve_dashboard(settings, host, port, interval, demo):
+    """웹 대시보드 서버 실행. /api/snapshot 은 TTL 캐시로 백엔드 부하 억제."""
+    cache = {"snap": None, "at": 0.0}
+    ttl = max(1.0, min(interval, 3.0))
+    html = _DASHBOARD_HTML.replace("__INTERVAL_MS__", str(int(interval * 1000)))
+
+    def get_snapshot():
+        now = time.time()
+        if cache["snap"] is None or (now - cache["at"]) > ttl:
+            snap = demo_snapshot() if demo else build_snapshot(settings)
+            snap["demo"] = bool(demo)
+            cache["snap"] = snap
+            cache["at"] = now
+        return cache["snap"]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype):
+            data = body.encode("utf-8") if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path in ("/", "/index.html"):
+                self._send(200, html, "text/html; charset=utf-8")
+            elif path == "/api/snapshot":
+                snap = get_snapshot()
+                self._send(200, json.dumps(snap, ensure_ascii=False),
+                           "application/json; charset=utf-8")
+            elif path in ("/healthz", "/readyz"):
+                self._send(200, "ok", "text/plain")
+            else:
+                self._send(404, "not found", "text/plain")
+
+        def log_message(self, *a):  # 액세스 로그 억제
+            pass
+
+    httpd = http.server.ThreadingHTTPServer((host, port), Handler)
+    url = "http://%s:%d" % ("localhost" if host == "0.0.0.0" else host, port)
+    print("Model Monitor 웹 대시보드: %s  (%.0fs 갱신, Ctrl+C 종료)"
+          % (url, interval))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print()
+        httpd.shutdown()
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+
+def clear_screen():
+    sys.stdout.write("\033[2J\033[H")
+
+
+def run_once(settings, as_json, demo):
+    snap = demo_snapshot() if demo else build_snapshot(settings)
+    if as_json:
+        print(json.dumps(snap, ensure_ascii=False, indent=2))
+    else:
+        print(render(snap, settings if not demo else dict(settings, probe_backends=True)))
+    return snap
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="LiteLLM/KServe/vLLM-SGLang 모델 현황 모니터")
+    p.add_argument("--litellm-url", help="LiteLLM 게이트웨이 URL (예: http://litellm:4000)")
+    p.add_argument("--api-key", help="LiteLLM API key (admin 권한 권장)")
+    p.add_argument("--config", help="설정 파일 (.json, 또는 PyYAML 있으면 .yaml)")
+    p.add_argument("--probe-backends", action="store_true",
+                   help="설정의 backends 를 직접 /v1/models probe")
+    p.add_argument("--watch", action="store_true", help="실시간 갱신 모드(터미널)")
+    p.add_argument("--interval", type=float, default=5.0, help="watch/웹 갱신 주기(초)")
+    p.add_argument("--json", action="store_true", help="JSON 출력")
+    p.add_argument("--timeout", type=float, default=10.0, help="HTTP 타임아웃(초)")
+    p.add_argument("--demo", action="store_true", help="샘플 데이터로 미리보기")
+    # 웹 UI
+    p.add_argument("--serve", action="store_true",
+                   help="웹 대시보드 모드 (브라우저로 조회)")
+    p.add_argument("--host", default="0.0.0.0", help="웹 서버 bind host")
+    p.add_argument("--port", type=int, default=8088, help="웹 서버 포트")
+    # backend 개수(LB 뒤 Pod 수) 수집
+    p.add_argument("--no-backend-count", action="store_true",
+                   help="LB 뒤 backend Pod 개수 수집 비활성")
+    p.add_argument("--k8s-api-server", help="k8s API server URL 오버라이드")
+    p.add_argument("--k8s-token-file", help="ServiceAccount 토큰 파일 경로")
+    p.add_argument("--k8s-ca-file", help="ServiceAccount CA 파일 경로")
+    p.add_argument("--k8s-insecure", action="store_true",
+                   help="k8s API TLS 검증 비활성")
+    p.add_argument("--k8s-timeout", type=float, help="k8s API 호출 타임아웃(초)")
+    args = p.parse_args()
+
+    settings = resolve_settings(args)
+
+    if (not args.demo and not settings["litellm_url"]
+            and not settings["backends"]):
+        p.error("--litellm-url 또는 --config 가 필요합니다 (또는 --demo).")
+
+    if args.serve:
+        serve_dashboard(settings, args.host, args.port, args.interval, args.demo)
+        return
+
+    if args.watch:
+        try:
+            while True:
+                clear_screen()
+                run_once(settings, args.json, args.demo)
+                sys.stdout.write(
+                    c("\n(%.0fs 마다 갱신 — Ctrl+C 종료)\n" % args.interval, "dim"))
+                sys.stdout.flush()
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print()
+            return
+    else:
+        run_once(settings, args.json, args.demo)
+
+
+if __name__ == "__main__":
+    main()

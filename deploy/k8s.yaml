@@ -1,0 +1,129 @@
+# model-monitor in-cluster 배포 매니페스트
+# 적용: kubectl apply -f k8s.yaml
+# 전제: model_monitor.py 를 담은 컨테이너 이미지(아래 image 교체) 또는 ConfigMap 마운트.
+#
+# 여기서는 ConfigMap 으로 스크립트를 직접 주입하는 무(無)이미지 방식을 기본으로 제공한다
+# (python:3.12-slim 같은 베이스 이미지만 있으면 됨 — air-gapped 에 이미 흔함).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: model-monitor
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-monitor
+  namespace: model-monitor
+---
+# LB 뒤 backend Pod 개수 조회에 필요한 최소 권한.
+# 핵심은 endpointslices(1순위). 나머지는 모드 감지/보정용.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: model-monitor-reader
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["endpoints", "services"]   # 구버전 폴백 + selector 확인
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]             # RawDeployment 보정
+    verbs: ["get", "list"]
+  - apiGroups: ["serving.kserve.io"]
+    resources: ["inferenceservices"]       # deploymentMode / revision 감지
+    verbs: ["get", "list"]
+  - apiGroups: ["serving.knative.dev"]
+    resources: ["revisions"]               # Serverless 보정
+    verbs: ["get", "list"]
+  - apiGroups: ["autoscaling.internal.knative.dev"]
+    resources: ["podautoscalers"]          # Serverless 실시간 actualScale
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: model-monitor-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: model-monitor-reader
+subjects:
+  - kind: ServiceAccount
+    name: model-monitor
+    namespace: model-monitor
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-monitor-config
+  namespace: model-monitor
+data:
+  config.json: |
+    {
+      "litellm": {
+        "url": "http://litellm.litellm.svc.cluster.local:4000",
+        "api_key": "REPLACE_WITH_ADMIN_KEY"
+      },
+      "backend_count": {
+        "default_namespace": "kserve",
+        "activator_namespace": "knative-serving"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-monitor
+  namespace: model-monitor
+  labels: { app: model-monitor }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: model-monitor }
+  template:
+    metadata:
+      labels: { app: model-monitor }
+    spec:
+      serviceAccountName: model-monitor
+      containers:
+        - name: model-monitor
+          # 이미지를 직접 말았다면 그 이미지로 교체하고 command/script 마운트 제거.
+          image: python:3.12-slim
+          command: ["python3", "/app/model_monitor.py",
+                    "--config", "/etc/model-monitor/config.json",
+                    "--serve", "--port", "8088", "--interval", "5"]
+          ports:
+            - { containerPort: 8088, name: http }
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8088 }
+            initialDelaySeconds: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8088 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "200m", memory: "128Mi" }
+          volumeMounts:
+            - { name: app, mountPath: /app }
+            - { name: config, mountPath: /etc/model-monitor }
+      volumes:
+        # model_monitor.py 를 ConfigMap 으로 주입 (이미지 없이 실행):
+        #   kubectl -n model-monitor create configmap model-monitor-src \
+        #     --from-file=model_monitor.py
+        - name: app
+          configMap: { name: model-monitor-src }
+        - name: config
+          configMap: { name: model-monitor-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-monitor
+  namespace: model-monitor
+spec:
+  selector: { app: model-monitor }
+  ports:
+    - { port: 80, targetPort: 8088, name: http }

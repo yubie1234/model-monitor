@@ -1,0 +1,253 @@
+<style>
+  :root{
+    --bg:#0d1117; --surface:#161b22; --surface2:#1b222c; --border:#232c38;
+    --text:#e6edf3; --muted:#8b97a7; --faint:#5b6675;
+    --accent:#6e8bff; --up:#3fb950; --down:#f85149; --warn:#d29922;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+    font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1240px;margin:0 auto;padding:20px 22px 60px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+    padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px}
+  h1{font-size:17px;font-weight:650;margin:0;letter-spacing:-.01em}
+  h1 .dim{color:var(--faint);font-weight:400}
+  .chain{font-family:var(--mono);font-size:11.5px;color:var(--muted);
+    background:var(--surface);border:1px solid var(--border);border-radius:6px;
+    padding:3px 9px}
+  .spacer{flex:1}
+  .meta{font-family:var(--mono);font-size:12px;color:var(--muted);
+    display:flex;align-items:center;gap:14px}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
+  .dot.live{background:var(--up);box-shadow:0 0 0 0 rgba(63,185,80,.5);
+    animation:pulse 2s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.45)}
+    70%{box-shadow:0 0 0 6px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+  @media (prefers-reduced-motion:reduce){.dot.live{animation:none}}
+  .toggle{font-family:var(--sans);font-size:12px;color:var(--muted);cursor:pointer;
+    user-select:none;display:flex;align-items:center;gap:6px}
+  .toggle input{accent-color:var(--accent)}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:12px;margin-bottom:22px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:9px;
+    padding:14px 16px}
+  .card .label{font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;
+    color:var(--muted);margin-bottom:7px}
+  .card .val{font-family:var(--mono);font-size:26px;font-weight:600;
+    font-variant-numeric:tabular-nums;line-height:1}
+  .card .sub{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:6px}
+  .val.good{color:var(--up)} .val.bad{color:var(--down)} .val.warn{color:var(--warn)}
+  .val.accent{color:var(--accent)}
+
+  section{margin-bottom:26px}
+  .sec-title{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
+    color:var(--muted);margin:0 0 10px;display:flex;align-items:center;gap:8px}
+  .sec-title .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
+    color:var(--faint);font-size:11px}
+
+  .tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:9px;
+    background:var(--surface)}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+    text-align:left;font-weight:500;padding:10px 14px;border-bottom:1px solid var(--border);
+    white-space:nowrap}
+  td{padding:10px 14px;border-bottom:1px solid var(--border);vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tbody tr:hover{background:var(--surface2)}
+  td.mono,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  td.api{font-family:var(--mono);font-size:12px;color:var(--muted);max-width:340px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  td.name{font-weight:550}
+
+  .pill{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);
+    font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px;
+    border:1px solid transparent}
+  .pill.up{color:var(--up);background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.3)}
+  .pill.down{color:var(--down);background:rgba(248,81,73,.10);border-color:rgba(248,81,73,.3)}
+  .pill.unk{color:var(--muted);background:rgba(139,151,167,.1);border-color:var(--border)}
+  .chip{font-family:var(--mono);font-size:11px;color:var(--muted);
+    background:var(--surface2);border:1px solid var(--border);border-radius:5px;
+    padding:1px 7px}
+
+  /* BACKENDS 셀: ready/desired 미니바 + 수치 */
+  .bk{display:flex;align-items:center;gap:9px}
+  .bk .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px;
+    min-width:46px}
+  .bk .bar{flex:1;max-width:90px;height:6px;border-radius:3px;background:var(--surface2);
+    overflow:hidden;border:1px solid var(--border)}
+  .bk .bar i{display:block;height:100%;border-radius:3px}
+  .bk.good .num{color:var(--up)} .bk.good .bar i{background:var(--up)}
+  .bk.warn .num{color:var(--warn)} .bk.warn .bar i{background:var(--warn)}
+  .bk.bad .num{color:var(--down)} .bk.bad .bar i{background:var(--down)}
+  .bk.zero .num{color:var(--warn)}
+  .bk .note{font-size:10.5px;color:var(--faint)}
+  .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
+
+  .empty{color:var(--muted);padding:18px;text-align:center;font-style:italic}
+  .err{color:var(--down);font-family:var(--mono);font-size:12px;
+    background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.25);
+    border-radius:7px;padding:9px 12px;margin-top:8px}
+  footer{margin-top:30px;color:var(--faint);font-size:11.5px;font-family:var(--mono);
+    border-top:1px solid var(--border);padding-top:14px}
+</style>
+<script>
+const __SNAP__ = {"ts": "2026-06-25 02:40:04", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 4, "deployments_total": 4, "deployments_healthy": 3, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 4, "backend_pods_desired": 8, "backend_pods_known": true}, "demo": true};
+const _f = window.fetch ? window.fetch.bind(window) : null;
+window.fetch = function(u,o){
+  if(typeof u==='string' && u.indexOf('/api/snapshot')>=0){
+    var d = new Date();
+    __SNAP__.ts = d.toISOString().slice(0,19).replace('T',' ');
+    return Promise.resolve(new Response(JSON.stringify(__SNAP__),
+      {headers:{'Content-Type':'application/json'}}));
+  }
+  return _f ? _f(u,o) : Promise.reject('no fetch');
+};
+</script>
+<div class="wrap">
+  <header>
+    <h1>Model Monitor <span class="dim">· 떠 있는 모델 &amp; LB 뒤 backend</span></h1>
+    <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
+    <span class="spacer"></span>
+    <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
+    <div class="meta">
+      <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
+    </div>
+  </header>
+
+  <div class="cards" id="cards"></div>
+
+  <section id="deployments-sec">
+    <div class="sec-title">Deployments
+      <span class="src">/model/info api_base · /health status · k8s backend pods</span>
+    </div>
+    <div class="tablewrap"><table id="deployments">
+      <thead></thead><tbody></tbody>
+    </table></div>
+    <div id="dep-err"></div>
+  </section>
+
+  <section id="groups-sec">
+    <div class="sec-title">Model Groups <span class="src">/model_group/info</span></div>
+    <div class="tablewrap"><table id="groups"><thead></thead><tbody></tbody></table></div>
+  </section>
+
+  <footer id="foot">model_monitor · 표준 라이브러리만 사용 · 데이터 출처는 LiteLLM + Kubernetes API</footer>
+</div>
+
+<script>
+const REFRESH_MS = 5000;
+const $ = (s)=>document.querySelector(s);
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
+  c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function backendCell(d){
+  const r=d.backends_ready, des=d.backends_desired, src=d.backend_source||"none";
+  if(src==="external") return '<span class="srccol">external</span>';
+  if(d.scale_to_zero) return '<div class="bk zero"><span class="num">0</span>'
+    +'<span class="note">scaled-to-zero</span></div>';
+  if(r==null){
+    if(d.status==="UP" && src==="none")
+      return '<div class="bk warn"><span class="num">?</span>'
+        +'<span class="note">via activator?</span></div>';
+    return '<span class="srccol">?</span>';
+  }
+  let cls="good";
+  if(r===0) cls="bad"; else if(des!=null && r<des) cls="warn";
+  const num = des!=null ? (r+"/"+des) : (""+r);
+  let pct = des && des>0 ? Math.min(100, Math.round(r/des*100)) : (r>0?100:0);
+  return '<div class="bk '+cls+'"><span class="num">'+num+'</span>'
+    +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
+}
+
+function statusPill(s){
+  const cls = s==="UP"?"up":(s==="DOWN"?"down":"unk");
+  return '<span class="pill '+cls+'">'+esc(s)+'</span>';
+}
+
+function card(label,val,cls,sub){
+  return '<div class="card"><div class="label">'+esc(label)+'</div>'
+    +'<div class="val '+(cls||"")+'">'+val+'</div>'
+    +(sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
+}
+
+function render(snap){
+  const s = snap.summary||{};
+  const ll = snap.litellm;
+  // summary cards
+  let cards = "";
+  cards += card("Model Groups", s.model_groups||0, "accent");
+  cards += card("Registered", s.deployments_registered||0, "");
+  cards += card("Running (healthy)", s.deployments_healthy||0, "good",
+    "unhealthy "+(s.deployments_unhealthy||0));
+  if(s.backend_pods_known)
+    cards += card("Backend Pods", (s.backend_pods_ready||0)
+      +'<span style="color:var(--faint);font-size:16px"> / '
+      +(s.backend_pods_desired||0)+'</span>', "",
+      "LB 뒤 ready / desired");
+  $("#cards").innerHTML = cards;
+
+  // deployments
+  const showBk = !!snap.backend_count_enabled;
+  const dt = $("#deployments");
+  if(ll && ll.deployments && ll.deployments.length){
+    const merged = ll.deployments;
+    let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
+    if(showBk) head += '<th>BACKENDS (ready/desired)</th><th>MODE</th><th>SRC</th>';
+    head += "<th>API_BASE</th></tr>";
+    dt.querySelector("thead").innerHTML = head;
+    dt.querySelector("tbody").innerHTML = merged.map(d=>{
+      let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
+        +'<td class="name">'+esc(d.model_name)+"</td>"
+        +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
+      if(showBk) row += "<td>"+backendCell(d)+"</td>"
+        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
+        +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
+      row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
+      return row;
+    }).join("");
+  } else {
+    dt.querySelector("thead").innerHTML="";
+    dt.querySelector("tbody").innerHTML='<tr><td class="empty">deployment 없음 (LiteLLM /model/info 응답 비어있음 또는 미연결)</td></tr>';
+  }
+  $("#dep-err").innerHTML = (ll && ll.errors && ll.errors.length)
+    ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
+
+  // groups
+  const gt = $("#groups");
+  if(ll && ll.groups && ll.groups.length){
+    gt.querySelector("thead").innerHTML="<tr><th>MODEL_GROUP</th><th>PROVIDERS</th><th>MODE</th></tr>";
+    gt.querySelector("tbody").innerHTML = ll.groups.map(g=>
+      '<tr><td class="name">'+esc(g.model_group)+"</td>"
+      +'<td class="mono" style="color:var(--muted)">'+esc((g.providers||[]).join(", ")||"-")+"</td>"
+      +"<td>"+esc(g.mode||"-")+"</td></tr>").join("");
+  } else {
+    gt.querySelector("thead").innerHTML="";
+    gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
+  }
+
+  $("#updated").textContent = (snap.ts||"") + (snap.demo?"  (demo)":"");
+}
+
+async function tick(){
+  try{
+    const r = await fetch("/api/snapshot",{cache:"no-store"});
+    const snap = await r.json();
+    render(snap);
+    $("#livedot").style.background = "var(--up)";
+  }catch(e){
+    $("#livedot").style.background = "var(--down)";
+    $("#updated").textContent = "수집 실패: "+e;
+  }
+}
+
+let timer=null;
+function loop(){ if(timer) clearInterval(timer);
+  if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
+$("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
+tick(); loop();
+</script>
+

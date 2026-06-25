@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 로컬 실제 설정(키 포함) — 예시 파일만 커밋한다
+config.json
+config.yaml
+config.local.*
+
+# 에디터/OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,33 @@
+# model_monitor 설정 예시 (YAML).
+# PyYAML 이 없는 노드에서는 config.example.json 을 쓰세요. 내용은 동일합니다.
+
+litellm:
+  url: "http://litellm.litellm.svc.cluster.local:4000"
+  # admin 권한 키를 쓰면 /health 까지 조회 가능. 키 없이도 /v1/models 는 동작.
+  api_key: "sk-1234"
+
+# 백엔드를 LiteLLM 을 거치지 않고 직접 확인하고 싶을 때 (--probe-backends 또는 아래 probe_backends: true)
+probe_backends: true
+backends:
+  - name: llama-3.1-8b
+    url: "http://llama-8b-predictor.kserve.svc.cluster.local:8080"
+    type: vllm        # vllm | sglang (표시용)
+  - name: qwen2.5-32b
+    url: "http://qwen-32b-predictor.kserve.svc.cluster.local:8080"
+    type: sglang
+    # api_key: "..."   # 백엔드가 키를 요구하면
+
+# --- LB(api_base) 뒤의 실제 backend Pod 개수 수집 ---
+# 기본은 auto: in-cluster ServiceAccount 토큰이 있으면 자동으로 켜짐.
+# 끄려면 실행 시 --no-backend-count.
+backend_count:
+  # api_server: "https://kubernetes.default.svc"   # 보통 자동 감지(env)
+  # token_file: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+  # ca_file: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+  insecure: false           # TLS 검증 비활성(사설/만료 인증서 탈출구)
+  timeout: 5                # k8s API 호출 타임아웃(초)
+  default_namespace: "kserve"   # api_base 에서 ns 추론 불가 시 폴백
+  activator_namespace: "knative-serving"  # Serverless activator 식별용
+  # api_base host -> namespace 매핑 (단축형 주소 보강)
+  namespace_overrides:
+    qwen3-32b-vllm: "serving"

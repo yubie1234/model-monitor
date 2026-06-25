@@ -1,0 +1,28 @@
+{
+  "litellm": {
+    "url": "http://litellm.litellm.svc.cluster.local:4000",
+    "api_key": "sk-1234"
+  },
+  "probe_backends": true,
+  "backends": [
+    {
+      "name": "llama-3.1-8b",
+      "url": "http://llama-8b-predictor.kserve.svc.cluster.local:8080",
+      "type": "vllm"
+    },
+    {
+      "name": "qwen2.5-32b",
+      "url": "http://qwen-32b-predictor.kserve.svc.cluster.local:8080",
+      "type": "sglang"
+    }
+  ],
+  "backend_count": {
+    "insecure": false,
+    "timeout": 5,
+    "default_namespace": "kserve",
+    "activator_namespace": "knative-serving",
+    "namespace_overrides": {
+      "qwen3-32b-vllm": "serving"
+    }
+  }
+}
