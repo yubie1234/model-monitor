@@ -4,7 +4,7 @@ FROM python:3.12-slim
 
 # 이미지 메타데이터(버전은 빌드 시 --build-arg VERSION 으로 주입; ci.sh 가 채움)
 ARG VERSION=dev
-LABEL org.opencontainers.image.title="model-monitor" \
+LABEL org.opencontainers.image.title="ai-tool/llm-monitor" \
       org.opencontainers.image.description="LiteLLM/KServe/vLLM·SGLang 모델 현황 + LB 뒤 backend Pod 개수 모니터" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.source="https://github.com/yubie1234/llm-monitor"

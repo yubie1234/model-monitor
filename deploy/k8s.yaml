@@ -1,9 +1,11 @@
 # model-monitor in-cluster 배포 매니페스트
-# 적용: kubectl apply -f k8s.yaml
-# 전제: model_monitor.py 를 담은 컨테이너 이미지(아래 image 교체) 또는 ConfigMap 마운트.
-#
-# 여기서는 ConfigMap 으로 스크립트를 직접 주입하는 무(無)이미지 방식을 기본으로 제공한다
-# (python:3.12-slim 같은 베이스 이미지만 있으면 됨 — air-gapped 에 이미 흔함).
+# 전제: 이미지가 레지스트리(10.92.20.77:5002)에 올라가 있어야 한다.
+#   ./ci.sh && ./push.sh
+#   # imagePullPolicy: Always 라 latest 최신본을 매번 받는다
+#   # HTTP(비TLS) 레지스트리면 노드 containerd 에 insecure-registry(10.92.20.77:5002) 설정 필요
+# 적용:
+#   kubectl apply -f k8s.yaml
+#   # config(LiteLLM 주소·api_key)는 아래 ConfigMap 의 값을 실제 값으로 교체할 것
 ---
 apiVersion: v1
 kind: Namespace
@@ -96,11 +98,13 @@ spec:
       serviceAccountName: model-monitor
       containers:
         - name: model-monitor
-          # 이미지를 직접 말았다면 그 이미지로 교체하고 command/script 마운트 제거.
-          image: python:3.12-slim
-          command: ["python3", "/app/model_monitor.py",
-                    "--config", "/etc/model-monitor/config.json",
-                    "--serve", "--port", "8088", "--interval", "5"]
+          # ci.sh 로 빌드 -> push.sh 로 레지스트리에 올린 이미지.
+          # ENTRYPOINT 가 python3 model_monitor.py 라 args 만 넘긴다.
+          image: 10.92.20.77:5002/ai-tool/llm-monitor:latest
+          # latest 를 쓰므로 매번 레지스트리에서 최신본을 받는다.
+          imagePullPolicy: Always
+          args: ["--config", "/etc/model-monitor/config.json",
+                 "--serve", "--port", "8088", "--interval", "5"]
           ports:
             - { containerPort: 8088, name: http }
           readinessProbe:
@@ -113,14 +117,8 @@ spec:
             requests: { cpu: "50m", memory: "64Mi" }
             limits: { cpu: "200m", memory: "128Mi" }
           volumeMounts:
-            - { name: app, mountPath: /app }
             - { name: config, mountPath: /etc/model-monitor }
       volumes:
-        # model_monitor.py 를 ConfigMap 으로 주입 (이미지 없이 실행):
-        #   kubectl -n model-monitor create configmap model-monitor-src \
-        #     --from-file=model_monitor.py
-        - name: app
-          configMap: { name: model-monitor-src }
         - name: config
           configMap: { name: model-monitor-config }
 ---

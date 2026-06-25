@@ -101,21 +101,26 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 
 ## 운영 배포
 
-in-cluster 로 배포하면 backend Pod 개수 수집이 자동으로 켜집니다(ServiceAccount 토큰 사용).
+빌드한 컨테이너 이미지로 배포합니다. in-cluster 로 뜨면 backend Pod 개수 수집이 자동으로 켜집니다(ServiceAccount 토큰 사용).
 
-- **매니페스트**: [deploy/k8s.yaml](deploy/k8s.yaml) — Namespace / ServiceAccount / **ClusterRole(RBAC)** / ConfigMap / Deployment / Service. 이미지 없이 `model_monitor.py` 를 ConfigMap 으로 주입하는 방식이 기본:
-  ```bash
-  kubectl create namespace model-monitor
-  kubectl -n model-monitor create configmap model-monitor-src --from-file=model_monitor.py
-  kubectl apply -f deploy/k8s.yaml
-  ```
-- **컨테이너 이미지 방식**(이 레포의 다른 컴포넌트처럼 오프라인 반입):
-  ```dockerfile
-  FROM python:3.12-slim
-  COPY model_monitor.py /app/model_monitor.py
-  ENTRYPOINT ["python3", "/app/model_monitor.py"]
-  ```
-  빌드 후 `docker save ... -o model-monitor-image.tar` 로 묶어 다른 `*-container-images.tar` 와 동일하게 반입.
+1. **이미지 빌드** ([ci.sh](ci.sh) → [Dockerfile](Dockerfile)) — 로컬 `ai-tool/llm-monitor:<버전>` + `:latest`:
+   ```bash
+   ./ci.sh
+   ```
+2. **레지스트리에 push** ([push.sh](push.sh)) — `10.92.20.77:5002` 로 retag 후 push:
+   ```bash
+   ./push.sh
+   #  -> 10.92.20.77:5002/ai-tool/llm-monitor:<버전> + :latest
+   ```
+3. **배포** ([deploy/k8s.yaml](deploy/k8s.yaml) — Namespace / ServiceAccount / **ClusterRole(RBAC)** / ConfigMap / Deployment / Service):
+   ```bash
+   # 먼저 deploy/k8s.yaml 의 ConfigMap 에서 LiteLLM url·api_key·namespace 를 실제 값으로 교체
+   kubectl apply -f deploy/k8s.yaml
+   kubectl -n model-monitor port-forward svc/model-monitor 8088:80   # 브라우저로 확인
+   ```
+
+> Deployment 는 `image: 10.92.20.77:5002/ai-tool/llm-monitor:latest` + `imagePullPolicy: Always` 라 latest 최신본을 매번 레지스트리에서 받습니다.
+> HTTP(비TLS) 레지스트리면 빌드 노드의 docker(`/etc/docker/daemon.json` 의 `insecure-registries`)와 클러스터 노드의 containerd 에 `10.92.20.77:5002` 를 insecure 레지스트리로 등록해야 push/pull 이 됩니다.
 
 ### scale-to-zero / Knative 참고
 KServe Serverless 는 scale-to-zero 시 Service/EndpointSlice 가 activator 를 가리켜 실제 모델 Pod 수를 왜곡합니다.
