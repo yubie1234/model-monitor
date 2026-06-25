@@ -1,8 +1,12 @@
 # model-monitor
 
+**버전: v0.1.0**
+
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 모니터. 터미널(TUI)과 웹 대시보드(`--serve`)를 모두 제공합니다.
 
 외부 패키지 없이 **Python 3.6+ 표준 라이브러리만** 사용합니다. air-gapped 노드에서 `pip install` 없이 `model_monitor.py` 한 파일만 있으면 실행됩니다.
+
+> 버전 확인: `python3 model_monitor.py --version` · TUI/웹 헤더와 `/api/snapshot` 의 `version` 필드에도 표시됩니다.
 
 ## 무엇을 보여주나
 

@@ -28,6 +28,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
+__version__ = "0.1.0"
+
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
 # ----------------------------------------------------------------------------
@@ -616,6 +618,7 @@ def resolve_backend_count(deployment, client, settings):
 def build_snapshot(settings):
     """전체 수집 -> 스냅샷 dict."""
     snap = {
+        "version": __version__,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "litellm": None,
         "backends": [],
@@ -807,7 +810,10 @@ def _plain(s):
 def render(snap, settings):
     lines = []
     s = snap["summary"]
-    lines.append(c("=== Model Monitor ===", "bold") + c("  %s" % snap["ts"], "dim"))
+    ver = snap.get("version", __version__)
+    lines.append(c("=== Model Monitor ===", "bold")
+                 + c(" v%s" % ver, "cyan")
+                 + c("  %s" % snap["ts"], "dim"))
     lines.append("")
 
     # 핵심 요약
@@ -930,6 +936,7 @@ def indent(text, n):
 
 def demo_snapshot():
     snap = {
+        "version": __version__,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "litellm": {
             "url": "http://litellm:4000 (demo)",
@@ -1048,6 +1055,9 @@ _DASHBOARD_HTML = r"""<!doctype html>
     padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px}
   h1{font-size:17px;font-weight:650;margin:0;letter-spacing:-.01em}
   h1 .dim{color:var(--faint);font-weight:400}
+  h1 .ver{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--accent);
+    background:rgba(110,139,255,.12);border:1px solid rgba(110,139,255,.3);
+    border-radius:5px;padding:1px 6px;vertical-align:middle}
   .chain{font-family:var(--mono);font-size:11.5px;color:var(--muted);
     background:var(--surface);border:1px solid var(--border);border-radius:6px;
     padding:3px 9px}
@@ -1131,7 +1141,8 @@ _DASHBOARD_HTML = r"""<!doctype html>
 <body>
 <div class="wrap">
   <header>
-    <h1>Model Monitor <span class="dim">· 떠 있는 모델 &amp; LB 뒤 backend</span></h1>
+    <h1>Model Monitor <span class="ver" id="ver"></span>
+      <span class="dim">· 떠 있는 모델 &amp; LB 뒤 backend</span></h1>
     <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
@@ -1252,6 +1263,9 @@ function render(snap){
     gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
   }
 
+  if(snap.version) $("#ver").textContent = "v"+snap.version;
+  $("#foot").textContent = "model_monitor v"+(snap.version||"?")
+    +" · 표준 라이브러리만 사용 · 데이터 출처는 LiteLLM + Kubernetes API";
   $("#updated").textContent = (snap.ts||"") + (snap.demo?"  (demo)":"");
 }
 
@@ -1349,7 +1363,9 @@ def run_once(settings, as_json, demo):
 
 def main():
     p = argparse.ArgumentParser(
-        description="LiteLLM/KServe/vLLM-SGLang 모델 현황 모니터")
+        description="LiteLLM/KServe/vLLM-SGLang 모델 현황 모니터 (v%s)" % __version__)
+    p.add_argument("--version", action="version",
+                   version="model_monitor %s" % __version__)
     p.add_argument("--litellm-url", help="LiteLLM 게이트웨이 URL (예: http://litellm:4000)")
     p.add_argument("--api-key", help="LiteLLM API key (admin 권한 권장)")
     p.add_argument("--config", help="설정 파일 (.json, 또는 PyYAML 있으면 .yaml)")

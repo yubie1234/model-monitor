@@ -78,14 +78,20 @@ kind: Deployment
 metadata:
   name: model-monitor
   namespace: model-monitor
-  labels: { app: model-monitor }
+  labels:
+    app: model-monitor
+    app.kubernetes.io/name: model-monitor
+    app.kubernetes.io/version: "0.1.0"
 spec:
   replicas: 1
   selector:
     matchLabels: { app: model-monitor }
   template:
     metadata:
-      labels: { app: model-monitor }
+      labels:
+        app: model-monitor
+        app.kubernetes.io/name: model-monitor
+        app.kubernetes.io/version: "0.1.0"
     spec:
       serviceAccountName: model-monitor
       containers:
