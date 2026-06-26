@@ -29,5 +29,8 @@
     "enabled": false,
     "show_internal": false,
     "cache_ttl": 30
+  },
+  "metrics": {
+    "enabled": true
   }
 }

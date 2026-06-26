@@ -77,6 +77,7 @@ python3 model_monitor.py --config config.yaml --serve --port 8088
 #   현재 상태 내보내기(공유/디버깅용 — 헤더의 [💾 JSON]/[정지 페이지] 버튼과 동일):
 #     http://localhost:8088/snapshot.json   # raw JSON 파일 다운로드(클릭 한 번)
 #     http://localhost:8088/snapshot.html   # 데이터가 박제된 self-contained 정지 페이지(저장해 공유)
+#     http://localhost:8088/metrics         # Prometheus 메트릭(기본 ON, --no-metrics 로 끔)
 
 # 키별(per-user) 뷰 — 켜면 "키 필수 모드": 키를 입력해야 목록이 보인다
 #   기본 OFF. 켜기 전에 ① /v1/models 가 키별로 필터되는지 ② TLS 종단 을 확인할 것.
@@ -115,6 +116,39 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   확인**(안 되면 켜지 말 것 — 전체 모델 유출) ② 키를 평문 반복 전송하므로 **TLS 뒤에서만** 노출.
   이 때문에 기능은 **기본 OFF** 입니다. (`--enable-user-view` OFF면 기존 열린 global 대시보드 그대로)
 
+### Prometheus 메트릭 — `GET /metrics`
+
+`--serve` 면 **기본으로** `/metrics` 를 노출합니다(text exposition 0.0.4, 끄려면 `--no-metrics`).
+요청 경로에서 수집하지 않고 **백그라운드 캐시 스냅샷을 포맷만** 하므로(다른 엔드포인트와 동일) 스크레이프가
+수집을 막지 않습니다. 시점 대시보드를 **시계열·알림**으로 확장하는 용도입니다(기존 Prometheus/Grafana 연동).
+
+- **요약 게이지**: `model_monitor_deployments_{total,healthy,unhealthy}`,
+  `model_monitor_backend_pods_{ready,desired}_total`(공유 Service 는 1회만 집계),
+  `model_monitor_model_groups`, `model_monitor_backend_pods_known`.
+- **모델(deployment) 단위**: `model_monitor_model_up`(라벨 `model`/`namespace`/`service`/`status_source`,
+  값 **UP=1 · DOWN=0 · 미상/idle=-1**), `model_monitor_model_backend_pods_{ready,desired}`,
+  `model_monitor_model_scale_to_zero`(0 Pod 가 정상 idle 인지 장애인지 구분).
+- **스크레이프 신뢰도**: `model_monitor_up`, `model_monitor_build_info{version=…}`,
+  `model_monitor_backend_count_enabled`, `model_monitor_collect_errors`(>0 이면 일부 Pod 수 부정확).
+- 활용 예: `model_monitor_model_up == 0 and model_monitor_model_scale_to_zero == 0` 으로 **"진짜 죽음"만**
+  알림(정상 idle 오탐 제거), `model_up == 1 and model_backend_pods_ready == 0` 으로 **LB 는 200인데 뒤에
+  Pod 0** 인 함정 탐지, `avg_over_time(model_monitor_model_up[30d])` 로 모델별 가동률 산출.
+- **주의**: 한 `model_name` 에 여러 deployment(로드밸런싱)가 있으면 동일 라벨 series 가 중복될 수 있어
+  내부적으로 합칩니다(상태는 DOWN 우선). 내부 `api_base` 는 라벨로 노출하지 않습니다(카디널리티·보안).
+- **키 필수 모드(`--enable-user-view`)** 에선 다른 global export 처럼 `/metrics` 도 **admin 키 헤더
+  (`X-LiteLLM-Key`)** 가 있어야 노출됩니다(Prometheus 스크레이프 설정에 헤더 추가).
+
+#### Grafana / Prometheus 연동
+
+바로 쓸 수 있는 구성 파일을 함께 제공합니다:
+
+- [deploy/grafana-dashboard.json](deploy/grafana-dashboard.json) — Grafana 대시보드(Import → JSON 붙여넣기
+  → Prometheus 데이터소스 선택). 개요 stat, **이상 징후**(진짜 DOWN / LB UP인데 Pod 0 / 수집 신뢰도),
+  추세 그래프, 모델별 상태 타임라인, 상세 테이블로 구성. `namespace`/`model` 변수로 필터.
+- [deploy/prometheus-alerts.yaml](deploy/prometheus-alerts.yaml) — 스크레이프 설정 예시 + 알림 룰
+  (`PrometheusRule`): `ModelDown`(idle 제외), `BackendPodsZeroWhileUp`, `BackendCapacityDegraded`,
+  `ModelMonitorDown`, `ModelMonitorCollectErrors`.
+
 ### 설정 우선순위
 CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 
@@ -144,6 +178,7 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 | `--probe-backends` | config 의 backends 를 직접 probe |
 | `--watch` / `--interval N` | 실시간 갱신 / 주기(초, 기본 5) |
 | `--serve` / `--host` / `--port` | 웹 대시보드 (기본 0.0.0.0:8088) |
+| `--no-metrics` | Prometheus `/metrics` 끄기 (기본 ON, `--serve` 시) |
 | `--json` | JSON 출력 |
 | `--timeout N` | HTTP 타임아웃(초, 기본 10) |
 | `--demo` | 샘플 데이터로 미리보기 |
