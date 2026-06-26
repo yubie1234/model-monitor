@@ -20,6 +20,7 @@ model_monitor.py — LiteLLM -> KServe -> vLLM/SGLang 백엔드에서 실제로 
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -29,7 +30,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
@@ -92,6 +93,7 @@ def resolve_settings(args):
 
     litellm = cfg.get("litellm", {}) if isinstance(cfg.get("litellm"), dict) else {}
     bc = cfg.get("backend_count", {}) if isinstance(cfg.get("backend_count"), dict) else {}
+    uv = cfg.get("user_view", {}) if isinstance(cfg.get("user_view"), dict) else {}
 
     # backend 개수 수집(k8s API) 사용 여부:
     #   --no-backend-count 면 off, 기본은 auto(= in-cluster SA 토큰 있으면 자동 on)
@@ -130,6 +132,16 @@ def resolve_settings(args):
         "default_namespace": bc.get("default_namespace"),
         "namespace_overrides": bc.get("namespace_overrides", {}) or {},
         "activator_namespace": bc.get("activator_namespace", "knative-serving"),
+        # --- per-user(키별) 뷰 ---
+        # 기본 OFF: Go/No-Go 게이트(/v1/models 키별 필터 동작) + TLS 종단을 운영자가
+        # 확인한 뒤에만 켠다. 켜지 않으면 POST /api/snapshot/user 는 비활성.
+        "user_view": bool(getattr(args, "enable_user_view", False)
+                          or uv.get("enabled")),
+        # 비-admin 뷰에서 내부 api_base/namespace 숨김(기본 True). 내부 도구라
+        # 토폴로지를 보여줘도 되면 --user-view-show-internal 로 끈다.
+        "user_view_hide_internal": not (
+            getattr(args, "user_view_show_internal", False)
+            or uv.get("show_internal")),
     }
     return settings
 
@@ -224,6 +236,49 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
         result["errors"].append("v1/models: %s" % err)
 
     return result
+
+
+def collect_user_access(url, user_key, timeout):
+    """사용자 본인 키로 접근 가능한 모델 집합 + 키 메타를 수집(per-user 뷰용).
+
+    권한 판정의 **단일 출처는 `/v1/models`** — LiteLLM 이 키의 models/팀 상속/
+    `*`·`openai/*` 와일드카드/access group 을 **이미 해석한 결과**다. 우리가 이를
+    재유도하지 않는다(`/key/info.models` 로 접근권을 다시 풀면 피하려던 해석이 되살아남).
+
+    `/key/info` 는 메타(spend/budget/limit) 표시용으로만 쓴다 — best-effort 라
+    실패해도 모델 목록(접근권)에는 영향 없다.
+
+    fail-closed: `/v1/models` 가 실패(키 무효/만료/네트워크)하면 ok=False, accessible
+    은 빈 집합으로 둔다. 호출측은 절대 unfiltered global 로 폴백하면 안 된다.
+    """
+    base = url.rstrip("/")
+    out = {"ok": False, "error": None, "accessible": [], "key_info": None}
+
+    ok, data, err = http_get_json(base + "/v1/models", user_key, timeout)
+    if not ok:
+        out["error"] = err or "/v1/models 조회 실패"
+        return out
+    if not isinstance(data, dict):
+        out["error"] = "예상치 못한 /v1/models 응답"
+        return out
+    # /v1/models 의 id == /model/info 의 model_name(public name) 으로 조인한다.
+    out["accessible"] = sorted(
+        {m.get("id") for m in (data.get("data") or []) if m.get("id")})
+    out["ok"] = True
+
+    # 키 메타: 비-admin 키가 자기 키 정보를 못 읽는 버전도 있어 best-effort.
+    ok2, ki, _ = http_get_json(base + "/key/info", user_key, timeout)
+    if ok2 and isinstance(ki, dict):
+        info = ki.get("info") if isinstance(ki.get("info"), dict) else ki
+        out["key_info"] = {
+            "spend": info.get("spend"),
+            "max_budget": info.get("max_budget"),
+            "tpm_limit": info.get("tpm_limit"),
+            "rpm_limit": info.get("rpm_limit"),
+            "expires": info.get("expires"),
+            "key_alias": info.get("key_alias"),
+        }
+    return out
 
 
 def collect_backend(backend, timeout):
@@ -834,6 +889,61 @@ def summarize(snap):
     return s
 
 
+def _redact_deployment_for_user(d):
+    """per-user 뷰에서 내부 토폴로지(api_base/underlying/namespace/내부 URL)를 떼고
+    상태·종류·backend Pod 수만 남긴다(비-admin 에 클러스터 구조 비노출)."""
+    return {
+        "model_name": d.get("model_name"),
+        "type": d.get("type", "-"),
+        "status": d.get("status", "?"),
+        "status_source": d.get("status_source"),
+        "backends_ready": d.get("backends_ready"),
+        "backends_desired": d.get("backends_desired"),
+        "backend_source": d.get("backend_source"),
+        "scale_to_zero": d.get("scale_to_zero"),
+        "mode": d.get("mode"),
+    }
+
+
+def filter_snapshot_for_user(global_snap, access, hide_internal=True):
+    """global 스냅샷을 사용자가 접근 가능한 모델로 필터한 per-user 뷰를 만든다.
+
+    핵심: 상태·Pod 수는 **deployment 단위라 키와 무관** → global 값을 그대로 join 하고,
+    "이 키가 접근 가능한 model_name 집합" 으로 걸러내기만 한다(얇은 레이어).
+
+    ⚠️ **공유 캐시 오염 주의** — 서버는 단일 `state["snap"]` 을 공유한다(얕은 복사).
+    반드시 **deepcopy 한 사본 위에서** 필터할 것. global 의 deployments/groups 를
+    제자리(in-place) 로 필터하면 모든 사용자의 global 뷰가 깨진다.
+    """
+    accessible = set(access.get("accessible") or [])
+    snap = copy.deepcopy(global_snap)
+    snap["user_view"] = True
+    snap.pop("loading", None)
+    if hide_internal:
+        # 백그라운드 수집 에러 문자열에 내부 주소가 섞일 수 있어 비-admin 뷰에선 숨긴다.
+        snap.pop("collect_error", None)
+    ll = snap.get("litellm")
+    if ll:
+        deps = [d for d in (ll.get("deployments") or [])
+                if d.get("model_name") in accessible]
+        ll["deployments"] = ([_redact_deployment_for_user(d) for d in deps]
+                             if hide_internal else deps)
+        ll["groups"] = [g for g in (ll.get("groups") or [])
+                        if g.get("model_group") in accessible]
+        # /v1/models 목록은 사용자 키 기준으로 교체(global admin 목록 노출 금지).
+        ll["models"] = sorted(accessible)
+        if hide_internal:
+            # 수집 에러 문자열에 내부 api_base 가 섞일 수 있어 비-admin 뷰에선 숨긴다.
+            ll["errors"] = []
+            ll.pop("health", None)
+            ll.pop("url", None)
+    # 필터된 deployments 기준으로 summary 재계산(카드 수치가 표와 일치).
+    snap["summary"] = summarize(snap)
+    snap["key_info"] = access.get("key_info")
+    snap["accessible_count"] = len(accessible)
+    return snap
+
+
 # ----------------------------------------------------------------------------
 # Rendering (ANSI, no deps)
 # ----------------------------------------------------------------------------
@@ -1269,6 +1379,21 @@ _DASHBOARD_HTML = r"""<!doctype html>
     border-radius:7px;padding:9px 12px}
   footer{margin-top:30px;color:var(--faint);font-size:11.5px;font-family:var(--mono);
     border-top:1px solid var(--border);padding-top:14px}
+
+  /* per-user(키별) 뷰 바 */
+  #userbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+    background:var(--surface);border:1px solid var(--border);border-radius:9px;
+    padding:10px 14px;margin-bottom:18px}
+  #userbar .uv-title{font-size:11px;text-transform:uppercase;letter-spacing:.07em;
+    color:var(--muted)}
+  #userbar input[type=password]{font-family:var(--mono);font-size:12.5px;
+    color:var(--text);background:var(--surface2);border:1px solid var(--border);
+    border-radius:6px;padding:5px 10px;min-width:240px;flex:1;max-width:360px}
+  #userbar input[type=password]:focus{outline:none;border-color:var(--accent)}
+  #userbar button.exp{background:var(--surface2)}
+  .uv-status{font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+  .uv-status.ok{color:var(--up)} .uv-status.bad{color:var(--down)}
+  .uv-note{font-size:10.5px;color:var(--faint)}
 </style>
 </head>
 <body>
@@ -1285,6 +1410,16 @@ _DASHBOARD_HTML = r"""<!doctype html>
       <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
     </div>
   </header>
+
+  <div id="userbar" style="display:none">
+    <span class="uv-title">🔑 내 키로 보기</span>
+    <input id="uv-key" type="password" autocomplete="off" spellcheck="false"
+           placeholder="LiteLLM 키 입력 (sk-…)">
+    <label class="toggle"><input type="checkbox" id="uv-on"> 내 모델만 보기</label>
+    <button id="uv-clear" class="exp" type="button">지우기</button>
+    <span class="uv-status" id="uv-status"></span>
+    <span class="uv-note">키는 이 브라우저(탭)에만 보관 · 매 요청 헤더로만 전송 · 서버 저장 안 함</span>
+  </div>
 
   <div id="banner"></div>
 
@@ -1328,11 +1463,22 @@ _DASHBOARD_HTML = r"""<!doctype html>
 
 <script>
 const REFRESH_MS = __INTERVAL_MS__;
+const USER_VIEW = __USER_VIEW__;   // 서버에서 per-user 뷰 활성 여부 주입
+const UV_KEY = "llm_monitor_key";  // 키는 sessionStorage 에만(탭 닫으면 소멸)
 const $ = (s)=>document.querySelector(s);
 let lastSnap = null;   // 필터 변경 시 재수집 없이 다시 렌더하려고 보관
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function fmtNum(n){
+  if(n==null || isNaN(Number(n))) return String(n);
+  return (Math.round(Number(n)*100)/100).toLocaleString();
+}
+function uvKey(){ return (sessionStorage.getItem(UV_KEY)||"").trim(); }
+function uvActive(){ return USER_VIEW && $("#uv-on") && $("#uv-on").checked && uvKey(); }
+function setUvStatus(msg, cls){ const el=$("#uv-status");
+  if(el){ el.textContent=msg||""; el.className="uv-status "+(cls||""); } }
 
 function backendCell(d){
   const r=d.backends_ready, des=d.backends_desired, src=d.backend_source||"none";
@@ -1382,6 +1528,30 @@ function render(snap){
   lastSnap = snap;
   // summary cards
   let cards = "";
+  // per-user 뷰: 맨 앞에 "내 키" 카드(접근 모델 수 / spend·예산 / rate limit·만료)
+  if(snap.user_view){
+    const ki = snap.key_info || {};
+    cards += card("내 접근 모델", (snap.accessible_count||0), "accent",
+      ki.key_alias ? esc(ki.key_alias) : "내 키 기준");
+    if(ki.spend!=null || ki.max_budget!=null){
+      const sp = ki.spend!=null ? "$"+fmtNum(ki.spend) : "—";
+      let sub = "&nbsp;";
+      if(ki.max_budget!=null){
+        const rem = ki.spend!=null ? (ki.max_budget - ki.spend) : null;
+        sub = "예산 $"+fmtNum(ki.max_budget)
+            + (rem!=null ? " · 잔액 $"+fmtNum(rem) : "");
+      }
+      cards += card("Spend", sp, "", sub);
+    }
+    if(ki.tpm_limit!=null || ki.rpm_limit!=null || ki.expires){
+      const tpm = ki.tpm_limit!=null ? fmtNum(ki.tpm_limit) : "∞";
+      const rpm = ki.rpm_limit!=null ? fmtNum(ki.rpm_limit) : "∞";
+      const exp = ki.expires ? "만료 "+esc(String(ki.expires).slice(0,10)) : "";
+      cards += card("Rate limit",
+        tpm+'<span style="color:var(--faint);font-size:14px"> tpm</span>',
+        "", "rpm "+rpm+(exp?" · "+exp:""));
+    }
+  }
   cards += card("Model Groups", s.model_groups||0, "accent");
   cards += card("Registered", s.deployments_registered||0, "");
   cards += card("Running (healthy)", s.deployments_healthy||0, "good",
@@ -1395,6 +1565,7 @@ function render(snap){
 
   // deployments
   const showBk = !!snap.backend_count_enabled;
+  const uHide = !!snap.user_view;   // per-user 뷰는 내부 컬럼(MODE/SRC/API_BASE) 숨김
   const dt = $("#deployments");
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
@@ -1404,19 +1575,25 @@ function render(snap){
     $("#f-count").textContent = (fS||fT)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
-    if(showBk) head += '<th>BACKENDS (ready/desired)</th><th>MODE</th><th>SRC</th>';
-    head += "<th>API_BASE</th></tr>";
+    if(showBk) head += '<th>BACKENDS (ready/desired)</th>';
+    if(showBk && !uHide) head += '<th>MODE</th><th>SRC</th>';
+    if(!uHide) head += "<th>API_BASE</th>";
+    head += "</tr>";
+    const ncol = 3 + (showBk?1:0) + (showBk&&!uHide?2:0) + (uHide?0:1);
     dt.querySelector("thead").innerHTML = head;
     dt.querySelector("tbody").innerHTML = merged.length ? merged.map(d=>{
       let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
         +'<td class="name">'+esc(d.model_name)+"</td>"
         +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
-      if(showBk) row += "<td>"+backendCell(d)+"</td>"
-        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
+      if(showBk) row += "<td>"+backendCell(d)+"</td>";
+      if(showBk && !uHide) row +=
+        '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
         +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
-      row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
+      if(!uHide) row += '<td class="api" title="'+esc(d.api_base)+'">'
+        +esc(d.api_base||"-")+"</td>";
+      row += "</tr>";
       return row;
-    }).join("") : '<tr><td class="empty" colspan="7">필터 결과 없음</td></tr>';
+    }).join("") : '<tr><td class="empty" colspan="'+ncol+'">필터 결과 없음</td></tr>';
   } else {
     $("#f-count").textContent="";
     dt.querySelector("thead").innerHTML="";
@@ -1444,19 +1621,53 @@ function render(snap){
   $("#updated").textContent = (snap.ts||"") + (snap.demo?"  (demo)":"");
 }
 
+function showUvError(msg){
+  // fail-closed: 키 검증 실패 시 절대 global 뷰로 폴백하지 않는다 — 화면을 비우고 에러만.
+  lastSnap = null;
+  $("#banner").innerHTML = '<div class="err">⚠ 내 모델 보기 실패: '+esc(msg)
+    + ' — 키를 확인하세요. (전체 뷰로 폴백하지 않습니다)</div>';
+  $("#cards").innerHTML = "";
+  $("#f-count").textContent = "";
+  const dt=$("#deployments");
+  dt.querySelector("thead").innerHTML="";
+  dt.querySelector("tbody").innerHTML=
+    '<tr><td class="empty">키 검증 실패 — 표시할 데이터 없음</td></tr>';
+  const gt=$("#groups");
+  gt.querySelector("thead").innerHTML="";
+  gt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';
+  setUvStatus("키 검증 실패", "bad");
+}
+
 async function tick(){
   // 정지 스냅샷(/snapshot.html)으로 열렸으면 폴링 없이 박제된 데이터만 렌더한다.
   if(window.__SNAPSHOT__){
     render(window.__SNAPSHOT__);
     $("#livedot").style.background = "var(--warn)";
     document.querySelectorAll(".exp").forEach(e=>e.style.display="none");
+    const ub=$("#userbar"); if(ub) ub.style.display="none";  // 정지 페이지는 global 전용
     const a=$("#auto"); if(a){ a.checked=false; a.disabled=true; }
     const u=$("#updated"); if(u) u.textContent += "  · saved snapshot (frozen)";
     return;
   }
   try{
-    const r = await fetch("/api/snapshot",{cache:"no-store"});
-    const snap = await r.json();
+    let snap;
+    if(uvActive()){
+      // 키는 헤더 전용(쿼리 금지). 매 요청에 실어 보내고 서버는 저장하지 않는다.
+      const r = await fetch("/api/snapshot/user",
+        {method:"POST", cache:"no-store",
+         headers:{"X-LiteLLM-Key": uvKey()}});
+      snap = await r.json().catch(()=>({}));
+      if(!r.ok){
+        showUvError((snap && snap.error) ? snap.error : ("HTTP "+r.status));
+        $("#livedot").style.background = "var(--down)";
+        return;
+      }
+      setUvStatus("내 모델만 보는 중 ("+(snap.accessible_count||0)+"개)", "ok");
+    } else {
+      const r = await fetch("/api/snapshot",{cache:"no-store"});
+      snap = await r.json();
+      if(USER_VIEW) setUvStatus("", "");
+    }
     render(snap);
     $("#livedot").style.background = "var(--up)";
   }catch(e){
@@ -1473,6 +1684,27 @@ $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(
 // 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
 $("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+
+// per-user(키별) 뷰: 서버가 활성일 때만 키 입력 바를 노출한다.
+if(USER_VIEW){
+  $("#userbar").style.display = "";
+  const keyInput = $("#uv-key");
+  keyInput.value = uvKey();   // 같은 탭 내 새로고침 시 복원(sessionStorage)
+  keyInput.addEventListener("input", ()=>{
+    // 키는 sessionStorage 에만 둔다(탭 닫으면 소멸). DOM/title 에 새지 않게 값만 보관.
+    sessionStorage.setItem(UV_KEY, keyInput.value.trim());
+  });
+  $("#uv-on").addEventListener("change", ()=>{
+    if($("#uv-on").checked && !uvKey()){ keyInput.focus();
+      setUvStatus("키를 먼저 입력하세요", "bad"); return; }
+    tick();
+  });
+  $("#uv-clear").addEventListener("click", ()=>{
+    sessionStorage.removeItem(UV_KEY); keyInput.value="";
+    $("#uv-on").checked = false; setUvStatus("", "");
+    tick();
+  });
+}
 tick(); loop();
 </script>
 </body>
@@ -1487,7 +1719,11 @@ def serve_dashboard(settings, host, port, interval, demo):
     HTTP 요청에는 마지막으로 수집한 스냅샷을 즉시 돌려준다 -> 브라우저가 멈추거나
     BrokenPipe 가 나지 않는다.
     """
-    html = _DASHBOARD_HTML.replace("__INTERVAL_MS__", str(int(interval * 1000)))
+    user_view_on = bool(settings.get("user_view")) and not demo
+    hide_internal = bool(settings.get("user_view_hide_internal", True))
+    html = (_DASHBOARD_HTML
+            .replace("__INTERVAL_MS__", str(int(interval * 1000)))
+            .replace("__USER_VIEW__", "true" if user_view_on else "false"))
 
     def frozen_html(snap):
         """현재 스냅샷을 페이지에 박제 -> 폴링 없이 그대로 렌더되는 self-contained HTML.
@@ -1603,6 +1839,58 @@ def serve_dashboard(settings, host, port, interval, demo):
             else:
                 self._send(404, "not found", "text/plain")
 
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            if path == "/api/snapshot/user":
+                self._handle_user_snapshot()
+            else:
+                self._send(404, "not found", "text/plain")
+
+        def _drain_body(self):
+            """요청 본문을 읽어 버린다(연결 정리). 본문은 쓰지 않는다."""
+            try:
+                clen = int(self.headers.get("Content-Length") or 0)
+                if clen > 0:
+                    self.rfile.read(clen)
+            except (ValueError, OSError):
+                pass
+
+        def _json(self, code, obj):
+            self._send(code, json.dumps(obj, ensure_ascii=False),
+                       "application/json; charset=utf-8")
+
+        def _handle_user_snapshot(self):
+            """키별 per-user 뷰. 키는 **헤더(X-LiteLLM-Key) 전용**(쿼리 금지),
+            저장·로그 없이 pass-through. fail-closed: 키 무효면 global 폴백 금지."""
+            self._drain_body()
+            # 게이트: 운영자가 명시적으로 켜지 않으면 노출 안 함(기본 OFF).
+            if not user_view_on:
+                self._json(403, {"error": "per-user 뷰가 비활성입니다 "
+                                          "(--enable-user-view).", "user_view": True})
+                return
+            # 키는 헤더 전용 — 쿼리스트링은 프록시/LB 액세스 로그에 남아 금지.
+            key = (self.headers.get("X-LiteLLM-Key") or "").strip()
+            if not key:
+                self._json(400, {"error": "X-LiteLLM-Key 헤더가 필요합니다.",
+                                 "user_view": True})
+                return
+            url = settings.get("litellm_url")
+            if not url:
+                self._json(503, {"error": "LiteLLM 이 설정되지 않았습니다.",
+                                 "user_view": True})
+                return
+            access = collect_user_access(url, key, settings.get("timeout", 10.0))
+            if not access["ok"]:
+                # fail-closed: 절대 unfiltered global 로 폴백하지 않는다.
+                # 내부 토폴로지(주소) 누출 방지 위해 사유는 일반화한 메시지로만.
+                self._json(401, {"error": "유효하지 않거나 만료된 키이거나 "
+                                          "LiteLLM 조회에 실패했습니다.",
+                                 "user_view": True})
+                return
+            snap = filter_snapshot_for_user(self._snapshot(), access,
+                                            hide_internal=hide_internal)
+            self._json(200, snap)
+
         def log_message(self, *a):  # 액세스 로그 억제
             pass
 
@@ -1662,6 +1950,12 @@ def main():
                    help="웹 대시보드 모드 (브라우저로 조회)")
     p.add_argument("--host", default="0.0.0.0", help="웹 서버 bind host")
     p.add_argument("--port", type=int, default=8088, help="웹 서버 포트")
+    # per-user(키별) 뷰 — 기본 OFF (Go/No-Go 게이트 + TLS 확인 후 켤 것)
+    p.add_argument("--enable-user-view", action="store_true",
+                   help="키 입력 per-user 뷰 활성(POST /api/snapshot/user). "
+                        "전제: /v1/models 키별 필터 동작 확인 + TLS 종단")
+    p.add_argument("--user-view-show-internal", action="store_true",
+                   help="per-user 뷰에서 내부 api_base/namespace 도 표시(기본 숨김)")
     # backend 개수(LB 뒤 Pod 수) 수집
     p.add_argument("--no-backend-count", action="store_true",
                    help="LB 뒤 backend Pod 개수 수집 비활성")
