@@ -36,5 +36,6 @@ backend_count:
 # 사용자가 자기 LiteLLM 키를 입력하면 그 키로 볼 수 있는 모델만 보여준다.
 # 기본 OFF. 켜기 전에 ① /v1/models 가 키별 필터되는지 ② TLS 종단 을 반드시 확인할 것.
 user_view:
-  enabled: false        # true 면 POST /api/snapshot/user 활성 (또는 --enable-user-view)
+  enabled: false        # true 면 "키 필수 모드" 활성 (또는 --enable-user-view)
   show_internal: false  # true 면 per-user 뷰에도 내부 api_base/namespace 표시(기본 숨김)
+  cache_ttl: 30         # 키별 접근(/v1/models) 캐시 TTL(초). 폴링 중복 호출 제거

@@ -56,9 +56,15 @@ LiteLLM은 가상 키(virtual key)마다 접근 가능한 모델이 다르다. �
 
 ## 5. 구현 계획
 
-> **구현 상태(2026-06): 1차 구현 완료** — `feature/per-user-dashboard`.
+> **구현 상태(2026-06): 구현 완료 + "키 필수 모드"로 발전** — `feature/per-user-dashboard`.
 > 기능은 **기본 OFF**, `--enable-user-view`(또는 config `user_view.enabled`)로만 켠다.
 > 켜기 전에 **4. 사전 검증(Go/No-Go) + TLS** 를 라이브에서 확인할 것.
+>
+> 2차 변경(검수 반영):
+> - **키 필수 모드** — 켜면 무인증 `GET /api/snapshot`·export 를 잠그고, 데이터는 키로만 조회.
+> - **admin 키(= 구동 키)** 입력 시 내부 주소 포함 **전체 뷰** + export 허용(상수시간 비교).
+> - **키별 접근 캐시(TTL 기본 30s)** — 폴링 중복 `/v1/models` 호출 제거. 해시만 보관(원문 키 비저장),
+>   성공만 캐시(무효 키는 매번 재검증). 무거운 데이터는 원래부터 admin 공유 캐시라 키 무관.
 
 ### 백엔드 ([model_monitor.py](model_monitor.py))
 - [x] `collect_user_access(url, user_key, timeout)` — 그 키로 `/v1/models`(접근 model_name 집합) +

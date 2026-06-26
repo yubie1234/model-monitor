@@ -290,6 +290,57 @@ class TestCollectUserAccess(unittest.TestCase):
         self.assertIsNone(out["key_info"])
 
 
+class TestAccessCache(unittest.TestCase):
+    """키별 접근 캐시 — 폴링 중복 호출 제거, 성공만 캐시, TTL 만료."""
+
+    def test_caches_success_and_skips_recollect(self):
+        cache = m.AccessCache(ttl=30.0)
+        calls = {"n": 0}
+        def collect():
+            calls["n"] += 1
+            return {"ok": True, "accessible": ["a"]}
+        a1 = cache.get_or_collect("sk-x", collect, now=100.0)
+        a2 = cache.get_or_collect("sk-x", collect, now=110.0)   # TTL 내
+        self.assertEqual(calls["n"], 1)                          # 재호출 없음
+        self.assertIs(a1, a2)
+
+    def test_recollect_after_ttl(self):
+        cache = m.AccessCache(ttl=30.0)
+        calls = {"n": 0}
+        def collect():
+            calls["n"] += 1
+            return {"ok": True}
+        cache.get_or_collect("sk-x", collect, now=100.0)
+        cache.get_or_collect("sk-x", collect, now=131.0)        # TTL 경과
+        self.assertEqual(calls["n"], 2)
+
+    def test_failure_not_cached(self):
+        cache = m.AccessCache(ttl=30.0)
+        calls = {"n": 0}
+        def collect():
+            calls["n"] += 1
+            return {"ok": False, "error": "401"}
+        cache.get_or_collect("sk-bad", collect, now=100.0)
+        cache.get_or_collect("sk-bad", collect, now=101.0)      # 실패는 매번 재검증
+        self.assertEqual(calls["n"], 2)
+
+    def test_distinct_keys_distinct_entries(self):
+        cache = m.AccessCache(ttl=30.0)
+        calls = {"n": 0}
+        def collect():
+            calls["n"] += 1
+            return {"ok": True}
+        cache.get_or_collect("sk-a", collect, now=100.0)
+        cache.get_or_collect("sk-b", collect, now=100.0)
+        self.assertEqual(calls["n"], 2)
+
+    def test_raw_key_never_stored(self):
+        cache = m.AccessCache(ttl=30.0)
+        cache.get_or_collect("sk-secret", lambda: {"ok": True}, now=100.0)
+        self.assertNotIn("sk-secret", cache._d)                 # 해시만 보관
+        self.assertEqual(len(next(iter(cache._d))), 64)         # sha256 hex
+
+
 class TestFilterSnapshotForUser(unittest.TestCase):
     def _global(self):
         return {
