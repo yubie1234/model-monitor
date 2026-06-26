@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.1.3**
+**버전: v0.1.4**
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 모니터. 터미널(TUI)과 웹 대시보드(`--serve`)를 모두 제공합니다.
 
@@ -34,6 +34,14 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 
 표기: `ready/desired` (예: `2/2` 초록, `1/3` 노랑=미달, `0/2` 빨강, `0 (scaled-to-zero)` 노랑=정상 idle).
 `/health` 가 UP 인데 backend `0` 이면 `via activator?` 로 cold-start 대기를 드러냅니다.
+
+> **모델 기준 그룹 뷰 + Model↔Backend 그래프 (웹, v0.1.4)** — 한 model_name 이 여러 백엔드를
+> 가지거나(로드밸런싱) 여러 model_name 이 한 백엔드(api_base=Service)를 공유할 수 있습니다.
+> 웹 대시보드는 deployment 를 model_name 으로 묶어 모델별 합성 상태와 `Σ ready/desired` 를
+> 보여주고(`group by model` 토글), 공유 백엔드는 `⇄ SHARED` 로 명시합니다. 상단 **Model ↔ Backend**
+> 그래프(`show graph` 토글)는 라우팅을 이분 그래프로 그려 공유 백엔드로 간선이 모이는 모습을
+> 한눈에 보여줍니다. 헤드라인 **Backend Pods** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
+> 공유 백엔드가 모델 수만큼 이중 집계되지 않습니다.
 
 > in-cluster 에서 ServiceAccount 토큰이 있으면 **자동으로 켜집니다**(`--no-backend-count` 로 끔).
 > 필요한 RBAC 는 [deploy/k8s.yaml](deploy/k8s.yaml) 의 ClusterRole 참고 — 최소한 `endpointslices` 읽기.

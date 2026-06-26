@@ -106,6 +106,49 @@
   .bk .note{font-size:10.5px;color:var(--faint)}
   .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
 
+  /* 모델 기준 그룹 뷰 */
+  .pill.deg{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
+  tr.grp-row td{background:var(--surface);border-top:2px solid var(--border)}
+  tr.grp-row:first-child td{border-top:none}
+  tr.grp-row td.name{font-weight:600}
+  tr.grp-row .nbk{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:8px}
+  tr.child-row td{background:#0f141b;font-size:12.5px;padding-top:7px;padding-bottom:7px}
+  tr.child-row td.leg{font-family:var(--mono);color:var(--muted);padding-left:26px;position:relative}
+  tr.child-row td.leg::before{content:"↳";position:absolute;left:12px;color:var(--faint)}
+  tr.child-row td.leg .svc{color:var(--text)}
+  .agg{display:flex;align-items:center;gap:9px}
+  .agg .lead{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .shared{font-family:var(--mono);font-size:9.5px;font-weight:700;color:var(--warn);
+    background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.35);border-radius:4px;
+    padding:0 5px;margin-left:8px;letter-spacing:.02em;white-space:nowrap}
+
+  /* Model ↔ Backend 그래프 */
+  #graph-sec .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
+    color:var(--faint);font-size:11px}
+  .graphwrap{overflow:auto;max-height:560px;border:1px solid var(--border);border-radius:9px;
+    background:#0c1118;padding:6px 8px}
+  .graphwrap svg{display:block;width:100%;height:auto;min-width:520px}
+  .glabel{font-family:var(--mono);font-size:10px;fill:var(--muted);
+    text-transform:uppercase;letter-spacing:.08em}
+  .gnode rect{stroke-width:1.5}
+  .gnode .ntext{font-family:var(--mono);font-size:12px;font-weight:600;fill:var(--text)}
+  .gnode .nsub{font-family:var(--mono);font-size:10px;fill:var(--faint)}
+  .gnode.model rect{fill:rgba(110,139,255,.12);stroke:rgba(110,139,255,.55)}
+  .gnode.be.up rect{fill:rgba(63,185,80,.10);stroke:rgba(63,185,80,.5)}
+  .gnode.be.down rect{fill:rgba(248,81,73,.10);stroke:rgba(248,81,73,.5)}
+  .gnode.be.warn rect{fill:rgba(210,153,34,.12);stroke:rgba(210,153,34,.5)}
+  .gnode.be.zero rect{fill:rgba(210,153,34,.08);stroke:rgba(210,153,34,.4)}
+  .gnode.be.unk rect{fill:var(--surface2);stroke:var(--border)}
+  .gnode.be.shared rect{stroke-dasharray:4 3}
+  .gedge{stroke:var(--faint);stroke-width:1.6;fill:none;opacity:.5}
+  .gedge.shared{stroke:var(--warn);stroke-width:2;opacity:.8}
+  .badge-shared{font-family:var(--mono);font-size:9px;font-weight:700;fill:var(--warn)}
+  svg.focusing .gedge{opacity:.07}
+  svg.focusing .gnode{opacity:.28}
+  svg.focusing .gedge.on{opacity:.95}
+  svg.focusing .gnode.on{opacity:1}
+  @media (prefers-reduced-motion:no-preference){.gedge,.gnode{transition:opacity .12s ease}}
+
   .empty{color:var(--muted);padding:18px;text-align:center;font-style:italic}
   .err{color:var(--down);font-family:var(--mono);font-size:12px;
     background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.25);
@@ -117,7 +160,7 @@
   footer{margin-top:30px;color:var(--faint);font-size:11.5px;font-family:var(--mono);
     border-top:1px solid var(--border);padding-top:14px}
 </style>
-<script>window.__SNAPSHOT__={"version": "0.1.3", "ts": "2026-06-25 06:35:54", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "status": "UP", "status_source": "health"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "status": "UP", "status_source": "health"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "status": "DOWN", "status_source": "health"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 4, "deployments_total": 4, "deployments_healthy": 3, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 4, "backend_pods_desired": 8, "backend_pods_known": true}, "demo": true};</script>
+<script>window.__SNAPSHOT__={"version": "0.1.4", "ts": "2026-06-26 08:37:13", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor-2.kserve.svc:8080/v1", "id": "a1b2c4", "type": "kserve", "backends_ready": 2, "backends_desired": 2, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor-2", "status": "UP", "status_source": "health"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "status": "UP", "status_source": "health"}, {"model_name": "Router-Qwen3.6-35B", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c5", "type": "vllm", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "status": "UP", "status_source": "health"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "status": "DOWN", "status_source": "health"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor-2.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 6, "deployments_total": 6, "deployments_healthy": 5, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 6, "backend_pods_desired": 10, "backend_pods_known": true}, "demo": true};</script>
 </head>
 <body>
 <div class="wrap">
@@ -138,10 +181,21 @@
 
   <div class="cards" id="cards"></div>
 
+  <section id="graph-sec" style="display:none">
+    <div class="sec-title">Model ↔ Backend
+      <span class="src">model_name → api_base(Service) 라우팅 · ⇄ 공유 백엔드</span>
+      <span class="filters">
+        <label class="toggle"><input type="checkbox" id="f-graph" checked> show graph</label>
+      </span>
+    </div>
+    <div class="graphwrap" id="graphwrap"></div>
+  </section>
+
   <section id="deployments-sec">
     <div class="sec-title">Deployments
       <span class="src">/model/info api_base · /health status · k8s backend pods</span>
       <span class="filters">
+        <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
         <select id="f-status">
           <option value="">all</option>
@@ -211,6 +265,148 @@ function card(label,val,cls,sub){
     +(sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
 }
 
+// ── 모델 기준 그룹 뷰 헬퍼 ──────────────────────────────────────────────
+// 같은 백엔드(Service)를 여러 model_name 이 공유할 수 있으므로 (ns,svc) 로 식별.
+function svcKeyOf(d){
+  if(d.namespace || d.service) return (d.namespace||"")+"/"+(d.service||"");
+  return "api:"+(d.api_base||"external");
+}
+function trunc(s,n){s=String(s==null?"":s);return s.length>n?s.slice(0,n-1)+"…":s;}
+function backendHost(api){ if(!api) return "";
+  return String(api).replace(/^[a-z]+:\/\//,"").replace(/[:\/].*$/,""); }
+function compositeStatus(bes){
+  let up=0,down=0;
+  bes.forEach(b=>{const s=b.status||"?"; if(s==="UP")up++; else if(s==="DOWN")down++;});
+  if(up===bes.length) return "UP";
+  if(down===bes.length && down>0) return "DOWN";
+  if(up>0) return "DEGRADED";
+  return "?";
+}
+function statusPillCls(s){return s==="UP"?"up":(s==="DOWN"?"down":(s==="DEGRADED"?"deg":"unk"));}
+function compositePill(s){return '<span class="pill '+statusPillCls(s)+'">'+esc(s)+'</span>';}
+function sumBackends(bes){
+  let r=null,d=null;
+  bes.forEach(b=>{ if(b.backends_ready!=null) r=(r||0)+b.backends_ready;
+    if(b.backends_desired!=null) d=(d||0)+b.backends_desired; });
+  return {r:r,d:d};
+}
+function aggCell(r,d){
+  if(r==null) return '<span class="srccol">?</span>';
+  let cls="good"; if(r===0) cls="bad"; else if(d!=null && r<d) cls="warn";
+  const num = d!=null?(r+"/"+d):(""+r);
+  const pct = d&&d>0?Math.min(100,Math.round(r/d*100)):(r>0?100:0);
+  return '<div class="bk '+cls+'"><span class="num">Σ '+num+'</span>'
+    +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
+}
+function sharedMap(all){
+  const mp={};
+  (all||[]).forEach(d=>{const k=svcKeyOf(d);(mp[k]=mp[k]||new Set()).add(d.model_name);});
+  return mp;
+}
+// model_name 으로 묶은 tbody 행들(부모 그룹 행 + 자식 백엔드 행)
+function groupedRows(merged, shared, showBk){
+  const order=[], groups={};
+  merged.forEach(d=>{ if(!groups[d.model_name]){groups[d.model_name]=[];order.push(d.model_name);}
+    groups[d.model_name].push(d); });
+  return order.map(name=>{
+    const bes=groups[name];
+    const st=compositeStatus(bes), agg=sumBackends(bes), type=bes[0].type||"-";
+    let html='<tr class="grp-row"><td>'+compositePill(st)+'</td>'
+      +'<td class="name">'+esc(name)
+        +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
+      +'<td><span class="chip">'+esc(type)+'</span></td>';
+    if(showBk) html+='<td>'+aggCell(agg.r,agg.d)+'</td><td></td><td></td>';
+    html+='<td></td></tr>';
+    bes.forEach(b=>{
+      const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
+      const others=sh?[...shared[k]].filter(x=>x!==name):[];
+      const svcLabel=b.service||backendHost(b.api_base)||"—";
+      html+='<tr class="child-row"><td>'+statusPill(b.status||"?")+'</td>'
+        +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
+          +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
+      if(showBk) html+='<td>'+backendCell(b)+'</td>'
+        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
+        +'<td class="srccol">'+esc(b.backend_source||"-")+'</td>';
+      html+='<td class="api" title="'+esc(b.api_base)+'">'+esc(b.api_base||"-")+'</td></tr>';
+    });
+    return html;
+  }).join("");
+}
+
+// ── Model ↔ Backend 이분 그래프 (SVG, 외부 의존성 0) ─────────────────────
+function beNodeCls(o){
+  if(o.ext) return "unk";
+  if(o.stz) return "zero";
+  if(o.r==null) return "unk";
+  if(o.r===0) return "down";
+  if(o.des!=null && o.r<o.des) return "warn";
+  return "up";
+}
+function attrId(s){return String(s).replace(/[^a-zA-Z0-9_-]/g,"_");}
+function buildGraph(deps){
+  if(!deps || !deps.length) return "";
+  const names=[], seenN={};
+  deps.forEach(d=>{ if(!seenN[d.model_name]){seenN[d.model_name]=1;names.push(d.model_name);} });
+  names.sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
+  const svcOrder=[], svc={};
+  deps.forEach(d=>{ const k=svcKeyOf(d);
+    if(!svc[k]){ svc[k]={key:k,label:d.service||backendHost(d.api_base)||"external",
+      r:d.backends_ready,des:d.backends_desired,status:d.status,
+      ext:(d.backend_source==="external"),stz:d.scale_to_zero,models:new Set()}; svcOrder.push(k); }
+    svc[k].models.add(d.model_name); });
+  const NW=176, NH=42, GAP=16, PADX=16, PADY=34, W=600;
+  const colL=PADX, colR=W-PADX-NW;
+  const rows=Math.max(names.length, svcOrder.length);
+  const H=PADY+rows*NH+(rows>0?(rows-1)*GAP:0)+18;
+  const colY=(k,total)=>{const t=total*NH+(total-1)*GAP; const s=(H-PADY-18-t)/2+PADY; return s+k*(NH+GAP);};
+  const mY={}, sY={};
+  names.forEach((n,i)=>mY[n]=colY(i,names.length));
+  svcOrder.forEach((k,i)=>sY[k]=colY(i,svcOrder.length));
+  let edges="";
+  deps.forEach(d=>{ const k=svcKeyOf(d), sh=svc[k].models.size>1;
+    const y1=mY[d.model_name]+NH/2, y2=sY[k]+NH/2, x1=colL+NW, x2=colR, mx=(x1+x2)/2;
+    edges+='<path class="gedge'+(sh?' shared':'')+'" data-m="'+attrId(d.model_name)+'" data-b="'+attrId(k)+'" '
+      +'d="M'+x1+' '+y1+' C'+mx+' '+y1+' '+mx+' '+y2+' '+x2+' '+y2+'"></path>'; });
+  let mnodes="";
+  names.forEach(n=>{ const y=mY[n];
+    mnodes+='<g class="gnode model" data-key="'+attrId(n)+'" data-kind="m">'
+      +'<rect x="'+colL+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
+      +'<text class="ntext" x="'+(colL+12)+'" y="'+(y+19)+'">'+esc(trunc(n,22))+'</text>'
+      +'<text class="nsub" x="'+(colL+12)+'" y="'+(y+33)+'">model_name</text></g>'; });
+  let snodes="";
+  svcOrder.forEach(k=>{ const o=svc[k], sh=o.models.size>1, y=sY[k];
+    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" pods"+(sh?"  ·  shared ×"+o.models.size:""));
+    snodes+='<g class="gnode be '+beNodeCls(o)+(sh?' shared':'')+'" data-key="'+attrId(k)+'" data-kind="b">'
+      +'<rect x="'+colR+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
+      +'<text class="ntext" x="'+(colR+12)+'" y="'+(y+19)+'">'+esc(trunc(o.label,22))+'</text>'
+      +'<text class="nsub" x="'+(colR+12)+'" y="'+(y+33)+'">'+esc(sub)+'</text>'
+      +(sh?'<text class="badge-shared" x="'+(colR+NW-8)+'" y="'+(y+15)+'" text-anchor="end">⇄</text>':'')
+      +'</g>'; });
+  return '<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Model 과 Backend 라우팅 그래프">'
+    +'<text class="glabel" x="'+colL+'" y="20">Models</text>'
+    +'<text class="glabel" x="'+colR+'" y="20">Backends (Service)</text>'
+    +edges+mnodes+snodes+'</svg>';
+}
+function wireGraph(svg){
+  if(!svg) return;
+  const clear=()=>{svg.classList.remove("focusing");
+    svg.querySelectorAll(".on").forEach(e=>e.classList.remove("on"));};
+  svg.querySelectorAll(".gnode").forEach(node=>{
+    node.addEventListener("mouseenter",()=>{
+      const kind=node.getAttribute("data-kind"), key=node.getAttribute("data-key");
+      svg.classList.add("focusing"); node.classList.add("on");
+      svg.querySelectorAll(".gedge").forEach(ed=>{
+        const match = kind==="m" ? ed.getAttribute("data-m")===key : ed.getAttribute("data-b")===key;
+        if(match){ ed.classList.add("on");
+          const other = kind==="m" ? ed.getAttribute("data-b") : ed.getAttribute("data-m");
+          const on=svg.querySelector((kind==="m"?'.gnode.be[data-key="':'.gnode.model[data-key="')+other+'"]');
+          if(on) on.classList.add("on"); }
+      });
+    });
+    node.addEventListener("mouseleave",clear);
+  });
+}
+
 function render(snap){
   const s = snap.summary||{};
   const ll = snap.litellm;
@@ -244,6 +440,7 @@ function render(snap){
   // deployments
   const showBk = !!snap.backend_count_enabled;
   const dt = $("#deployments");
+  const cols = showBk ? 7 : 4;
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
     const fS = $("#f-status").value, fT = $("#f-type").value;
@@ -255,16 +452,27 @@ function render(snap){
     if(showBk) head += '<th>BACKENDS (ready/desired)</th><th>MODE</th><th>SRC</th>';
     head += "<th>API_BASE</th></tr>";
     dt.querySelector("thead").innerHTML = head;
-    dt.querySelector("tbody").innerHTML = merged.length ? merged.map(d=>{
-      let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
-        +'<td class="name">'+esc(d.model_name)+"</td>"
-        +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
-      if(showBk) row += "<td>"+backendCell(d)+"</td>"
-        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
-        +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
-      row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
-      return row;
-    }).join("") : '<tr><td class="empty" colspan="7">필터 결과 없음</td></tr>';
+    const grouped = $("#f-group").checked;
+    let body;
+    if(!merged.length){
+      body = '<tr><td class="empty" colspan="'+cols+'">필터 결과 없음</td></tr>';
+    } else if(grouped){
+      // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
+      // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
+      body = groupedRows(merged, sharedMap(all), showBk);
+    } else {
+      body = merged.map(d=>{
+        let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
+          +'<td class="name">'+esc(d.model_name)+"</td>"
+          +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
+        if(showBk) row += "<td>"+backendCell(d)+"</td>"
+          +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
+          +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
+        row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
+        return row;
+      }).join("");
+    }
+    dt.querySelector("tbody").innerHTML = body;
   } else {
     $("#f-count").textContent="";
     dt.querySelector("thead").innerHTML="";
@@ -272,6 +480,21 @@ function render(snap){
   }
   $("#dep-err").innerHTML = (ll && ll.errors && ll.errors.length)
     ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
+
+  // Model ↔ Backend 그래프 (스냅샷 데이터만으로 그림 — 추가 수집 없음)
+  const gsec = $("#graph-sec"), gwrap = $("#graphwrap");
+  const deps = (ll && ll.deployments) || [];
+  if(deps.length && $("#f-graph").checked){
+    gsec.style.display = "";
+    gwrap.style.display = "";
+    gwrap.innerHTML = buildGraph(deps);
+    wireGraph(gwrap.querySelector("svg"));
+  } else if(deps.length){
+    gsec.style.display = "";        // 섹션(토글)은 두고 그래프만 숨김
+    gwrap.style.display = "none";
+  } else {
+    gsec.style.display = "none";
+  }
 
   // groups
   const gt = $("#groups");
@@ -321,6 +544,8 @@ $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(
 // 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
 $("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+$("#f-group").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+$("#f-graph").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 tick(); loop();
 </script>
 </body>
