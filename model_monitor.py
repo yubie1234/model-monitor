@@ -891,6 +891,63 @@ def _fmt_backends(d):
     return c(body, color)
 
 
+# --- 모델 기준 그룹 뷰 헬퍼 (TUI/웹 공통 개념; 웹은 JS 에 동일 로직) ---
+def _svc_key(d):
+    """deployment 의 백엔드 Service 식별자. (ns,svc) 우선, 없으면 api_base 폴백."""
+    ns, svc = d.get("namespace"), d.get("service")
+    if ns or svc:
+        return (ns or "", svc or "")
+    return ("api", d.get("api_base") or "external")
+
+
+def _shared_map(deps):
+    """(ns,svc) -> 그 Service 를 쓰는 model_name 집합. 2개 이상이면 공유."""
+    m = {}
+    for d in deps:
+        m.setdefault(_svc_key(d), set()).add(d.get("model_name"))
+    return m
+
+
+def _composite_status(bes):
+    """한 model_name 의 여러 백엔드 상태를 합성: 전부 UP→UP, 전부 DOWN→DOWN,
+    섞이면 DEGRADED, 그 외 ?."""
+    up = sum(1 for b in bes if b.get("status") == "UP")
+    down = sum(1 for b in bes if b.get("status") == "DOWN")
+    n = len(bes)
+    if n and up == n:
+        return "UP"
+    if n and down == n:
+        return "DOWN"
+    if up > 0:
+        return "DEGRADED"
+    return "?"
+
+
+def _sum_backends(bes):
+    """그 model_name 의 백엔드 ready/desired 합(값 있는 것만)."""
+    r = d = None
+    for b in bes:
+        if b.get("backends_ready") is not None:
+            r = (r or 0) + b["backends_ready"]
+        if b.get("backends_desired") is not None:
+            d = (d or 0) + b["backends_desired"]
+    return r, d
+
+
+def _fmt_agg_backends(ready, desired):
+    """모델 그룹 행의 Σ ready/desired 컬러 셀."""
+    if ready is None:
+        return c("?", "dim")
+    body = ("Σ %d/%d" % (ready, desired)) if desired is not None else ("Σ %d" % ready)
+    if ready == 0:
+        color = "red"
+    elif desired is not None and ready < desired:
+        color = "yellow"
+    else:
+        color = "green"
+    return c(body, color)
+
+
 def _table(headers, rows, aligns=None):
     """간단한 모노스페이스 테이블 렌더."""
     cols = len(headers)
@@ -996,19 +1053,60 @@ def render(snap, settings):
             merged = merge_deployments_with_health(ll)
             show_backends = snap.get("backend_count_enabled")
             if merged:
-                drows = []
+                # model_name 으로 묶어 표시. 백엔드가 1개뿐이고 공유도 아니면 한 줄로
+                # 간결히, 여러 백엔드(로드밸런싱)면 그룹 헤더(합성 상태 + Σ) + 자식 줄.
+                # 여러 model_name 이 같은 Service 를 공유하면 ⇄shared 로 명시.
+                shared = _shared_map(merged)
+                order, groups = [], {}
                 for d in merged:
-                    color = {"UP": "green", "DOWN": "red"}.get(d["status"], "yellow")
-                    row = [
-                        c(d["status"], color),
-                        d.get("model_name", "?"),
-                        d.get("type", "-"),
-                    ]
+                    nm = d.get("model_name", "?")
+                    if nm not in groups:
+                        groups[nm] = []
+                        order.append(nm)
+                    groups[nm].append(d)
+
+                def _shared_suffix(b, nm):
+                    others = sorted(x for x in shared.get(_svc_key(b), ()) if x != nm)
+                    return c("  ⇄shared:%s" % ",".join(others), "yellow") if others else ""
+
+                drows = []
+                for nm in order:
+                    bes = groups[nm]
+                    multi = len(bes) > 1
+                    if not multi:
+                        # 단일 백엔드: 한 줄(기존 평면 형태) + 공유 시 마커
+                        d = bes[0]
+                        color = {"UP": "green", "DOWN": "red"}.get(d["status"], "yellow")
+                        row = [c(d["status"], color), nm, d.get("type", "-")]
+                        if show_backends:
+                            row.append(_fmt_backends(d))
+                            row.append(c(d.get("backend_source", "-"), "dim"))
+                        row.append((d.get("api_base") or "-") + _shared_suffix(d, nm))
+                        drows.append(row)
+                        continue
+                    # 여러 백엔드: 그룹 헤더 + 자식
+                    st = _composite_status(bes)
+                    scolor = {"UP": "green", "DOWN": "red"}.get(st, "yellow")
+                    grow = [c(st, scolor),
+                            "%s %s" % (nm, c("(%d)" % len(bes), "dim")),
+                            bes[0].get("type", "-")]
                     if show_backends:
-                        row.append(_fmt_backends(d))
-                        row.append(c(d.get("backend_source", "-"), "dim"))
-                    row.append(d.get("api_base") or "-")
-                    drows.append(row)
+                        r, dd = _sum_backends(bes)
+                        grow.append(_fmt_agg_backends(r, dd))
+                        grow.append("")
+                    grow.append("")
+                    drows.append(grow)
+                    for b in bes:
+                        bcolor = {"UP": "green", "DOWN": "red"}.get(b.get("status"), "yellow")
+                        label = "  ↳ %s%s" % (
+                            b.get("service") or b.get("api_base") or "-",
+                            _shared_suffix(b, nm))
+                        crow = [c(b.get("status", "?"), bcolor), label, ""]
+                        if show_backends:
+                            crow.append(_fmt_backends(b))
+                            crow.append(c(b.get("backend_source", "-"), "dim"))
+                        crow.append(b.get("api_base") or "-")
+                        drows.append(crow)
                 hdr = ["STATUS", "MODEL_NAME", "TYPE"]
                 if show_backends:
                     hdr += ["BACKENDS", "SRC"]
