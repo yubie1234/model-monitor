@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
@@ -96,6 +96,7 @@ def resolve_settings(args):
     litellm = cfg.get("litellm", {}) if isinstance(cfg.get("litellm"), dict) else {}
     bc = cfg.get("backend_count", {}) if isinstance(cfg.get("backend_count"), dict) else {}
     uv = cfg.get("user_view", {}) if isinstance(cfg.get("user_view"), dict) else {}
+    mt = cfg.get("metrics", {}) if isinstance(cfg.get("metrics"), dict) else {}
 
     # backend 개수 수집(k8s API) 사용 여부:
     #   --no-backend-count 면 off, 기본은 auto(= in-cluster SA 토큰 있으면 자동 on)
@@ -146,6 +147,11 @@ def resolve_settings(args):
             or uv.get("show_internal")),
         # 키별 접근 캐시 TTL(초). 폴링 중복 /v1/models 호출을 줄인다.
         "user_view_cache_ttl": float(uv.get("cache_ttl") or 30.0),
+        # --- Prometheus 메트릭(/metrics) ---
+        # 기본 ON(--serve 시). 캐시된 스냅샷을 노출만 하므로 /api/snapshot 과 같은
+        # 수준의 정보 — 끄려면 --no-metrics. user_view(키 필수) 모드에선 다른 global
+        # export 처럼 admin 키 헤더가 있어야 노출된다.
+        "metrics": (not getattr(args, "no_metrics", False)) and mt.get("enabled", True),
     }
     return settings
 
@@ -940,6 +946,162 @@ def summarize(snap):
     s["backends_up"] = sum(1 for b in backends if b.get("up"))
     s["backend_models"] = sum(len(b.get("models") or []) for b in backends)
     return s
+
+
+# ----------------------------------------------------------------------------
+# Prometheus 메트릭 (text exposition format 0.0.4) — stdlib 만 사용
+# ----------------------------------------------------------------------------
+
+# 상태 -> 게이지 값. UP=1, DOWN=0, 그 외(?/unknown/scale-to-zero idle)=-1.
+_STATUS_GAUGE = {"UP": 1, "DOWN": 0}
+
+
+def _prom_label(v):
+    """Prometheus 라벨 값 이스케이프(역슬래시/따옴표/개행)."""
+    s = "" if v is None else str(v)
+    return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _prom_num(v):
+    """게이지 값 직렬화. bool -> 0/1, 정수형 float -> 정수, 그 외 그대로."""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _dedup_samples(samples, reduce_fn):
+    """같은 라벨 셋의 중복 series 를 reduce_fn 으로 합쳐 valid exposition 을 보장한다.
+
+    LiteLLM 은 한 model_name 에 여러 deployment 를 둘 수 있고(=로드밸런싱), 그러면
+    동일 라벨 series 가 중복돼 Prometheus 스크레이프가 깨진다. 값이 None 인 샘플은 버린다.
+    """
+    acc, order = {}, []
+    for labels, value in samples:
+        if value is None:
+            continue
+        key = tuple(sorted(labels.items()))
+        if key not in acc:
+            acc[key] = [labels, value]
+            order.append(key)
+        else:
+            acc[key][1] = reduce_fn(acc[key][1], value)
+    return [(acc[k][0], acc[k][1]) for k in order]
+
+
+def _status_reduce(a, b):
+    """같은 라벨의 상태 충돌 시: DOWN(0) 우선, 다음 UP(1), 그다음 미상(-1)."""
+    if 0 in (a, b):
+        return 0
+    if 1 in (a, b):
+        return 1
+    return -1
+
+
+def render_prometheus_metrics(snap):
+    """캐시된 스냅샷을 Prometheus text exposition(0.0.4) 으로 변환한다.
+
+    수집은 하지 않는다 — 이미 만들어진 snap 을 문자열로 포맷만 한다(요청 경로 비차단).
+    상태 인코딩: UP=1, DOWN=0, ?(미상/scale-to-zero idle)=-1.
+    카디널리티: 라벨은 model/namespace/service/backend_source/status_source 로 한정하고
+    api_base(내부 URL)는 노출하지 않는다(per-user 뷰에서 숨기는 내부 정보).
+    """
+    lines = []
+
+    def emit(name, help_text, mtype, samples):
+        lines.append("# HELP %s %s" % (name, help_text))
+        lines.append("# TYPE %s %s" % (name, mtype))
+        for labels, value in samples:
+            if value is None:
+                continue
+            if labels:
+                lbl = ",".join('%s="%s"' % (k, _prom_label(val))
+                               for k, val in labels.items())
+                lines.append("%s{%s} %s" % (name, lbl, _prom_num(value)))
+            else:
+                lines.append("%s %s" % (name, _prom_num(value)))
+
+    s = snap.get("summary") or {}
+    ll = snap.get("litellm") or {}
+    deps = ll.get("deployments") or []
+
+    # --- 모니터 자체 메타(스크레이프 신뢰도) ---
+    emit("model_monitor_up",
+         "모니터가 스냅샷을 갖고 응답 중이면 1, 첫 수집 전(loading)이면 0.", "gauge",
+         [({}, 0 if snap.get("loading") else 1)])
+    emit("model_monitor_build_info",
+         "버전 정보. 값은 항상 1, version 라벨로 식별.", "gauge",
+         [({"version": snap.get("version") or __version__}, 1)])
+    emit("model_monitor_backend_count_enabled",
+         "k8s 백엔드 Pod 수 수집이 켜져 있으면 1.", "gauge",
+         [({}, 1 if snap.get("backend_count_enabled") else 0)])
+    emit("model_monitor_collect_errors",
+         "k8s 조회 에러가 기록된 deployment 수(>0 이면 일부 Pod 수가 부정확).", "gauge",
+         [({}, sum(1 for d in deps if d.get("k8s_error")))])
+
+    # --- 요약(summary) 게이지 ---
+    emit("model_monitor_deployments_total",
+         "집계된 deployment(모델) 총 수.", "gauge",
+         [({}, s.get("deployments_total", 0))])
+    emit("model_monitor_deployments_healthy",
+         "상태 UP 인 deployment 수.", "gauge",
+         [({}, s.get("deployments_healthy", 0))])
+    emit("model_monitor_deployments_unhealthy",
+         "상태 DOWN 인 deployment 수.", "gauge",
+         [({}, s.get("deployments_unhealthy", 0))])
+    emit("model_monitor_model_groups",
+         "LiteLLM 모델 그룹 수.", "gauge",
+         [({}, s.get("model_groups", 0))])
+    emit("model_monitor_backend_pods_ready_total",
+         "모든 LB 뒤 ready Pod 합계(공유 Service 는 1회만 집계).", "gauge",
+         [({}, s.get("backend_pods_ready", 0))])
+    emit("model_monitor_backend_pods_desired_total",
+         "모든 LB 뒤 목표 replica 합계(공유 Service 는 1회만 집계).", "gauge",
+         [({}, s.get("backend_pods_desired", 0))])
+    emit("model_monitor_backend_pods_known",
+         "backend Pod 수를 하나라도 알아냈으면 1.", "gauge",
+         [({}, 1 if s.get("backend_pods_known") else 0)])
+
+    # --- deployment(모델) 단위 ---
+    def base_labels(d):
+        lab = {"model": d.get("model_name") or ""}
+        if d.get("namespace"):
+            lab["namespace"] = d["namespace"]
+        if d.get("service"):
+            lab["service"] = d["service"]
+        return lab
+
+    up_s, ready_s, desired_s, s2z_s = [], [], [], []
+    for d in deps:
+        lab = base_labels(d)
+        up_lab = dict(lab)
+        if d.get("status_source"):
+            up_lab["status_source"] = d["status_source"]
+        up_s.append((up_lab, _STATUS_GAUGE.get(d.get("status"), -1)))
+        pod_lab = dict(lab)
+        if d.get("backend_source"):
+            pod_lab["backend_source"] = d["backend_source"]
+        ready_s.append((pod_lab, d.get("backends_ready")))
+        desired_s.append((pod_lab, d.get("backends_desired")))
+        s2z_s.append(({"model": d.get("model_name") or ""},
+                      1 if d.get("scale_to_zero") else 0))
+
+    emit("model_monitor_model_up",
+         "모델 상태: UP=1, DOWN=0, 미상/idle=-1.", "gauge",
+         _dedup_samples(up_s, _status_reduce))
+    emit("model_monitor_model_backend_pods_ready",
+         "이 모델 LB 뒤 ready Pod 수. 여러 모델이 같은 Service 를 공유할 수 있어 "
+         "단순 합산은 물리 Pod 를 중복 집계한다 — 총합은 *_total 사용.", "gauge",
+         _dedup_samples(ready_s, max))
+    emit("model_monitor_model_backend_pods_desired",
+         "이 모델 LB 뒤 목표 replica 수.", "gauge",
+         _dedup_samples(desired_s, max))
+    emit("model_monitor_model_scale_to_zero",
+         "scale-to-zero 로 0 Pod 가 정상 idle 이면 1(장애 0 Pod 와 구분).", "gauge",
+         _dedup_samples(s2z_s, max))
+
+    return "\n".join(lines) + "\n"
 
 
 def _redact_deployment_for_user(d):
@@ -2173,6 +2335,7 @@ def serve_dashboard(settings, host, port, interval, demo):
     # 모든 데이터는 키로만(POST /api/snapshot/user) 나간다. admin 키는 전체 뷰 해제.
     user_view_on = bool(settings.get("user_view")) and not demo
     hide_internal = bool(settings.get("user_view_hide_internal", True))
+    metrics_on = bool(settings.get("metrics", True))
     admin_key = settings.get("api_key") or ""
     uaccess = AccessCache(ttl=float(settings.get("user_view_cache_ttl", 30.0)))
 
@@ -2317,6 +2480,17 @@ def serve_dashboard(settings, host, port, interval, demo):
                 # 데이터가 박제된 self-contained 페이지(폴링 없음) — 저장해서 공유용.
                 self._send(200, frozen_html(self._snapshot()),
                            "text/html; charset=utf-8")
+            elif path == "/metrics":
+                # Prometheus 스크레이프. 캐시 스냅샷을 포맷만(수집 안 함).
+                if not metrics_on:
+                    self._send(404, "not found", "text/plain")
+                    return
+                # 키 필수 모드면 다른 global export 처럼 admin 키 헤더가 있어야 노출.
+                if user_view_on and not self._admin_ok():
+                    self._send(403, "metrics 는 admin 키가 필요합니다.", "text/plain")
+                    return
+                self._send(200, render_prometheus_metrics(self._snapshot()),
+                           "text/plain; version=0.0.4; charset=utf-8")
             elif path in ("/healthz", "/readyz"):
                 self._send(200, "ok", "text/plain")
             else:
@@ -2388,6 +2562,9 @@ def serve_dashboard(settings, host, port, interval, demo):
           % (url, interval))
     print("  스냅샷 내보내기: %s/snapshot.json (raw JSON 다운로드)"
           "  ·  %s/snapshot.html (정지 페이지)" % (url, url))
+    if metrics_on:
+        print("  Prometheus 메트릭: %s/metrics%s"
+              % (url, " (admin 키 헤더 필요)" if user_view_on else ""))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -2438,6 +2615,8 @@ def main():
                    help="웹 대시보드 모드 (브라우저로 조회)")
     p.add_argument("--host", default="0.0.0.0", help="웹 서버 bind host")
     p.add_argument("--port", type=int, default=8088, help="웹 서버 포트")
+    p.add_argument("--no-metrics", action="store_true",
+                   help="Prometheus /metrics 엔드포인트 비활성(기본 ON, --serve 시)")
     # per-user(키별) 뷰 — 기본 OFF (Go/No-Go 게이트 + TLS 확인 후 켤 것)
     p.add_argument("--enable-user-view", action="store_true",
                    help="키 입력 per-user 뷰 활성(POST /api/snapshot/user). "

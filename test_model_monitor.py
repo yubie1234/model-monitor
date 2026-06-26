@@ -443,5 +443,151 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         self.assertEqual(out["summary"]["deployments_registered"], 0)
 
 
+class TestPrometheusMetrics(unittest.TestCase):
+    """render_prometheus_metrics: exposition 포맷·인코딩·중복 series 처리."""
+
+    def _parse(self, text):
+        """exposition 텍스트에서 (metric_name{labels}) -> value 맵으로 파싱."""
+        out = {}
+        for line in text.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            key, _, val = line.rpartition(" ")
+            out.setdefault(key, []).append(val)
+        return out
+
+    def _snap(self):
+        ll = {
+            "groups": [{"model_group": "g"}],
+            "health": None,
+            "deployments": [
+                {"model_name": "A", "api_base": "http://a/v1",
+                 "namespace": "ns1", "service": "svc-a",
+                 "backends_ready": 3, "backends_desired": 3,
+                 "backend_source": "deployment", "scale_to_zero": False},
+                {"model_name": "B", "api_base": "http://b/v1",
+                 "namespace": "ns1", "service": "svc-b",
+                 "backends_ready": 0, "backends_desired": 2,
+                 "backend_source": "knative-pa", "scale_to_zero": True},
+            ],
+        }
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "9.9.9", "litellm": ll, "backends": [],
+                "backend_count_enabled": True}
+        snap["summary"] = m.summarize(snap)
+        return snap
+
+    def test_well_formed_exposition(self):
+        text = m.render_prometheus_metrics(self._snap())
+        self.assertTrue(text.endswith("\n"))
+        # HELP/TYPE 헤더가 각 메트릭마다 있어야 한다.
+        self.assertIn("# TYPE model_monitor_model_up gauge", text)
+        self.assertIn("# HELP model_monitor_up", text)
+        # 모든 비주석 라인은 "name{...} value" 또는 "name value" 형태.
+        for line in text.splitlines():
+            if line and not line.startswith("#"):
+                self.assertRegex(line, r"^[a-zA-Z_][a-zA-Z0-9_]*(\{.*\})? -?\d")
+
+    def test_status_encoding(self):
+        parsed = self._parse(m.render_prometheus_metrics(self._snap()))
+        up = parsed['model_monitor_model_up{model="A",namespace="ns1",'
+                    'service="svc-a",status_source="k8s"}']
+        self.assertEqual(up, ["1"])   # A: ready>0 -> UP=1
+        # B: ready=0 이지만 scale_to_zero -> 정상 idle "?" -> -1 (DOWN 아님)
+        idle = parsed['model_monitor_model_up{model="B",namespace="ns1",'
+                      'service="svc-b",status_source="k8s"}']
+        self.assertEqual(idle, ["-1"])
+        self.assertEqual(parsed['model_monitor_model_scale_to_zero{model="B"}'],
+                         ["1"])
+
+    def test_unknown_status_is_minus_one(self):
+        # status 가 ?(미상)면 -1 로 인코딩.
+        ll = {"groups": [], "health": None,
+              "deployments": [{"model_name": "U", "api_base": "1.2.3.4",
+                               "backend_source": "external"}]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "x", "litellm": ll, "backends": [],
+                "backend_count_enabled": False}
+        snap["summary"] = m.summarize(snap)
+        text = m.render_prometheus_metrics(snap)
+        self.assertIn('model_monitor_model_up{model="U",status_source="unknown"} -1',
+                      text)
+
+    def test_summary_gauges_present(self):
+        parsed = self._parse(m.render_prometheus_metrics(self._snap()))
+        self.assertEqual(parsed["model_monitor_deployments_total"], ["2"])
+        self.assertEqual(parsed["model_monitor_deployments_healthy"], ["1"])  # A UP
+        # B 는 scale_to_zero -> "?" 이므로 DOWN(unhealthy) 아님
+        self.assertEqual(parsed["model_monitor_deployments_unhealthy"], ["0"])
+        # 공유 없는 두 Service -> ready 합 3, desired 합 5
+        self.assertEqual(parsed["model_monitor_backend_pods_ready_total"], ["3"])
+        self.assertEqual(parsed["model_monitor_backend_pods_desired_total"], ["5"])
+        self.assertEqual(parsed['model_monitor_build_info{version="9.9.9"}'], ["1"])
+
+    def test_duplicate_series_collapsed(self):
+        # 회귀: LiteLLM 은 한 model_name 에 여러 deployment 를 둘 수 있다(로드밸런싱).
+        # 같은 라벨 series 가 중복되면 Prometheus 스크레이프가 깨지므로 1개로 합쳐야 한다.
+        ll = {"groups": [], "health": None, "deployments": [
+            {"model_name": "LB", "api_base": "http://x/v1",
+             "namespace": "ns", "service": "svc",
+             "backends_ready": 2, "backends_desired": 2,
+             "backend_source": "deployment"},
+            {"model_name": "LB", "api_base": "http://x/v1",  # 동일 (model,ns,svc)
+             "namespace": "ns", "service": "svc",
+             "backends_ready": 2, "backends_desired": 2,
+             "backend_source": "deployment"},
+        ]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "x", "litellm": ll, "backends": [],
+                "backend_count_enabled": True}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        # 동일 라벨이 정확히 1개 series 로만 나와야 한다.
+        for key, vals in parsed.items():
+            self.assertEqual(len(vals), 1,
+                             "중복 series 발생: %s -> %s" % (key, vals))
+
+    def test_down_wins_on_status_collision(self):
+        # 같은 라벨(model,ns,svc,status_source)에서 UP/DOWN 충돌 시 DOWN(0) 우선.
+        # 같은 (ns,svc) 인데 backend api_base 만 달라 한쪽은 healthy, 한쪽은 unhealthy.
+        ll = {"groups": [], "health": {
+            "healthy_endpoints": [{"api_base": "http://up/v1"}],
+            "unhealthy_endpoints": [{"api_base": "http://down/v1"}]},
+            "deployments": [
+                {"model_name": "C", "api_base": "http://up/v1",
+                 "namespace": "ns", "service": "svc"},
+                {"model_name": "C", "api_base": "http://down/v1",
+                 "namespace": "ns", "service": "svc"},
+            ]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "x", "litellm": ll, "backends": []}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        key = [k for k in parsed if k.startswith("model_monitor_model_up{")][0]
+        self.assertEqual(parsed[key], ["0"])  # 충돌 -> DOWN
+
+    def test_label_value_escaping(self):
+        ll = {"groups": [], "health": None, "deployments": [
+            {"model_name": 'we"ird\\name', "api_base": "http://x/v1",
+             "namespace": "ns", "service": "svc",
+             "backends_ready": 1, "backend_source": "deployment"}]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "x", "litellm": ll, "backends": []}
+        snap["summary"] = m.summarize(snap)
+        text = m.render_prometheus_metrics(snap)
+        # 따옴표·역슬래시가 이스케이프되어야 한다.
+        self.assertIn(r'model="we\"ird\\name"', text)
+
+    def test_no_api_base_label_leak(self):
+        # 내부 URL(api_base)은 메트릭 라벨에 노출되면 안 된다(카디널리티/보안).
+        text = m.render_prometheus_metrics(self._snap())
+        self.assertNotIn("api_base", text)
+        self.assertNotIn("http://a/v1", text)
+
+    def test_loading_snapshot_reports_down(self):
+        text = m.render_prometheus_metrics({"loading": True, "version": "x"})
+        self.assertIn("model_monitor_up 0", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

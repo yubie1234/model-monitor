@@ -39,3 +39,9 @@ user_view:
   enabled: false        # true 면 "키 필수 모드" 활성 (또는 --enable-user-view)
   show_internal: false  # true 면 per-user 뷰에도 내부 api_base/namespace 표시(기본 숨김)
   cache_ttl: 30         # 키별 접근(/v1/models) 캐시 TTL(초). 폴링 중복 호출 제거
+
+# --- Prometheus 메트릭(/metrics) ---
+# --serve 면 기본 ON. 캐시 스냅샷을 노출만 하므로 /api/snapshot 과 같은 수준의 정보.
+# 끄려면 enabled: false (또는 --no-metrics). user_view 켜진 경우 admin 키 헤더가 있어야 노출.
+metrics:
+  enabled: true
