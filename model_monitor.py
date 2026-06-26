@@ -1244,27 +1244,27 @@ def _fmt_agg_backends(ready, desired):
     return c(body, color)
 
 
-def _gpu_text(gpu, products):
-    """GPU 셀 문자열: ? (미상) / - (없음·idle) / "4×H100" / "6 (H100×4,B200×2)"."""
-    if gpu is None:
-        return "?"
-    if gpu == 0:
-        return "-"
-    if products:
-        if len(products) == 1:
-            return "%d×%s" % (gpu, next(iter(products)))
-        parts = ",".join("%s×%d" % (p, n) for p, n in sorted(products.items()))
-        return "%d (%s)" % (gpu, parts)
-    return "%d" % gpu
+# TUI 장치 색(제한된 ANSI 팔레트 내에서 장치 구분). 상태색(green/red) 회피.
+_GPU_TUI_COLOR = {"H100": "magenta", "B200": "cyan", "H200": "yellow",
+                  "A100": "cyan", "L40S": "yellow"}
+
+
+def _gpu_tokens(products):
+    """장치별 색 토큰: "H100×4 B200×2" (혼합이면 공백 구분)."""
+    toks = []
+    for k in sorted(products or {}):
+        toks.append(c("%s×%d" % (k, products[k]), _GPU_TUI_COLOR.get(k, "magenta")))
+    return " ".join(toks)
 
 
 def _fmt_gpu(d):
-    """deployment 한 행의 GPU 컬러 셀."""
+    """deployment 한 행의 GPU 셀 — 장치별 색 칩(텍스트)."""
     gpu = d.get("gpu_ready")
-    txt = _gpu_text(gpu, d.get("gpu_products"))
     if gpu is None:
         return c("?" + (" ⚠" if d.get("gpu_error") else ""), "dim")
-    return c(txt, "green" if gpu > 0 else "dim")
+    if gpu == 0:
+        return c("-", "dim")
+    return _gpu_tokens(d.get("gpu_products")) or c(str(gpu), "magenta")
 
 
 def _sum_gpu(bes):
@@ -1282,10 +1282,13 @@ def _sum_gpu(bes):
 
 
 def _fmt_agg_gpu(gpu, products):
-    """모델 그룹 행의 Σ GPU 컬러 셀."""
+    """모델 그룹 행의 Σ GPU 셀 — 장치별 색 칩(텍스트)."""
     if gpu is None:
         return c("?", "dim")
-    return c("Σ " + _gpu_text(gpu, products), "green" if gpu > 0 else "dim")
+    if gpu == 0:
+        return c("-", "dim")
+    toks = _gpu_tokens(products)
+    return c("Σ ", "dim") + (toks or c(str(gpu), "magenta"))
 
 
 def _table(headers, rows, aligns=None):
@@ -1352,7 +1355,7 @@ def render(snap, settings):
     ]
     if s.get("backend_pods_known"):
         summary_bits.append(
-            "backend pods: %s/%s" % (
+            "replicas: %s/%s" % (
                 c(str(s["backend_pods_ready"]), "green"),
                 s["backend_pods_desired"] or "?")
         )
@@ -1463,13 +1466,13 @@ def render(snap, settings):
                         drows.append(crow)
                 hdr = ["STATUS", "MODEL_NAME", "TYPE"]
                 if show_backends:
-                    hdr += ["BACKENDS"]
+                    hdr += ["REPLICAS"]
                     if show_gpu:
                         hdr += ["GPU"]
                     hdr += ["SRC"]
                 hdr.append("API_BASE")
                 title = ("  [Deployments] (/model/info api_base + /health status"
-                         + (" + LB backend pods)" if show_backends else ")"))
+                         + (" + k8s replicas/GPU)" if show_backends else ")"))
                 lines.append(c(title, "bold"))
                 lines.append(indent(_table(hdr, drows), 2))
                 lines.append("")
@@ -1751,9 +1754,22 @@ _DASHBOARD_HTML = r"""<!doctype html>
   .bk.zero .num{color:var(--warn)}
   .bk .note{font-size:10.5px;color:var(--faint)}
   .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
-  .gpu{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12.5px;color:var(--faint)}
-  .gpu.on{color:#b083f0}
   .val.gpuval{color:#b083f0}
+  /* GPU 장치 칩 (혼합 GPU: 장치별 색) */
+  .gchips{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+  .gchip{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10.5px;
+    font-weight:600;padding:0 7px;line-height:18px;border-radius:20px;border:1px solid}
+  .gchip .dot{width:6px;height:6px;border-radius:50%}
+  .gtot{font-family:var(--mono);font-size:11.5px;color:var(--faint);font-variant-numeric:tabular-nums}
+  /* 헤드라인 GPU 카드: 세그먼트 바 + 범례 */
+  .gpusub{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+  .gbar{display:flex;height:10px;width:100%;max-width:160px;border-radius:4px;
+    overflow:hidden;border:1px solid var(--border)}
+  .gbar i{display:block;height:100%}
+  .glegend{display:flex;gap:9px;flex-wrap:wrap}
+  .glegend span{font-family:var(--mono);font-size:10px;color:var(--muted);
+    display:inline-flex;align-items:center;gap:4px}
+  .glegend i{width:7px;height:7px;border-radius:2px;display:inline-block}
 
   /* 모델 기준 그룹 뷰 */
   .pill.deg{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
@@ -1866,7 +1882,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
 
   <section id="deployments-sec">
     <div class="sec-title">Deployments
-      <span class="src">/model/info api_base · /health status · k8s backend pods</span>
+      <span class="src">/model/info api_base · /health status · k8s replicas · GPU</span>
       <span class="filters">
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
@@ -2021,19 +2037,32 @@ function sharedMap(all){
   (all||[]).forEach(d=>{const k=svcKeyOf(d);(mp[k]=mp[k]||new Set()).add(d.model_name);});
   return mp;
 }
-// GPU 셀: ? (미상) / - (없음·idle) / "4×H100" / "6 (B200×2,H100×4)"
+// 장치명 -> 색(고정 매핑 + 해시 폴백). 상태색(green/red)과 겹치지 않는 계열.
+const DEV_COLORS={H100:"#b083f0",B200:"#56d4dd",A100:"#6e8bff",L40S:"#d29922",H200:"#f0883e"};
+const DEV_POOL=["#b083f0","#56d4dd","#6e8bff","#d29922","#3fb950","#f0883e"];
+function devColor(n){ if(DEV_COLORS[n]) return DEV_COLORS[n];
+  let h=0; for(const ch of String(n)) h=(h*31+ch.charCodeAt(0))>>>0; return DEV_POOL[h%DEV_POOL.length]; }
+// 혼합 GPU: 장치별 색 칩. lead 가 있으면 앞에 총합/Σ 표시.
+function gpuChips(products, lead){
+  const keys=Object.keys(products||{}).sort();
+  const chips=keys.map(k=>{const col=devColor(k);
+    return '<span class="gchip" style="color:'+col+';border-color:'+col+'66;background:'+col+'1a">'
+      +'<i class="dot" style="background:'+col+'"></i>'+esc(k)+'×'+products[k]+'</span>';}).join("");
+  return '<span class="gchips">'+(lead?'<span class="gtot">'+esc(lead)+'</span>':'')+chips+'</span>';
+}
+// 그래프 노드용 축약 텍스트
 function gpuText(g, products){
-  if(g==null) return "?";
-  if(g===0) return "-";
-  const ps=products||{}, keys=Object.keys(ps);
-  if(keys.length===1) return g+"×"+keys[0];
-  if(keys.length>1) return g+" ("+keys.sort().map(k=>k+"×"+ps[k]).join(",")+")";
-  return ""+g;
+  if(g==null) return "?"; if(g===0) return "-";
+  const ps=products||{}, keys=Object.keys(ps).sort();
+  if(keys.length===1) return keys[0]+"×"+ps[keys[0]];
+  return keys.map(k=>k+"×"+ps[k]).join("·");
 }
 function gpuCell(d){
   const g=d.gpu_ready;
   if(g==null) return '<span class="srccol"'+(d.gpu_error?' title="'+esc(d.gpu_error)+'"':'')+'>?'+(d.gpu_error?' ⚠':'')+'</span>';
-  return '<span class="gpu'+(g>0?' on':'')+'">'+esc(gpuText(g,d.gpu_products))+'</span>';
+  if(g===0) return '<span class="srccol">-</span>';
+  const keys=Object.keys(d.gpu_products||{});
+  return gpuChips(d.gpu_products, keys.length>1?String(g):"");   // 혼합이면 총합 표시
 }
 function sumGpu(bes){
   let total=null; const products={};
@@ -2043,7 +2072,18 @@ function sumGpu(bes){
 }
 function aggGpuCell(g, products){
   if(g==null) return '<span class="srccol">?</span>';
-  return '<span class="gpu'+(g>0?' on':'')+'">Σ '+esc(gpuText(g,products))+'</span>';
+  if(g===0) return '<span class="srccol">-</span>';
+  const keys=Object.keys(products||{});
+  return gpuChips(products, keys.length>1?("Σ "+g):"Σ");
+}
+// 헤드라인 GPU 카드: 장치 비율 세그먼트 바 + 범례
+function gpuBar(products){
+  const keys=Object.keys(products||{}).sort();
+  const t=keys.reduce((a,k)=>a+products[k],0)||1;
+  const segs=keys.map(k=>'<i style="width:'+(products[k]/t*100)+'%;background:'+devColor(k)
+    +'" title="'+esc(k)+'×'+products[k]+'"></i>').join("");
+  const leg=keys.map(k=>'<span><i style="background:'+devColor(k)+'"></i>'+esc(k)+'×'+products[k]+'</span>').join("");
+  return '<span class="gbar">'+segs+'</span><span class="glegend">'+leg+'</span>';
 }
 // model_name 으로 묶은 tbody 행들(부모 그룹 행 + 자식 백엔드 행)
 function groupedRows(merged, shared, showBk, showGpu){
@@ -2202,16 +2242,18 @@ function render(snap){
   cards += card("Running (healthy)", s.deployments_healthy||0, "good",
     "unhealthy "+(s.deployments_unhealthy||0));
   if(s.backend_pods_known)
-    cards += card("Backend Pods", (s.backend_pods_ready||0)
+    cards += card("Replicas", (s.backend_pods_ready||0)
       +'<span style="color:var(--faint);font-size:16px"> / '
       +(s.backend_pods_desired||"?")+'</span>', "",
       "LB 뒤 ready / desired");
-  // GPU 카드는 전체(admin) 뷰에서만 — per-user 뷰는 내부정보로 숨김
+  // GPU 카드는 전체(admin) 뷰에서만 — per-user 뷰는 내부정보로 숨김.
+  // 혼합 GPU 는 세그먼트 바 + 범례로 비중을 보여준다.
   if(s.gpu_known && !snap.user_view){
     const gp=s.gpu_products||{};
-    const gsub=Object.keys(gp).length
-      ? Object.keys(gp).sort().map(k=>k+"×"+gp[k]).join(" · ") : "장치 미상";
-    cards += card("GPU", (s.gpu_total||0), "gpuval", gsub);
+    const sub = Object.keys(gp).length
+      ? '<div class="sub gpusub">'+gpuBar(gp)+'</div>' : '<div class="sub">장치 미상</div>';
+    cards += '<div class="card"><div class="label">GPU</div>'
+      +'<div class="val gpuval">'+(s.gpu_total||0)+'</div>'+sub+'</div>';
   }
   $("#cards").innerHTML = cards;
 
@@ -2228,7 +2270,7 @@ function render(snap){
     $("#f-count").textContent = (fS||fT)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
-    if(showBk) head += '<th>BACKENDS (ready/desired)</th>';
+    if(showBk) head += '<th>REPLICAS (ready/desired)</th>';
     if(showBk && showGpu) head += '<th>GPU</th>';
     if(showBk && !uHide) head += '<th>MODE</th><th>SRC</th>';
     if(!uHide) head += "<th>API_BASE</th>";

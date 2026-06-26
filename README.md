@@ -41,13 +41,15 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 > 웹 대시보드는 deployment 를 model_name 으로 묶어 모델별 합성 상태와 `Σ ready/desired` 를
 > 보여주고(`group by model` 토글), 공유 백엔드는 `⇄ SHARED` 로 명시합니다. 상단 **Model ↔ Backend**
 > 그래프(`show graph` 토글)는 라우팅을 이분 그래프로 그려 공유 백엔드로 간선이 모이는 모습을
-> 한눈에 보여줍니다. 헤드라인 **Backend Pods** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
-> 공유 백엔드가 모델 수만큼 이중 집계되지 않습니다.
+> 한눈에 보여줍니다. 헤드라인 **Replicas** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
+> 공유 백엔드가 모델 수만큼 이중 집계되지 않습니다. (UI 라벨은 `Replicas`/`REPLICAS` — k8s Pod=서빙 복제본.)
 
 > **GPU 개수 + 장치명 (v0.4.0)** — backend Pod 가 점유한 GPU 수(`resources.limits[nvidia.com/gpu]`
 > 합)와 장치 모델명을 함께 보여줍니다. 장치명은 Pod 가 뜬 **노드의 라벨 `nvidia.com/gpu.product`**
 > (NVIDIA GPU Operator / GPU Feature Discovery 가 부착)에서 얻어 `H100`·`B200` 처럼 축약 표시합니다.
-> 표기: `4×H100`, 여러 장치면 `6 (H100×4,B200×2)`, GPU 없음/idle 은 `-`, 조회 실패는 `?`.
+> 한 모델의 replica 가 **서로 다른 GPU 로 섞여**(예: H100 풀 + B200 풀) 구성될 수 있고, 이 경우
+> 장치별 색 **칩**으로 `H100×4` `B200×2` 처럼 나눠 보여줍니다(단일 장치면 칩 하나). 헤드라인 GPU
+> 카드는 장치 비율 **세그먼트 바 + 범례**로 믹스를 드러냅니다. GPU 없음/idle 은 `-`, 조회 실패는 `?`.
 > 헤드라인 GPU 총합도 `(namespace, service)` 기준 dedup. 기본 ON(`--no-gpu-info` 로 끔). 멀티노드 GPU 미지원.
 
 > in-cluster 에서 ServiceAccount 토큰이 있으면 **자동으로 켜집니다**(`--no-backend-count` 로 끔).
