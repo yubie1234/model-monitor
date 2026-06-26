@@ -1,0 +1,410 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "model-monitor /metrics 를 스크레이프하는 Prometheus 데이터소스",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"},
+    {"type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0"}
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "LiteLLM -> KServe -> vLLM/SGLang 모델 서빙 현황과 LB 뒤 backend Pod 수. model-monitor /metrics 기반.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["llm", "litellm", "kserve", "model-monitor"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "current": {"text": ["All"], "value": ["$__all"]},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(model_monitor_model_up, namespace)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Namespace",
+        "multi": true,
+        "name": "namespace",
+        "options": [],
+        "query": {"query": "label_values(model_monitor_model_up, namespace)", "refId": "ns"},
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {"text": ["All"], "value": ["$__all"]},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(model_monitor_model_up{namespace=~\"$namespace\"}, model)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Model",
+        "multi": true,
+        "name": "model",
+        "options": [],
+        "query": {"query": "label_values(model_monitor_model_up{namespace=~\"$namespace\"}, model)", "refId": "model"},
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "LLM Model Monitor",
+  "uid": "llm-model-monitor",
+  "version": 1,
+  "weekStart": "",
+  "panels": [
+    {
+      "type": "row",
+      "title": "개요 (Overview)",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "모델 UP",
+      "description": "상태 UP 인 deployment 수 (model_monitor_deployments_healthy).",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 1},
+      "id": 1,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "fixed", "fixedColor": "green"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "textMode": "value",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_deployments_healthy", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "모델 DOWN",
+      "description": "상태 DOWN 인 deployment 수. 0 초과면 빨강.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 1},
+      "id": 2,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "green", "value": null},
+            {"color": "red", "value": 1}
+          ]},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      },
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_deployments_unhealthy", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "총 모델",
+      "description": "집계된 deployment(모델) 총 수.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 1},
+      "id": 3,
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "text"}, "unit": "short"}, "overrides": []},
+      "options": {"colorMode": "value", "graphMode": "none", "textMode": "value", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_deployments_total", "refId": "A"}
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Backend Pod 가용률",
+      "description": "ready / desired Pod 비율(공유 Service 1회 집계 기준). 80% 미만 주황, 50% 미만 빨강.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 1},
+      "id": 4,
+      "fieldConfig": {
+        "defaults": {
+          "min": 0, "max": 1, "unit": "percentunit",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "red", "value": null},
+            {"color": "orange", "value": 0.5},
+            {"color": "green", "value": 0.8}
+          ]}
+        },
+        "overrides": []
+      },
+      "options": {"showThresholdLabels": false, "showThresholdMarkers": true, "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_backend_pods_ready_total / clamp_min(model_monitor_backend_pods_desired_total, 1)", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Backend Pods (ready/desired)",
+      "description": "모든 LB 뒤 ready / desired Pod 합계.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 1},
+      "id": 5,
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "blue"}, "unit": "short"}, "overrides": [
+        {"matcher": {"id": "byName", "options": "desired"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "text"}}]}
+      ]},
+      "options": {"colorMode": "value", "graphMode": "area", "textMode": "value_and_name", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_backend_pods_ready_total", "legendFormat": "ready", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_backend_pods_desired_total", "legendFormat": "desired", "refId": "B"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "이상 징후 (Anomalies)",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "id": 101,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "진짜 DOWN (idle 제외)",
+      "description": "model_up==0 이면서 scale_to_zero==0 인 모델 수. scale-to-zero 정상 idle 을 오탐하지 않는다 — 이 모니터만 아는 구분.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 8, "x": 0, "y": 6},
+      "id": 6,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "unit": "short",
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "count(model_monitor_model_up == 0 and on(model) model_monitor_model_scale_to_zero == 0) or vector(0)", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "LB UP인데 Pod 0",
+      "description": "model_up==1 인데 ready Pod 가 0 인 모델 수. LiteLLM /health 는 LB 만 찌르니 'UP'으로 보이는 함정 — 이 모니터의 고유 가치.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 8, "x": 8, "y": 6},
+      "id": 7,
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 1}]},
+          "unit": "short",
+          "noValue": "0"
+        },
+        "overrides": []
+      },
+      "options": {"colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "count(model_monitor_model_up == 1 and on(model) model_monitor_model_scale_to_zero == 0 and on(model, namespace, service) model_monitor_model_backend_pods_ready == 0) or vector(0)", "refId": "A"}
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "수집 신뢰도",
+      "description": "model_monitor_up (모니터 응답) / collect_errors (k8s 조회 에러 deployment 수). errors>0 이면 일부 Pod 수가 부정확.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 5, "w": 8, "x": 16, "y": 6},
+      "id": 8,
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "monitor up"}, "properties": [
+            {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}},
+            {"id": "mappings", "value": [{"type": "value", "options": {"1": {"text": "OK"}, "0": {"text": "DOWN"}}}]}
+          ]}
+        ]
+      },
+      "options": {"colorMode": "value", "graphMode": "none", "textMode": "value_and_name", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_up", "legendFormat": "monitor up", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_collect_errors", "legendFormat": "collect errors", "refId": "B"}
+      ]
+    },
+    {
+      "type": "row",
+      "title": "추세 (Trends)",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 11},
+      "id": 102,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "모델 상태 추세 (UP / DOWN)",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "id": 9,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "stacking": {"mode": "normal", "group": "A"}, "lineWidth": 1},
+          "unit": "short"
+        },
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "UP"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "green"}}]},
+          {"matcher": {"id": "byName", "options": "DOWN"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}
+        ]
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_deployments_healthy", "legendFormat": "UP", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_deployments_unhealthy", "legendFormat": "DOWN", "refId": "B"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Backend Pod 추세 (ready vs desired)",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "id": 10,
+      "fieldConfig": {
+        "defaults": {"custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}, "unit": "short"},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "ready"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "blue"}}]},
+          {"matcher": {"id": "byName", "options": "desired"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "text"}}, {"id": "custom.lineStyle", "value": {"fill": "dash", "dash": [10, 10]}}]}
+        ]
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_backend_pods_ready_total", "legendFormat": "ready", "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_backend_pods_desired_total", "legendFormat": "desired", "refId": "B"}
+      ]
+    },
+    {
+      "type": "state-timeline",
+      "title": "모델별 상태 타임라인",
+      "description": "model_monitor_model_up. UP=1(초록), DOWN=0(빨강), idle/미상=-1(회색).",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 20},
+      "id": 11,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"fillOpacity": 80, "lineWidth": 0},
+          "mappings": [
+            {"type": "value", "options": {
+              "1": {"text": "UP", "color": "green", "index": 0},
+              "0": {"text": "DOWN", "color": "red", "index": 1},
+              "-1": {"text": "idle/?", "color": "#808080", "index": 2}
+            }}
+          ],
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color": "#808080", "value": null},
+            {"color": "red", "value": 0},
+            {"color": "green", "value": 1}
+          ]}
+        },
+        "overrides": []
+      },
+      "options": {"mergeValues": true, "showValue": "auto", "alignValue": "left", "rowHeight": 0.9, "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_model_up{namespace=~\"$namespace\", model=~\"$model\"}", "legendFormat": "{{model}} ({{namespace}}/{{service}})", "refId": "A"}
+      ]
+    },
+    {
+      "type": "table",
+      "title": "모델 상세 (상태 · Pod)",
+      "description": "모델별 현재 상태와 LB 뒤 ready/desired Pod. 같은 model_name 이 여러 Service 에 걸쳐 있을 수 있다.",
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 28},
+      "id": 12,
+      "fieldConfig": {
+        "defaults": {"custom": {"align": "auto", "filterable": true}, "color": {"mode": "thresholds"}},
+        "overrides": [
+          {"matcher": {"id": "byName", "options": "status"}, "properties": [
+            {"id": "mappings", "value": [{"type": "value", "options": {
+              "1": {"text": "UP", "color": "green", "index": 0},
+              "0": {"text": "DOWN", "color": "red", "index": 1},
+              "-1": {"text": "idle/?", "color": "#808080", "index": 2}
+            }}]},
+            {"id": "custom.cellOptions", "value": {"type": "color-background"}},
+            {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "#808080", "value": null}, {"color": "red", "value": 0}, {"color": "green", "value": 1}]}}
+          ]},
+          {"matcher": {"id": "byName", "options": "ready"}, "properties": [{"id": "custom.cellOptions", "value": {"type": "color-text"}}, {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}}]}
+        ]
+      },
+      "options": {"showHeader": true, "sortBy": [{"displayName": "status", "desc": false}]},
+      "targets": [
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_model_up{namespace=~\"$namespace\", model=~\"$model\"}", "format": "table", "instant": true, "refId": "A"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_model_backend_pods_ready{namespace=~\"$namespace\", model=~\"$model\"}", "format": "table", "instant": true, "refId": "B"},
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "model_monitor_model_backend_pods_desired{namespace=~\"$namespace\", model=~\"$model\"}", "format": "table", "instant": true, "refId": "C"}
+      ],
+      "transformations": [
+        {"id": "joinByField", "options": {"byField": "model", "mode": "outer"}},
+        {"id": "organize", "options": {
+          "excludeByName": {"Time": true, "Time 1": true, "Time 2": true, "Time 3": true, "__name__": true, "__name__ 1": true, "__name__ 2": true, "__name__ 3": true, "job": true, "job 1": true, "job 2": true, "job 3": true, "instance": true, "instance 1": true, "instance 2": true, "instance 3": true, "status_source": false, "namespace 2": true, "namespace 3": true, "service 2": true, "service 3": true, "backend_source 2": true},
+          "renameByName": {
+            "model": "model",
+            "namespace 1": "namespace",
+            "service 1": "service",
+            "Value #A": "status",
+            "Value #B": "ready",
+            "Value #C": "desired",
+            "backend_source 1": "backend",
+            "backend_source": "backend"
+          },
+          "indexByName": {}
+        }}
+      ]
+    }
+  ]
+}

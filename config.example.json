@@ -24,5 +24,13 @@
     "namespace_overrides": {
       "qwen3-32b-vllm": "serving"
     }
+  },
+  "user_view": {
+    "enabled": false,
+    "show_internal": false,
+    "cache_ttl": 30
+  },
+  "metrics": {
+    "enabled": true
   }
 }
