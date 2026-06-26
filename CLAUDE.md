@@ -77,6 +77,8 @@ CLI args > env (`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config file. Resolved o
 - **`product`** — branch tracking the product/release line.
 - **`feature/<name>`** — one branch per feature (e.g. `feature/per-user-dashboard`). Do feature development here, not directly on `develop`/`product`/`main`.
 
+**PR 필수 규칙 (no direct push):** `develop` 또는 `product` 에 변경을 반영할 때는 **반드시 PR 절차를 거친다.** 이 브랜치들로 직접 `git push` 하지 않는다. feature/integration 브랜치를 push 한 뒤 PR 을 열고, **PR 의 base 가 `develop`(또는 의도한 `product`)인지 반드시 확인한다** — push 직후 GitHub 가 안내하는 "create PR" 링크는 base 를 레포 기본 브랜치(`main`)로 자동 지정하므로, base 를 수동으로 바꾸지 않으면 엉뚱하게 `main` 으로 머지된다. 여러 feature 를 묶을 때는 `develop` 기준 통합 브랜치를 만들어 각 feature 를 `--no-ff` 로 병합한 뒤, 그 통합 브랜치를 PR 로 `develop` 에 올린다.
+
 ## Conventions
 
 - **Versioning:** `__version__` in `model_monitor.py` is the single source of truth — it drives the Docker image tag (`ci.sh`/`push.sh` grep it), the `--version` flag, and the `version` field in TUI/web/`/api/snapshot`. Bump it there; the README header version should follow.
