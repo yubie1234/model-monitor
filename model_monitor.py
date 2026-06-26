@@ -874,11 +874,23 @@ def summarize(snap):
             s["deployments_unhealthy"] = uc
             s["deployments_total"] = hc + uc
 
-        # LB 뒤 backend Pod 집계 (값이 있는 deployment 만)
+        # LB 뒤 backend Pod 집계 (값이 있는 deployment 만).
+        # 여러 model_name 이 같은 백엔드 Service 를 공유할 수 있으므로
+        # (namespace, service) 유일 기준으로 한 번만 더한다 — 안 그러면
+        # 공유 Service 의 물리 Pod 가 model_name 수만큼 이중 집계된다.
+        # service 식별이 안 되면(external 등) api_base 로 폴백해 그래도 dedup.
+        seen_svc = set()
         for d in ll.get("deployments") or []:
-            if d.get("backends_ready") is not None:
-                s["backend_pods_ready"] += d["backends_ready"]
-                s["backend_pods_known"] = True
+            if d.get("backends_ready") is None:
+                continue
+            key = (d.get("namespace"), d.get("service"))
+            if key == (None, None):
+                key = ("", d.get("api_base"))
+            if key in seen_svc:
+                continue
+            seen_svc.add(key)
+            s["backend_pods_ready"] += d["backends_ready"]
+            s["backend_pods_known"] = True
             if d.get("backends_desired") is not None:
                 s["backend_pods_desired"] += d["backends_desired"]
 
@@ -980,6 +992,63 @@ def _fmt_backends(d):
     else:
         body = "%d/%d" % (ready, desired)
 
+    if ready == 0:
+        color = "red"
+    elif desired is not None and ready < desired:
+        color = "yellow"
+    else:
+        color = "green"
+    return c(body, color)
+
+
+# --- 모델 기준 그룹 뷰 헬퍼 (TUI/웹 공통 개념; 웹은 JS 에 동일 로직) ---
+def _svc_key(d):
+    """deployment 의 백엔드 Service 식별자. (ns,svc) 우선, 없으면 api_base 폴백."""
+    ns, svc = d.get("namespace"), d.get("service")
+    if ns or svc:
+        return (ns or "", svc or "")
+    return ("api", d.get("api_base") or "external")
+
+
+def _shared_map(deps):
+    """(ns,svc) -> 그 Service 를 쓰는 model_name 집합. 2개 이상이면 공유."""
+    m = {}
+    for d in deps:
+        m.setdefault(_svc_key(d), set()).add(d.get("model_name"))
+    return m
+
+
+def _composite_status(bes):
+    """한 model_name 의 여러 백엔드 상태를 합성: 전부 UP→UP, 전부 DOWN→DOWN,
+    섞이면 DEGRADED, 그 외 ?."""
+    up = sum(1 for b in bes if b.get("status") == "UP")
+    down = sum(1 for b in bes if b.get("status") == "DOWN")
+    n = len(bes)
+    if n and up == n:
+        return "UP"
+    if n and down == n:
+        return "DOWN"
+    if up > 0:
+        return "DEGRADED"
+    return "?"
+
+
+def _sum_backends(bes):
+    """그 model_name 의 백엔드 ready/desired 합(값 있는 것만)."""
+    r = d = None
+    for b in bes:
+        if b.get("backends_ready") is not None:
+            r = (r or 0) + b["backends_ready"]
+        if b.get("backends_desired") is not None:
+            d = (d or 0) + b["backends_desired"]
+    return r, d
+
+
+def _fmt_agg_backends(ready, desired):
+    """모델 그룹 행의 Σ ready/desired 컬러 셀."""
+    if ready is None:
+        return c("?", "dim")
+    body = ("Σ %d/%d" % (ready, desired)) if desired is not None else ("Σ %d" % ready)
     if ready == 0:
         color = "red"
     elif desired is not None and ready < desired:
@@ -1094,19 +1163,60 @@ def render(snap, settings):
             merged = merge_deployments_with_health(ll)
             show_backends = snap.get("backend_count_enabled")
             if merged:
-                drows = []
+                # model_name 으로 묶어 표시. 백엔드가 1개뿐이고 공유도 아니면 한 줄로
+                # 간결히, 여러 백엔드(로드밸런싱)면 그룹 헤더(합성 상태 + Σ) + 자식 줄.
+                # 여러 model_name 이 같은 Service 를 공유하면 ⇄shared 로 명시.
+                shared = _shared_map(merged)
+                order, groups = [], {}
                 for d in merged:
-                    color = {"UP": "green", "DOWN": "red"}.get(d["status"], "yellow")
-                    row = [
-                        c(d["status"], color),
-                        d.get("model_name", "?"),
-                        d.get("type", "-"),
-                    ]
+                    nm = d.get("model_name", "?")
+                    if nm not in groups:
+                        groups[nm] = []
+                        order.append(nm)
+                    groups[nm].append(d)
+
+                def _shared_suffix(b, nm):
+                    others = sorted(x for x in shared.get(_svc_key(b), ()) if x != nm)
+                    return c("  ⇄shared:%s" % ",".join(others), "yellow") if others else ""
+
+                drows = []
+                for nm in order:
+                    bes = groups[nm]
+                    multi = len(bes) > 1
+                    if not multi:
+                        # 단일 백엔드: 한 줄(기존 평면 형태) + 공유 시 마커
+                        d = bes[0]
+                        color = {"UP": "green", "DOWN": "red"}.get(d["status"], "yellow")
+                        row = [c(d["status"], color), nm, d.get("type", "-")]
+                        if show_backends:
+                            row.append(_fmt_backends(d))
+                            row.append(c(d.get("backend_source", "-"), "dim"))
+                        row.append((d.get("api_base") or "-") + _shared_suffix(d, nm))
+                        drows.append(row)
+                        continue
+                    # 여러 백엔드: 그룹 헤더 + 자식
+                    st = _composite_status(bes)
+                    scolor = {"UP": "green", "DOWN": "red"}.get(st, "yellow")
+                    grow = [c(st, scolor),
+                            "%s %s" % (nm, c("(%d)" % len(bes), "dim")),
+                            bes[0].get("type", "-")]
                     if show_backends:
-                        row.append(_fmt_backends(d))
-                        row.append(c(d.get("backend_source", "-"), "dim"))
-                    row.append(d.get("api_base") or "-")
-                    drows.append(row)
+                        r, dd = _sum_backends(bes)
+                        grow.append(_fmt_agg_backends(r, dd))
+                        grow.append("")
+                    grow.append("")
+                    drows.append(grow)
+                    for b in bes:
+                        bcolor = {"UP": "green", "DOWN": "red"}.get(b.get("status"), "yellow")
+                        label = "  ↳ %s%s" % (
+                            b.get("service") or b.get("api_base") or "-",
+                            _shared_suffix(b, nm))
+                        crow = [c(b.get("status", "?"), bcolor), label, ""]
+                        if show_backends:
+                            crow.append(_fmt_backends(b))
+                            crow.append(c(b.get("backend_source", "-"), "dim"))
+                        crow.append(b.get("api_base") or "-")
+                        drows.append(crow)
                 hdr = ["STATUS", "MODEL_NAME", "TYPE"]
                 if show_backends:
                     hdr += ["BACKENDS", "SRC"]
@@ -1209,6 +1319,24 @@ def demo_snapshot():
                  "backend_source": "knative-pa", "mode": "Serverless",
                  "scale_to_zero": True, "namespace": "kserve",
                  "service": "qwen3-embd-predictor"},
+                # 같은 model_name 에 백엔드 2개 (로드밸런싱) — 모델 그룹 뷰의 1:N 팬아웃 예시
+                {"model_name": "KServe-Qwen3.6-35B-A3B-FP8",
+                 "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8",
+                 "api_base": "http://qwen36-35b-predictor-2.kserve.svc:8080/v1",
+                 "id": "a1b2c4", "type": "kserve",
+                 "backends_ready": 2, "backends_desired": 2,
+                 "backend_source": "endpointslice", "mode": "RawDeployment",
+                 "scale_to_zero": False, "namespace": "kserve",
+                 "service": "qwen36-35b-predictor-2"},
+                # 다른 model_name 이 위 predictor Service 를 공유 — 그래프/SHARED 배지 예시
+                {"model_name": "Router-Qwen3.6-35B",
+                 "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8",
+                 "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1",
+                 "id": "a1b2c5", "type": "vllm",
+                 "backends_ready": 3, "backends_desired": 3,
+                 "backend_source": "endpointslice", "mode": "RawDeployment",
+                 "scale_to_zero": False, "namespace": "kserve",
+                 "service": "qwen36-35b-predictor"},
             ],
             "health": {
                 "healthy_count": 3,
@@ -1220,6 +1348,8 @@ def demo_snapshot():
                      "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"},
                     {"model": "openai/Qwen3-Embedding-8B",
                      "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"},
+                    {"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8",
+                     "api_base": "http://qwen36-35b-predictor-2.kserve.svc:8080/v1"},
                 ],
                 "unhealthy_endpoints": [
                     {"model": "hosted_vllm/Qwen3-32B-AWQ",
@@ -1369,6 +1499,49 @@ _DASHBOARD_HTML = r"""<!doctype html>
   .bk .note{font-size:10.5px;color:var(--faint)}
   .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
 
+  /* 모델 기준 그룹 뷰 */
+  .pill.deg{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
+  tr.grp-row td{background:var(--surface);border-top:2px solid var(--border)}
+  tr.grp-row:first-child td{border-top:none}
+  tr.grp-row td.name{font-weight:600}
+  tr.grp-row .nbk{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:8px}
+  tr.child-row td{background:#0f141b;font-size:12.5px;padding-top:7px;padding-bottom:7px}
+  tr.child-row td.leg{font-family:var(--mono);color:var(--muted);padding-left:26px;position:relative}
+  tr.child-row td.leg::before{content:"↳";position:absolute;left:12px;color:var(--faint)}
+  tr.child-row td.leg .svc{color:var(--text)}
+  .agg{display:flex;align-items:center;gap:9px}
+  .agg .lead{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .shared{font-family:var(--mono);font-size:9.5px;font-weight:700;color:var(--warn);
+    background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.35);border-radius:4px;
+    padding:0 5px;margin-left:8px;letter-spacing:.02em;white-space:nowrap}
+
+  /* Model ↔ Backend 그래프 */
+  #graph-sec .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
+    color:var(--faint);font-size:11px}
+  .graphwrap{overflow:auto;max-height:560px;border:1px solid var(--border);border-radius:9px;
+    background:#0c1118;padding:6px 8px}
+  .graphwrap svg{display:block;width:100%;height:auto;min-width:520px}
+  .glabel{font-family:var(--mono);font-size:10px;fill:var(--muted);
+    text-transform:uppercase;letter-spacing:.08em}
+  .gnode rect{stroke-width:1.5}
+  .gnode .ntext{font-family:var(--mono);font-size:12px;font-weight:600;fill:var(--text)}
+  .gnode .nsub{font-family:var(--mono);font-size:10px;fill:var(--faint)}
+  .gnode.model rect{fill:rgba(110,139,255,.12);stroke:rgba(110,139,255,.55)}
+  .gnode.be.up rect{fill:rgba(63,185,80,.10);stroke:rgba(63,185,80,.5)}
+  .gnode.be.down rect{fill:rgba(248,81,73,.10);stroke:rgba(248,81,73,.5)}
+  .gnode.be.warn rect{fill:rgba(210,153,34,.12);stroke:rgba(210,153,34,.5)}
+  .gnode.be.zero rect{fill:rgba(210,153,34,.08);stroke:rgba(210,153,34,.4)}
+  .gnode.be.unk rect{fill:var(--surface2);stroke:var(--border)}
+  .gnode.be.shared rect{stroke-dasharray:4 3}
+  .gedge{stroke:var(--faint);stroke-width:1.6;fill:none;opacity:.5}
+  .gedge.shared{stroke:var(--warn);stroke-width:2;opacity:.8}
+  .badge-shared{font-family:var(--mono);font-size:9px;font-weight:700;fill:var(--warn)}
+  svg.focusing .gedge{opacity:.07}
+  svg.focusing .gnode{opacity:.28}
+  svg.focusing .gedge.on{opacity:.95}
+  svg.focusing .gnode.on{opacity:1}
+  @media (prefers-reduced-motion:no-preference){.gedge,.gnode{transition:opacity .12s ease}}
+
   .empty{color:var(--muted);padding:18px;text-align:center;font-style:italic}
   .err{color:var(--down);font-family:var(--mono);font-size:12px;
     background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.25);
@@ -1425,10 +1598,21 @@ _DASHBOARD_HTML = r"""<!doctype html>
 
   <div class="cards" id="cards"></div>
 
+  <section id="graph-sec" style="display:none">
+    <div class="sec-title">Model ↔ Backend
+      <span class="src">model_name → api_base(Service) 라우팅 · ⇄ 공유 백엔드</span>
+      <span class="filters">
+        <label class="toggle"><input type="checkbox" id="f-graph" checked> show graph</label>
+      </span>
+    </div>
+    <div class="graphwrap" id="graphwrap"></div>
+  </section>
+
   <section id="deployments-sec">
     <div class="sec-title">Deployments
       <span class="src">/model/info api_base · /health status · k8s backend pods</span>
       <span class="filters">
+        <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
         <select id="f-status">
           <option value="">all</option>
@@ -1509,6 +1693,148 @@ function card(label,val,cls,sub){
     +(sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
 }
 
+// ── 모델 기준 그룹 뷰 헬퍼 ──────────────────────────────────────────────
+// 같은 백엔드(Service)를 여러 model_name 이 공유할 수 있으므로 (ns,svc) 로 식별.
+function svcKeyOf(d){
+  if(d.namespace || d.service) return (d.namespace||"")+"/"+(d.service||"");
+  return "api:"+(d.api_base||"external");
+}
+function trunc(s,n){s=String(s==null?"":s);return s.length>n?s.slice(0,n-1)+"…":s;}
+function backendHost(api){ if(!api) return "";
+  return String(api).replace(/^[a-z]+:\/\//,"").replace(/[:\/].*$/,""); }
+function compositeStatus(bes){
+  let up=0,down=0;
+  bes.forEach(b=>{const s=b.status||"?"; if(s==="UP")up++; else if(s==="DOWN")down++;});
+  if(up===bes.length) return "UP";
+  if(down===bes.length && down>0) return "DOWN";
+  if(up>0) return "DEGRADED";
+  return "?";
+}
+function statusPillCls(s){return s==="UP"?"up":(s==="DOWN"?"down":(s==="DEGRADED"?"deg":"unk"));}
+function compositePill(s){return '<span class="pill '+statusPillCls(s)+'">'+esc(s)+'</span>';}
+function sumBackends(bes){
+  let r=null,d=null;
+  bes.forEach(b=>{ if(b.backends_ready!=null) r=(r||0)+b.backends_ready;
+    if(b.backends_desired!=null) d=(d||0)+b.backends_desired; });
+  return {r:r,d:d};
+}
+function aggCell(r,d){
+  if(r==null) return '<span class="srccol">?</span>';
+  let cls="good"; if(r===0) cls="bad"; else if(d!=null && r<d) cls="warn";
+  const num = d!=null?(r+"/"+d):(""+r);
+  const pct = d&&d>0?Math.min(100,Math.round(r/d*100)):(r>0?100:0);
+  return '<div class="bk '+cls+'"><span class="num">Σ '+num+'</span>'
+    +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
+}
+function sharedMap(all){
+  const mp={};
+  (all||[]).forEach(d=>{const k=svcKeyOf(d);(mp[k]=mp[k]||new Set()).add(d.model_name);});
+  return mp;
+}
+// model_name 으로 묶은 tbody 행들(부모 그룹 행 + 자식 백엔드 행)
+function groupedRows(merged, shared, showBk){
+  const order=[], groups={};
+  merged.forEach(d=>{ if(!groups[d.model_name]){groups[d.model_name]=[];order.push(d.model_name);}
+    groups[d.model_name].push(d); });
+  return order.map(name=>{
+    const bes=groups[name];
+    const st=compositeStatus(bes), agg=sumBackends(bes), type=bes[0].type||"-";
+    let html='<tr class="grp-row"><td>'+compositePill(st)+'</td>'
+      +'<td class="name">'+esc(name)
+        +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
+      +'<td><span class="chip">'+esc(type)+'</span></td>';
+    if(showBk) html+='<td>'+aggCell(agg.r,agg.d)+'</td><td></td><td></td>';
+    html+='<td></td></tr>';
+    bes.forEach(b=>{
+      const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
+      const others=sh?[...shared[k]].filter(x=>x!==name):[];
+      const svcLabel=b.service||backendHost(b.api_base)||"—";
+      html+='<tr class="child-row"><td>'+statusPill(b.status||"?")+'</td>'
+        +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
+          +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
+      if(showBk) html+='<td>'+backendCell(b)+'</td>'
+        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
+        +'<td class="srccol">'+esc(b.backend_source||"-")+'</td>';
+      html+='<td class="api" title="'+esc(b.api_base)+'">'+esc(b.api_base||"-")+'</td></tr>';
+    });
+    return html;
+  }).join("");
+}
+
+// ── Model ↔ Backend 이분 그래프 (SVG, 외부 의존성 0) ─────────────────────
+function beNodeCls(o){
+  if(o.ext) return "unk";
+  if(o.stz) return "zero";
+  if(o.r==null) return "unk";
+  if(o.r===0) return "down";
+  if(o.des!=null && o.r<o.des) return "warn";
+  return "up";
+}
+function attrId(s){return String(s).replace(/[^a-zA-Z0-9_-]/g,"_");}
+function buildGraph(deps){
+  if(!deps || !deps.length) return "";
+  const names=[], seenN={};
+  deps.forEach(d=>{ if(!seenN[d.model_name]){seenN[d.model_name]=1;names.push(d.model_name);} });
+  names.sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
+  const svcOrder=[], svc={};
+  deps.forEach(d=>{ const k=svcKeyOf(d);
+    if(!svc[k]){ svc[k]={key:k,label:d.service||backendHost(d.api_base)||"external",
+      r:d.backends_ready,des:d.backends_desired,status:d.status,
+      ext:(d.backend_source==="external"),stz:d.scale_to_zero,models:new Set()}; svcOrder.push(k); }
+    svc[k].models.add(d.model_name); });
+  const NW=176, NH=42, GAP=16, PADX=16, PADY=34, W=600;
+  const colL=PADX, colR=W-PADX-NW;
+  const rows=Math.max(names.length, svcOrder.length);
+  const H=PADY+rows*NH+(rows>0?(rows-1)*GAP:0)+18;
+  const colY=(k,total)=>{const t=total*NH+(total-1)*GAP; const s=(H-PADY-18-t)/2+PADY; return s+k*(NH+GAP);};
+  const mY={}, sY={};
+  names.forEach((n,i)=>mY[n]=colY(i,names.length));
+  svcOrder.forEach((k,i)=>sY[k]=colY(i,svcOrder.length));
+  let edges="";
+  deps.forEach(d=>{ const k=svcKeyOf(d), sh=svc[k].models.size>1;
+    const y1=mY[d.model_name]+NH/2, y2=sY[k]+NH/2, x1=colL+NW, x2=colR, mx=(x1+x2)/2;
+    edges+='<path class="gedge'+(sh?' shared':'')+'" data-m="'+attrId(d.model_name)+'" data-b="'+attrId(k)+'" '
+      +'d="M'+x1+' '+y1+' C'+mx+' '+y1+' '+mx+' '+y2+' '+x2+' '+y2+'"></path>'; });
+  let mnodes="";
+  names.forEach(n=>{ const y=mY[n];
+    mnodes+='<g class="gnode model" data-key="'+attrId(n)+'" data-kind="m">'
+      +'<rect x="'+colL+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
+      +'<text class="ntext" x="'+(colL+12)+'" y="'+(y+19)+'">'+esc(trunc(n,22))+'</text>'
+      +'<text class="nsub" x="'+(colL+12)+'" y="'+(y+33)+'">model_name</text></g>'; });
+  let snodes="";
+  svcOrder.forEach(k=>{ const o=svc[k], sh=o.models.size>1, y=sY[k];
+    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" pods"+(sh?"  ·  shared ×"+o.models.size:""));
+    snodes+='<g class="gnode be '+beNodeCls(o)+(sh?' shared':'')+'" data-key="'+attrId(k)+'" data-kind="b">'
+      +'<rect x="'+colR+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
+      +'<text class="ntext" x="'+(colR+12)+'" y="'+(y+19)+'">'+esc(trunc(o.label,22))+'</text>'
+      +'<text class="nsub" x="'+(colR+12)+'" y="'+(y+33)+'">'+esc(sub)+'</text>'
+      +(sh?'<text class="badge-shared" x="'+(colR+NW-8)+'" y="'+(y+15)+'" text-anchor="end">⇄</text>':'')
+      +'</g>'; });
+  return '<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Model 과 Backend 라우팅 그래프">'
+    +'<text class="glabel" x="'+colL+'" y="20">Models</text>'
+    +'<text class="glabel" x="'+colR+'" y="20">Backends (Service)</text>'
+    +edges+mnodes+snodes+'</svg>';
+}
+function wireGraph(svg){
+  if(!svg) return;
+  const clear=()=>{svg.classList.remove("focusing");
+    svg.querySelectorAll(".on").forEach(e=>e.classList.remove("on"));};
+  svg.querySelectorAll(".gnode").forEach(node=>{
+    node.addEventListener("mouseenter",()=>{
+      const kind=node.getAttribute("data-kind"), key=node.getAttribute("data-key");
+      svg.classList.add("focusing"); node.classList.add("on");
+      svg.querySelectorAll(".gedge").forEach(ed=>{
+        const match = kind==="m" ? ed.getAttribute("data-m")===key : ed.getAttribute("data-b")===key;
+        if(match){ ed.classList.add("on");
+          const other = kind==="m" ? ed.getAttribute("data-b") : ed.getAttribute("data-m");
+          const on=svg.querySelector((kind==="m"?'.gnode.be[data-key="':'.gnode.model[data-key="')+other+'"]');
+          if(on) on.classList.add("on"); }
+      });
+    });
+    node.addEventListener("mouseleave",clear);
+  });
+}
+
 function render(snap){
   const s = snap.summary||{};
   const ll = snap.litellm;
@@ -1581,19 +1907,32 @@ function render(snap){
     head += "</tr>";
     const ncol = 3 + (showBk?1:0) + (showBk&&!uHide?2:0) + (uHide?0:1);
     dt.querySelector("thead").innerHTML = head;
-    dt.querySelector("tbody").innerHTML = merged.length ? merged.map(d=>{
-      let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
-        +'<td class="name">'+esc(d.model_name)+"</td>"
-        +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
-      if(showBk) row += "<td>"+backendCell(d)+"</td>";
-      if(showBk && !uHide) row +=
-        '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
-        +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
-      if(!uHide) row += '<td class="api" title="'+esc(d.api_base)+'">'
-        +esc(d.api_base||"-")+"</td>";
-      row += "</tr>";
-      return row;
-    }).join("") : '<tr><td class="empty" colspan="'+ncol+'">필터 결과 없음</td></tr>';
+    // per-user 뷰(uHide)는 내부 토폴로지(Service/api_base)를 숨기므로 그룹/그래프를
+    // 쓰지 않고 컬럼 축소된 평면 행을 그린다. 전체(admin) 뷰에서만 모델 그룹핑을 적용.
+    const grouped = $("#f-group").checked && !uHide;
+    let body;
+    if(!merged.length){
+      body = '<tr><td class="empty" colspan="'+ncol+'">필터 결과 없음</td></tr>';
+    } else if(grouped){
+      // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
+      // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
+      body = groupedRows(merged, sharedMap(all), showBk);
+    } else {
+      body = merged.map(d=>{
+        let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
+          +'<td class="name">'+esc(d.model_name)+"</td>"
+          +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
+        if(showBk) row += "<td>"+backendCell(d)+"</td>";
+        if(showBk && !uHide) row +=
+          '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
+          +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
+        if(!uHide) row += '<td class="api" title="'+esc(d.api_base)+'">'
+          +esc(d.api_base||"-")+"</td>";
+        row += "</tr>";
+        return row;
+      }).join("");
+    }
+    dt.querySelector("tbody").innerHTML = body;
   } else {
     $("#f-count").textContent="";
     dt.querySelector("thead").innerHTML="";
@@ -1601,6 +1940,22 @@ function render(snap){
   }
   $("#dep-err").innerHTML = (ll && ll.errors && ll.errors.length)
     ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
+
+  // Model ↔ Backend 그래프 (스냅샷 데이터만으로 그림 — 추가 수집 없음).
+  // per-user 뷰(uHide)는 내부 토폴로지(Service 이름)를 숨기므로 그래프도 감춘다.
+  const gsec = $("#graph-sec"), gwrap = $("#graphwrap");
+  const deps = (ll && ll.deployments) || [];
+  if(uHide || !deps.length){
+    gsec.style.display = "none";
+  } else if($("#f-graph").checked){
+    gsec.style.display = "";
+    gwrap.style.display = "";
+    gwrap.innerHTML = buildGraph(deps);
+    wireGraph(gwrap.querySelector("svg"));
+  } else {
+    gsec.style.display = "";        // 섹션(토글)은 두고 그래프만 숨김
+    gwrap.style.display = "none";
+  }
 
   // groups
   const gt = $("#groups");
@@ -1684,6 +2039,8 @@ $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(
 // 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
 $("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+$("#f-group").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+$("#f-graph").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 
 // per-user(키별) 뷰: 서버가 활성일 때만 키 입력 바를 노출한다.
 if(USER_VIEW){

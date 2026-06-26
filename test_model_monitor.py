@@ -141,6 +141,33 @@ class TestSummarize(unittest.TestCase):
         self.assertEqual(s["backend_pods_desired"], 5)
         self.assertTrue(s["backend_pods_known"])
 
+    def test_backend_pods_dedup_shared_service(self):
+        # 회귀 테스트: 여러 model_name 이 같은 (ns,svc) 백엔드를 공유해도
+        # 물리 Pod 합계는 Service 당 한 번만 집계되어야 한다(이중 집계 금지).
+        ll = {
+            "groups": [], "health": None,
+            "deployments": [
+                {"model_name": "A", "api_base": "http://a1/v1",
+                 "namespace": "kserve", "service": "a1",
+                 "backends_ready": 2, "backends_desired": 2,
+                 "backend_source": "deployment"},
+                {"model_name": "A", "api_base": "http://a2/v1",
+                 "namespace": "kserve", "service": "a2",
+                 "backends_ready": 2, "backends_desired": 2,
+                 "backend_source": "deployment"},
+                {"model_name": "B", "api_base": "http://a1/v1",   # A-1 공유
+                 "namespace": "kserve", "service": "a1",
+                 "backends_ready": 2, "backends_desired": 2,
+                 "backend_source": "deployment"},
+            ],
+        }
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertEqual(s["backend_pods_ready"], 4)      # a1 + a2 (a1 한 번만)
+        self.assertEqual(s["backend_pods_desired"], 4)
+        self.assertEqual(s["deployments_registered"], 3)  # 행 수는 그대로
+        self.assertEqual(s["deployments_healthy"], 3)     # 상태는 deployment 단위
+
     def test_fallback_to_health_counts_when_no_deployments(self):
         ll = {
             "groups": [],
