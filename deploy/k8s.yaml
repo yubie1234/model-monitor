@@ -31,6 +31,12 @@ rules:
   - apiGroups: [""]
     resources: ["endpoints", "services"]   # 구버전 폴백 + selector 확인
     verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods"]                    # GPU 개수: Pod resources.limits[nvidia.com/gpu]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes"]                   # GPU 장치명: 노드 라벨 nvidia.com/gpu.product
+    verbs: ["get", "list"]
   - apiGroups: ["apps"]
     resources: ["deployments"]             # 라벨 합산 + RawDeployment 보정
     verbs: ["get", "list"]                  # list: serving.kserve.io/inferenceservice 라벨 조회

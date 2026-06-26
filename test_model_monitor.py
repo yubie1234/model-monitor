@@ -238,6 +238,99 @@ class TestResolveBackendCount(unittest.TestCase):
         self.assertEqual(out2["backends_ready"], 1)
 
 
+def _pod(node, gpu, ready=True):
+    return {"spec": {"nodeName": node,
+                     "containers": [{"resources": {"limits": {"nvidia.com/gpu": str(gpu)}}}]},
+            "status": {"phase": "Running" if ready else "Pending",
+                       "conditions": [{"type": "Ready",
+                                       "status": "True" if ready else "False"}]}}
+
+
+class TestGpu(unittest.TestCase):
+    GPU_SETTINGS = dict(SETTINGS, gpu_info=True)
+
+    def test_short_gpu_product(self):
+        self.assertEqual(m._short_gpu_product("NVIDIA-H100-80GB-HBM3"), "H100")
+        self.assertEqual(m._short_gpu_product("NVIDIA-B200"), "B200")
+        self.assertEqual(m._short_gpu_product("NVIDIA-A100-SXM4-80GB"), "A100")
+        self.assertIsNone(m._short_gpu_product(None))
+
+    def test_pod_gpu_and_ready(self):
+        self.assertEqual(m._pod_gpu(_pod("n", 4)), 4)
+        self.assertTrue(m._pod_ready(_pod("n", 1, ready=True)))
+        self.assertFalse(m._pod_ready(_pod("n", 1, ready=False)))
+
+    def test_kserve_gpu_sum_and_device(self):
+        client = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 2},
+                                "spec": {"replicas": 2}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [_pod("gpu-a", 2), _pod("gpu-a", 2)]}, None)),
+            ("/nodes/gpu-a",
+             (True, {"metadata": {"labels":
+                     {"nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"}}}, None)),
+        ], default_namespace="kserve")
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        out = m.resolve_backend_count(dep, client, self.GPU_SETTINGS)
+        self.assertEqual(out["gpu_ready"], 4)            # 2 pod × 2 GPU
+        self.assertEqual(out["gpu_products"], {"H100": 4})
+        self.assertIsNone(out["gpu_error"])
+
+    def test_gpu_zero_when_no_ready_pods(self):
+        client = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 0},
+                                "spec": {"replicas": 2}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [_pod("gpu-a", 2, ready=False)]}, None)),
+        ], default_namespace="kserve")
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        out = m.resolve_backend_count(dep, client, self.GPU_SETTINGS)
+        self.assertEqual(out["gpu_ready"], 0)            # ready pod 없음 -> 0 (장애 아님)
+        self.assertEqual(out["gpu_products"], {})
+
+    def test_gpu_unknown_when_pods_forbidden(self):
+        client = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 1},
+                                "spec": {"replicas": 1}}]}, None)),
+            ("/pods?labelSelector", (False, None, "HTTP 403 Forbidden")),
+        ], default_namespace="kserve")
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        out = m.resolve_backend_count(dep, client, self.GPU_SETTINGS)
+        self.assertIsNone(out["gpu_ready"])              # 권한 없음 -> ? 폴백
+        self.assertIn("403", out["gpu_error"])
+        self.assertEqual(out["backends_ready"], 1)       # Pod 개수는 영향 없음
+
+    def test_summarize_gpu_dedup_shared_service(self):
+        ll = {"groups": [], "health": None, "deployments": [
+            {"model_name": "A", "namespace": "kserve", "service": "a1",
+             "api_base": "http://a1/v1", "backends_ready": 2,
+             "gpu_ready": 4, "gpu_products": {"H100": 4}},
+            {"model_name": "B", "namespace": "kserve", "service": "a1",  # 공유
+             "api_base": "http://a1/v1", "backends_ready": 2,
+             "gpu_ready": 4, "gpu_products": {"H100": 4}},
+            {"model_name": "C", "namespace": "kserve", "service": "a2",
+             "api_base": "http://a2/v1", "backends_ready": 1,
+             "gpu_ready": 2, "gpu_products": {"B200": 2}},
+        ]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertEqual(s["gpu_total"], 6)              # a1(4) 한 번 + a2(2)
+        self.assertEqual(s["gpu_products"], {"H100": 4, "B200": 2})
+        self.assertTrue(s["gpu_known"])
+
+
 class TestSorting(unittest.TestCase):
     def test_merge_sorts_deployments_by_name_case_insensitive(self):
         ll = {"health": None, "deployments": [

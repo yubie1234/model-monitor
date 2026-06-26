@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
@@ -124,6 +124,11 @@ def resolve_settings(args):
             args.health_timeout or litellm.get("health_timeout") or 90.0),
         # --- backend 개수(LB 뒤 Pod 수) 수집 설정 ---
         "backend_count": bc_enabled,
+        # GPU 개수+장치명(Pod nvidia.com/gpu + 노드 라벨) 수집. 기본 ON,
+        # --no-gpu-info 면 off. Pod/Node 읽기 권한이 없으면 조용히 ? 폴백.
+        "gpu_info": (bc_enabled
+                     and not getattr(args, "no_gpu_info", False)
+                     and bc.get("gpu_info", True)),
         "k8s_api_server": (args.k8s_api_server or bc.get("api_server")),
         "k8s_token_file": (args.k8s_token_file or bc.get("token_file")
                            or "/var/run/secrets/kubernetes.io/serviceaccount/token"),
@@ -697,6 +702,120 @@ def _int_or_none(v):
         return None
 
 
+# ----------------------------------------------------------------------------
+# GPU: backend Pod 의 nvidia.com/gpu 개수 + 장치 모델명(H100/B200 ...)
+#   개수 -> Pod spec resources.limits["nvidia.com/gpu"]
+#   장치 -> Pod 가 뜬 노드의 라벨 nvidia.com/gpu.product (GPU Operator/GFD)
+#   멀티노드 GPU 환경 없음 전제: Pod 1개 = 노드 1개.
+# ----------------------------------------------------------------------------
+
+GPU_RESOURCE = "nvidia.com/gpu"
+GPU_PRODUCT_LABEL = "nvidia.com/gpu.product"
+
+
+def _gpu_qty(v):
+    """nvidia.com/gpu 수량 문자열("1","8")을 int 로. 실패하면 0."""
+    try:
+        return int(str(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _pod_gpu(pod):
+    """Pod 한 개가 점유하는 GPU 수 = 컨테이너 limits(없으면 requests) 의 nvidia.com/gpu 합."""
+    total = 0
+    for ctr in ((pod.get("spec") or {}).get("containers") or []):
+        res = ctr.get("resources") or {}
+        q = (res.get("limits") or {}).get(GPU_RESOURCE)
+        if q is None:
+            q = (res.get("requests") or {}).get(GPU_RESOURCE)
+        total += _gpu_qty(q)
+    return total
+
+
+def _pod_ready(pod):
+    """Running + Ready condition True 인 Pod 만 '서빙 중'으로 본다(backends_ready 와 동일 기준)."""
+    st = pod.get("status") or {}
+    if st.get("phase") != "Running":
+        return False
+    for cnd in st.get("conditions") or []:
+        if cnd.get("type") == "Ready":
+            return cnd.get("status") == "True"
+    return False
+
+
+def _short_gpu_product(prod):
+    """NVIDIA-H100-80GB-HBM3 -> H100, NVIDIA-B200 -> B200, NVIDIA-A100-SXM4-80GB -> A100."""
+    if not prod:
+        return None
+    s = prod
+    if s.upper().startswith("NVIDIA-"):
+        s = s[len("NVIDIA-"):]
+    return s.split("-")[0] or prod
+
+
+def _node_gpu_product(client, node_name, cache):
+    """노드 라벨 nvidia.com/gpu.product (캐시). 실패/없음이면 None."""
+    if not node_name:
+        return None
+    if node_name in cache:
+        return cache[node_name]
+    prod = None
+    ok, data, _ = client.get("/api/v1/nodes/%s" % node_name)
+    if ok:
+        labels = (data.get("metadata") or {}).get("labels") or {}
+        prod = labels.get(GPU_PRODUCT_LABEL)
+    cache[node_name] = prod
+    return prod
+
+
+def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
+    """(ns,svc) 뒤 ready Pod 들의 GPU 수 합 + 장치별 집계.
+
+    -> {"gpu_ready": int|None, "gpu_products": {short: count}, "gpu_error": str|None}
+       gpu_ready=None 은 조회 실패(?), 0 은 GPU 없음/scale-to-zero.
+    Pod 선택: KServe(ISVC found)면 serving.kserve.io/inferenceservice 라벨,
+    아니면 Service 의 spec.selector 로 labelSelector 를 만든다.
+    """
+    out = {"gpu_ready": None, "gpu_products": {}, "gpu_error": None}
+    if found:
+        sel = "serving.kserve.io/inferenceservice=%s" % isvc
+    else:
+        ok, sdata, serr = client.get(
+            "/api/v1/namespaces/%s/services/%s" % (ns, svc))
+        if not ok:
+            out["gpu_error"] = "service: %s" % serr
+            return out
+        seldict = ((sdata.get("spec") or {}).get("selector")) or {}
+        if not seldict:
+            out["gpu_error"] = "service 에 selector 없음"
+            return out
+        sel = ",".join("%s=%s" % (k, v) for k, v in sorted(seldict.items()))
+    ok, data, err = client.get(
+        "/api/v1/namespaces/%s/pods?labelSelector=%s"
+        % (ns, urllib.parse.quote(sel, safe="=,")))
+    if not ok:
+        out["gpu_error"] = "pods: %s" % err
+        return out
+    total = 0
+    products = {}
+    any_ready = False
+    for pod in data.get("items") or []:
+        if not _pod_ready(pod):
+            continue
+        any_ready = True
+        g = _pod_gpu(pod)
+        if g <= 0:
+            continue
+        total += g
+        prod = _short_gpu_product(_node_gpu_product(
+            client, (pod.get("spec") or {}).get("nodeName"), node_cache)) or "GPU"
+        products[prod] = products.get(prod, 0) + g
+    out["gpu_ready"] = total if any_ready else 0
+    out["gpu_products"] = products
+    return out
+
+
 def resolve_backend_count(deployment, client, settings, cache=None):
     """우선순위 체인으로 한 deployment 의 LB 뒤 backend 개수 산출 -> 필드 dict.
 
@@ -706,7 +825,8 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     out = {"backends_ready": None, "backends_desired": None,
            "backend_source": "none", "mode": "Unknown",
            "scale_to_zero": False, "namespace": None, "service": None,
-           "k8s_error": None}
+           "k8s_error": None,
+           "gpu_ready": None, "gpu_products": {}, "gpu_error": None}
     api_base = deployment.get("api_base")
     if not api_base:
         return out
@@ -788,6 +908,23 @@ def resolve_backend_count(deployment, client, settings, cache=None):
 
     if out["backends_ready"] is None and errors:
         out["k8s_error"] = "; ".join(errors)
+
+    # GPU 개수 + 장치명 (기본 ON; --no-gpu-info 면 settings["gpu_info"]=False).
+    # 한 건 실패가 전체를 막지 않게 try/except -> gpu_ready=None(=?) 폴백.
+    if settings.get("gpu_info"):
+        try:
+            node_cache = getattr(client, "_node_cache", None)
+            if node_cache is None:
+                node_cache = {}
+                setattr(client, "_node_cache", node_cache)
+            g = collect_gpu_for_service(
+                client, ns, svc, isvc, info["found"], node_cache)
+            out["gpu_ready"] = g["gpu_ready"]
+            out["gpu_products"] = g["gpu_products"]
+            out["gpu_error"] = g["gpu_error"]
+        except Exception as e:  # noqa: BLE001
+            out["gpu_error"] = "%s: %s" % (type(e).__name__, e)
+
     if cache is not None:
         cache[(ns, svc)] = dict(out)
     return out
@@ -889,6 +1026,9 @@ def summarize(snap):
         "backend_pods_ready": 0,     # 모든 LB 뒤 ready Pod 합계
         "backend_pods_desired": 0,   # 목표 replica 합계
         "backend_pods_known": False,
+        "gpu_total": 0,              # 모든 backend 의 ready GPU 합 (Service dedup)
+        "gpu_products": {},          # {장치명: 개수}
+        "gpu_known": False,
     }
     ll = snap.get("litellm")
     if ll:
@@ -921,19 +1061,24 @@ def summarize(snap):
         # 공유 Service 의 물리 Pod 가 model_name 수만큼 이중 집계된다.
         # service 식별이 안 되면(external 등) api_base 로 폴백해 그래도 dedup.
         seen_svc = set()
+        seen_gpu = set()
         for d in ll.get("deployments") or []:
-            if d.get("backends_ready") is None:
-                continue
             key = (d.get("namespace"), d.get("service"))
             if key == (None, None):
                 key = ("", d.get("api_base"))
-            if key in seen_svc:
-                continue
-            seen_svc.add(key)
-            s["backend_pods_ready"] += d["backends_ready"]
-            s["backend_pods_known"] = True
-            if d.get("backends_desired") is not None:
-                s["backend_pods_desired"] += d["backends_desired"]
+            if d.get("backends_ready") is not None and key not in seen_svc:
+                seen_svc.add(key)
+                s["backend_pods_ready"] += d["backends_ready"]
+                s["backend_pods_known"] = True
+                if d.get("backends_desired") is not None:
+                    s["backend_pods_desired"] += d["backends_desired"]
+            # GPU 도 (ns,svc) 기준 dedup — 공유 백엔드의 물리 GPU 이중 집계 방지.
+            if d.get("gpu_ready") is not None and key not in seen_gpu:
+                seen_gpu.add(key)
+                s["gpu_total"] += d["gpu_ready"]
+                s["gpu_known"] = True
+                for prod, n in (d.get("gpu_products") or {}).items():
+                    s["gpu_products"][prod] = s["gpu_products"].get(prod, 0) + n
 
     backends = snap.get("backends") or []
     s["backends_total"] = len(backends)
@@ -1099,6 +1244,53 @@ def _fmt_agg_backends(ready, desired):
     return c(body, color)
 
 
+# TUI 장치 색(제한된 ANSI 팔레트 내에서 장치 구분). 상태색(green/red) 회피.
+_GPU_TUI_COLOR = {"H100": "magenta", "B200": "cyan", "H200": "yellow",
+                  "A100": "cyan", "L40S": "yellow"}
+
+
+def _gpu_tokens(products):
+    """장치별 색 토큰: "H100×4 B200×2" (혼합이면 공백 구분)."""
+    toks = []
+    for k in sorted(products or {}):
+        toks.append(c("%s×%d" % (k, products[k]), _GPU_TUI_COLOR.get(k, "magenta")))
+    return " ".join(toks)
+
+
+def _fmt_gpu(d):
+    """deployment 한 행의 GPU 셀 — 장치별 색 칩(텍스트)."""
+    gpu = d.get("gpu_ready")
+    if gpu is None:
+        return c("?" + (" ⚠" if d.get("gpu_error") else ""), "dim")
+    if gpu == 0:
+        return c("-", "dim")
+    return _gpu_tokens(d.get("gpu_products")) or c(str(gpu), "magenta")
+
+
+def _sum_gpu(bes):
+    """모델 그룹의 GPU 합 + 장치별 집계(자식 백엔드는 서로 다른 Service 라 직접 합산)."""
+    total = None
+    products = {}
+    for b in bes:
+        g = b.get("gpu_ready")
+        if g is None:
+            continue
+        total = (total or 0) + g
+        for p, n in (b.get("gpu_products") or {}).items():
+            products[p] = products.get(p, 0) + n
+    return total, products
+
+
+def _fmt_agg_gpu(gpu, products):
+    """모델 그룹 행의 Σ GPU 셀 — 장치별 색 칩(텍스트)."""
+    if gpu is None:
+        return c("?", "dim")
+    if gpu == 0:
+        return c("-", "dim")
+    toks = _gpu_tokens(products)
+    return c("Σ ", "dim") + (toks or c(str(gpu), "magenta"))
+
+
 def _table(headers, rows, aligns=None):
     """간단한 모노스페이스 테이블 렌더."""
     cols = len(headers)
@@ -1163,10 +1355,16 @@ def render(snap, settings):
     ]
     if s.get("backend_pods_known"):
         summary_bits.append(
-            "backend pods: %s/%s" % (
+            "replicas: %s/%s" % (
                 c(str(s["backend_pods_ready"]), "green"),
                 s["backend_pods_desired"] or "?")
         )
+    if s.get("gpu_known"):
+        prods = s.get("gpu_products") or {}
+        detail = (" (%s)" % ",".join("%s×%d" % (p, n)
+                                     for p, n in sorted(prods.items()))) if prods else ""
+        summary_bits.append(
+            "gpu: %s%s" % (c(str(s["gpu_total"]), "green"), c(detail, "dim")))
     if settings["probe_backends"]:
         summary_bits.append(
             "backends up: %s/%s" % (
@@ -1203,6 +1401,7 @@ def render(snap, settings):
             #              + LB 뒤 backend Pod 개수
             merged = merge_deployments_with_health(ll)
             show_backends = snap.get("backend_count_enabled")
+            show_gpu = bool((snap.get("summary") or {}).get("gpu_known"))
             if merged:
                 # model_name 으로 묶어 표시. 백엔드가 1개뿐이고 공유도 아니면 한 줄로
                 # 간결히, 여러 백엔드(로드밸런싱)면 그룹 헤더(합성 상태 + Σ) + 자식 줄.
@@ -1231,6 +1430,8 @@ def render(snap, settings):
                         row = [c(d["status"], color), nm, d.get("type", "-")]
                         if show_backends:
                             row.append(_fmt_backends(d))
+                            if show_gpu:
+                                row.append(_fmt_gpu(d))
                             row.append(c(d.get("backend_source", "-"), "dim"))
                         row.append((d.get("api_base") or "-") + _shared_suffix(d, nm))
                         drows.append(row)
@@ -1244,6 +1445,9 @@ def render(snap, settings):
                     if show_backends:
                         r, dd = _sum_backends(bes)
                         grow.append(_fmt_agg_backends(r, dd))
+                        if show_gpu:
+                            g, gp = _sum_gpu(bes)
+                            grow.append(_fmt_agg_gpu(g, gp))
                         grow.append("")
                     grow.append("")
                     drows.append(grow)
@@ -1255,15 +1459,20 @@ def render(snap, settings):
                         crow = [c(b.get("status", "?"), bcolor), label, ""]
                         if show_backends:
                             crow.append(_fmt_backends(b))
+                            if show_gpu:
+                                crow.append(_fmt_gpu(b))
                             crow.append(c(b.get("backend_source", "-"), "dim"))
                         crow.append(b.get("api_base") or "-")
                         drows.append(crow)
                 hdr = ["STATUS", "MODEL_NAME", "TYPE"]
                 if show_backends:
-                    hdr += ["BACKENDS", "SRC"]
+                    hdr += ["REPLICAS"]
+                    if show_gpu:
+                        hdr += ["GPU"]
+                    hdr += ["SRC"]
                 hdr.append("API_BASE")
                 title = ("  [Deployments] (/model/info api_base + /health status"
-                         + (" + LB backend pods)" if show_backends else ")"))
+                         + (" + k8s replicas/GPU)" if show_backends else ")"))
                 lines.append(c(title, "bold"))
                 lines.append(indent(_table(hdr, drows), 2))
                 lines.append("")
@@ -1335,7 +1544,8 @@ def demo_snapshot():
                  "backends_ready": 3, "backends_desired": 3,
                  "backend_source": "endpointslice", "mode": "RawDeployment",
                  "scale_to_zero": False, "namespace": "kserve",
-                 "service": "qwen36-35b-predictor"},
+                 "service": "qwen36-35b-predictor",
+                 "gpu_ready": 6, "gpu_products": {"H100": 6}},
                 {"model_name": "SGlang-Qwen3.6-27B-FP8",
                  "underlying": "hosted_vllm/Qwen3.6-27B-FP8",
                  "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1",
@@ -1343,7 +1553,8 @@ def demo_snapshot():
                  "backends_ready": 1, "backends_desired": 3,
                  "backend_source": "endpointslice", "mode": "RawDeployment",
                  "scale_to_zero": False, "namespace": "serving",
-                 "service": "qwen36-27b-sglang"},
+                 "service": "qwen36-27b-sglang",
+                 "gpu_ready": 4, "gpu_products": {"H100": 4}},
                 {"model_name": "vLLM-Stack-Qwen3-32B-AWQ",
                  "underlying": "hosted_vllm/Qwen3-32B-AWQ",
                  "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1",
@@ -1351,7 +1562,8 @@ def demo_snapshot():
                  "backends_ready": 0, "backends_desired": 2,
                  "backend_source": "deployment", "mode": "RawDeployment",
                  "scale_to_zero": False, "namespace": "serving",
-                 "service": "qwen3-32b-vllm"},
+                 "service": "qwen3-32b-vllm",
+                 "gpu_ready": 0, "gpu_products": {}},
                 {"model_name": "Qwen3-Embedding-8B",
                  "underlying": "openai/Qwen3-Embedding-8B",
                  "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1",
@@ -1359,7 +1571,8 @@ def demo_snapshot():
                  "backends_ready": 0, "backends_desired": 0,
                  "backend_source": "knative-pa", "mode": "Serverless",
                  "scale_to_zero": True, "namespace": "kserve",
-                 "service": "qwen3-embd-predictor"},
+                 "service": "qwen3-embd-predictor",
+                 "gpu_ready": 0, "gpu_products": {}},
                 # 같은 model_name 에 백엔드 2개 (로드밸런싱) — 모델 그룹 뷰의 1:N 팬아웃 예시
                 {"model_name": "KServe-Qwen3.6-35B-A3B-FP8",
                  "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8",
@@ -1368,7 +1581,8 @@ def demo_snapshot():
                  "backends_ready": 2, "backends_desired": 2,
                  "backend_source": "endpointslice", "mode": "RawDeployment",
                  "scale_to_zero": False, "namespace": "kserve",
-                 "service": "qwen36-35b-predictor-2"},
+                 "service": "qwen36-35b-predictor-2",
+                 "gpu_ready": 2, "gpu_products": {"B200": 2}},
                 # 다른 model_name 이 위 predictor Service 를 공유 — 그래프/SHARED 배지 예시
                 {"model_name": "Router-Qwen3.6-35B",
                  "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8",
@@ -1377,7 +1591,8 @@ def demo_snapshot():
                  "backends_ready": 3, "backends_desired": 3,
                  "backend_source": "endpointslice", "mode": "RawDeployment",
                  "scale_to_zero": False, "namespace": "kserve",
-                 "service": "qwen36-35b-predictor"},
+                 "service": "qwen36-35b-predictor",
+                 "gpu_ready": 6, "gpu_products": {"H100": 6}},
             ],
             "health": {
                 "healthy_count": 3,
@@ -1539,6 +1754,22 @@ _DASHBOARD_HTML = r"""<!doctype html>
   .bk.zero .num{color:var(--warn)}
   .bk .note{font-size:10.5px;color:var(--faint)}
   .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .val.gpuval{color:#b083f0}
+  /* GPU 장치 칩 (혼합 GPU: 장치별 색) */
+  .gchips{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+  .gchip{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:10.5px;
+    font-weight:600;padding:0 7px;line-height:18px;border-radius:20px;border:1px solid}
+  .gchip .dot{width:6px;height:6px;border-radius:50%}
+  .gtot{font-family:var(--mono);font-size:11.5px;color:var(--faint);font-variant-numeric:tabular-nums}
+  /* 헤드라인 GPU 카드: 세그먼트 바 + 범례 */
+  .gpusub{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+  .gbar{display:flex;height:10px;width:100%;max-width:160px;border-radius:4px;
+    overflow:hidden;border:1px solid var(--border)}
+  .gbar i{display:block;height:100%}
+  .glegend{display:flex;gap:9px;flex-wrap:wrap}
+  .glegend span{font-family:var(--mono);font-size:10px;color:var(--muted);
+    display:inline-flex;align-items:center;gap:4px}
+  .glegend i{width:7px;height:7px;border-radius:2px;display:inline-block}
 
   /* 모델 기준 그룹 뷰 */
   .pill.deg{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
@@ -1651,7 +1882,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
 
   <section id="deployments-sec">
     <div class="sec-title">Deployments
-      <span class="src">/model/info api_base · /health status · k8s backend pods</span>
+      <span class="src">/model/info api_base · /health status · k8s replicas · GPU</span>
       <span class="filters">
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
@@ -1806,8 +2037,56 @@ function sharedMap(all){
   (all||[]).forEach(d=>{const k=svcKeyOf(d);(mp[k]=mp[k]||new Set()).add(d.model_name);});
   return mp;
 }
+// 장치명 -> 색(고정 매핑 + 해시 폴백). 상태색(green/red)과 겹치지 않는 계열.
+const DEV_COLORS={H100:"#b083f0",B200:"#56d4dd",A100:"#6e8bff",L40S:"#d29922",H200:"#f0883e"};
+const DEV_POOL=["#b083f0","#56d4dd","#6e8bff","#d29922","#3fb950","#f0883e"];
+function devColor(n){ if(DEV_COLORS[n]) return DEV_COLORS[n];
+  let h=0; for(const ch of String(n)) h=(h*31+ch.charCodeAt(0))>>>0; return DEV_POOL[h%DEV_POOL.length]; }
+// 혼합 GPU: 장치별 색 칩. lead 가 있으면 앞에 총합/Σ 표시.
+function gpuChips(products, lead){
+  const keys=Object.keys(products||{}).sort();
+  const chips=keys.map(k=>{const col=devColor(k);
+    return '<span class="gchip" style="color:'+col+';border-color:'+col+'66;background:'+col+'1a">'
+      +'<i class="dot" style="background:'+col+'"></i>'+esc(k)+'×'+products[k]+'</span>';}).join("");
+  return '<span class="gchips">'+(lead?'<span class="gtot">'+esc(lead)+'</span>':'')+chips+'</span>';
+}
+// 그래프 노드용 축약 텍스트
+function gpuText(g, products){
+  if(g==null) return "?"; if(g===0) return "-";
+  const ps=products||{}, keys=Object.keys(ps).sort();
+  if(keys.length===1) return keys[0]+"×"+ps[keys[0]];
+  return keys.map(k=>k+"×"+ps[k]).join("·");
+}
+function gpuCell(d){
+  const g=d.gpu_ready;
+  if(g==null) return '<span class="srccol"'+(d.gpu_error?' title="'+esc(d.gpu_error)+'"':'')+'>?'+(d.gpu_error?' ⚠':'')+'</span>';
+  if(g===0) return '<span class="srccol">-</span>';
+  const keys=Object.keys(d.gpu_products||{});
+  return gpuChips(d.gpu_products, keys.length>1?String(g):"");   // 혼합이면 총합 표시
+}
+function sumGpu(bes){
+  let total=null; const products={};
+  bes.forEach(b=>{ if(b.gpu_ready!=null){ total=(total||0)+b.gpu_ready;
+    const ps=b.gpu_products||{}; for(const k in ps) products[k]=(products[k]||0)+ps[k]; } });
+  return {g:total, products:products};
+}
+function aggGpuCell(g, products){
+  if(g==null) return '<span class="srccol">?</span>';
+  if(g===0) return '<span class="srccol">-</span>';
+  const keys=Object.keys(products||{});
+  return gpuChips(products, keys.length>1?("Σ "+g):"Σ");
+}
+// 헤드라인 GPU 카드: 장치 비율 세그먼트 바 + 범례
+function gpuBar(products){
+  const keys=Object.keys(products||{}).sort();
+  const t=keys.reduce((a,k)=>a+products[k],0)||1;
+  const segs=keys.map(k=>'<i style="width:'+(products[k]/t*100)+'%;background:'+devColor(k)
+    +'" title="'+esc(k)+'×'+products[k]+'"></i>').join("");
+  const leg=keys.map(k=>'<span><i style="background:'+devColor(k)+'"></i>'+esc(k)+'×'+products[k]+'</span>').join("");
+  return '<span class="gbar">'+segs+'</span><span class="glegend">'+leg+'</span>';
+}
 // model_name 으로 묶은 tbody 행들(부모 그룹 행 + 자식 백엔드 행)
-function groupedRows(merged, shared, showBk){
+function groupedRows(merged, shared, showBk, showGpu){
   const order=[], groups={};
   merged.forEach(d=>{ if(!groups[d.model_name]){groups[d.model_name]=[];order.push(d.model_name);}
     groups[d.model_name].push(d); });
@@ -1818,7 +2097,9 @@ function groupedRows(merged, shared, showBk){
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
       +'<td><span class="chip">'+esc(type)+'</span></td>';
-    if(showBk) html+='<td>'+aggCell(agg.r,agg.d)+'</td><td></td><td></td>';
+    if(showBk){ html+='<td>'+aggCell(agg.r,agg.d)+'</td>';
+      if(showGpu){const sg=sumGpu(bes); html+='<td>'+aggGpuCell(sg.g,sg.products)+'</td>';}
+      html+='<td></td><td></td>'; }
     html+='<td></td></tr>';
     bes.forEach(b=>{
       const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
@@ -1827,9 +2108,10 @@ function groupedRows(merged, shared, showBk){
       html+='<tr class="child-row"><td>'+statusPill(b.status||"?")+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
           +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
-      if(showBk) html+='<td>'+backendCell(b)+'</td>'
-        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
-        +'<td class="srccol">'+esc(b.backend_source||"-")+'</td>';
+      if(showBk){ html+='<td>'+backendCell(b)+'</td>';
+        if(showGpu) html+='<td>'+gpuCell(b)+'</td>';
+        html+='<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
+          +'<td class="srccol">'+esc(b.backend_source||"-")+'</td>'; }
       html+='<td class="api" title="'+esc(b.api_base)+'">'+esc(b.api_base||"-")+'</td></tr>';
     });
     return html;
@@ -1855,6 +2137,7 @@ function buildGraph(deps){
   deps.forEach(d=>{ const k=svcKeyOf(d);
     if(!svc[k]){ svc[k]={key:k,label:d.service||backendHost(d.api_base)||"external",
       r:d.backends_ready,des:d.backends_desired,status:d.status,
+      gpu:d.gpu_ready,gpu_products:d.gpu_products,
       ext:(d.backend_source==="external"),stz:d.scale_to_zero,models:new Set()}; svcOrder.push(k); }
     svc[k].models.add(d.model_name); });
   const NW=176, NH=42, GAP=16, PADX=16, PADY=34, W=600;
@@ -1878,7 +2161,8 @@ function buildGraph(deps){
       +'<text class="nsub" x="'+(colL+12)+'" y="'+(y+33)+'">model_name</text></g>'; });
   let snodes="";
   svcOrder.forEach(k=>{ const o=svc[k], sh=o.models.size>1, y=sY[k];
-    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" pods"+(sh?"  ·  shared ×"+o.models.size:""));
+    const gtxt=(o.gpu!=null && o.gpu>0)?("  ·  "+gpuText(o.gpu,o.gpu_products)):"";
+    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" pods"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
     snodes+='<g class="gnode be '+beNodeCls(o)+(sh?' shared':'')+'" data-key="'+attrId(k)+'" data-kind="b">'
       +'<rect x="'+colR+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
       +'<text class="ntext" x="'+(colR+12)+'" y="'+(y+19)+'">'+esc(trunc(o.label,22))+'</text>'
@@ -1958,15 +2242,25 @@ function render(snap){
   cards += card("Running (healthy)", s.deployments_healthy||0, "good",
     "unhealthy "+(s.deployments_unhealthy||0));
   if(s.backend_pods_known)
-    cards += card("Backend Pods", (s.backend_pods_ready||0)
+    cards += card("Replicas", (s.backend_pods_ready||0)
       +'<span style="color:var(--faint);font-size:16px"> / '
       +(s.backend_pods_desired||"?")+'</span>', "",
       "LB 뒤 ready / desired");
+  // GPU 카드는 전체(admin) 뷰에서만 — per-user 뷰는 내부정보로 숨김.
+  // 혼합 GPU 는 세그먼트 바 + 범례로 비중을 보여준다.
+  if(s.gpu_known && !snap.user_view){
+    const gp=s.gpu_products||{};
+    const sub = Object.keys(gp).length
+      ? '<div class="sub gpusub">'+gpuBar(gp)+'</div>' : '<div class="sub">장치 미상</div>';
+    cards += '<div class="card"><div class="label">GPU</div>'
+      +'<div class="val gpuval">'+(s.gpu_total||0)+'</div>'+sub+'</div>';
+  }
   $("#cards").innerHTML = cards;
 
   // deployments
   const showBk = !!snap.backend_count_enabled;
   const uHide = !!snap.user_view;   // per-user 뷰는 내부 컬럼(MODE/SRC/API_BASE) 숨김
+  const showGpu = !!s.gpu_known && !uHide;   // GPU 컬럼도 내부정보 — user 뷰 숨김
   const dt = $("#deployments");
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
@@ -1976,11 +2270,13 @@ function render(snap){
     $("#f-count").textContent = (fS||fT)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
-    if(showBk) head += '<th>BACKENDS (ready/desired)</th>';
+    if(showBk) head += '<th>REPLICAS (ready/desired)</th>';
+    if(showBk && showGpu) head += '<th>GPU</th>';
     if(showBk && !uHide) head += '<th>MODE</th><th>SRC</th>';
     if(!uHide) head += "<th>API_BASE</th>";
     head += "</tr>";
-    const ncol = 3 + (showBk?1:0) + (showBk&&!uHide?2:0) + (uHide?0:1);
+    const ncol = 3 + (showBk?1:0) + (showBk&&showGpu?1:0)
+      + (showBk&&!uHide?2:0) + (uHide?0:1);
     dt.querySelector("thead").innerHTML = head;
     // per-user 뷰(uHide)는 내부 토폴로지(Service/api_base)를 숨기므로 그룹/그래프를
     // 쓰지 않고 컬럼 축소된 평면 행을 그린다. 전체(admin) 뷰에서만 모델 그룹핑을 적용.
@@ -1991,13 +2287,14 @@ function render(snap){
     } else if(grouped){
       // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
       // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
-      body = groupedRows(merged, sharedMap(all), showBk);
+      body = groupedRows(merged, sharedMap(all), showBk, showGpu);
     } else {
       body = merged.map(d=>{
         let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
           +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
+        if(showBk && showGpu) row += "<td>"+gpuCell(d)+"</td>";
         if(showBk && !uHide) row +=
           '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
           +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
@@ -2445,6 +2742,8 @@ def main():
     p.add_argument("--user-view-show-internal", action="store_true",
                    help="per-user 뷰에서 내부 api_base/namespace 도 표시(기본 숨김)")
     # backend 개수(LB 뒤 Pod 수) 수집
+    p.add_argument("--no-gpu-info", action="store_true",
+                   help="GPU 개수/장치명 수집 끄기 (기본 ON; Pod/Node 읽기 권한 필요)")
     p.add_argument("--no-backend-count", action="store_true",
                    help="LB 뒤 backend Pod 개수 수집 비활성")
     p.add_argument("--k8s-api-server", help="k8s API server URL 오버라이드")
