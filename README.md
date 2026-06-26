@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.3.0**
+**버전: v0.4.0**
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 모니터. 터미널(TUI)과 웹 대시보드(`--serve`)를 모두 제공합니다.
 
@@ -16,6 +16,7 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 | **model_name → api_base 매핑** | LiteLLM `GET /model/info` (api_base 평문, admin 키 권장) |
 | running(healthy) / unhealthy | LiteLLM `GET /health` (api_base 기준으로 위 매핑과 join) |
 | **LB 뒤 backend Pod 개수 (ready/desired)** | Kubernetes API (EndpointSlice / Knative PodAutoscaler / Deployment) |
+| **GPU 개수 + 장치명 (H100/B200 …)** | Pod `resources.limits[nvidia.com/gpu]` + 노드 라벨 `nvidia.com/gpu.product` |
 | OpenAI 호환 모델 이름 목록 | LiteLLM `GET /v1/models` (이름만, **api_base 없음**) |
 | backends up (옵션) | 각 백엔드 `GET /v1/models`, `/health` 직접 probe |
 
@@ -43,8 +44,15 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 > 한눈에 보여줍니다. 헤드라인 **Backend Pods** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
 > 공유 백엔드가 모델 수만큼 이중 집계되지 않습니다.
 
+> **GPU 개수 + 장치명 (v0.4.0)** — backend Pod 가 점유한 GPU 수(`resources.limits[nvidia.com/gpu]`
+> 합)와 장치 모델명을 함께 보여줍니다. 장치명은 Pod 가 뜬 **노드의 라벨 `nvidia.com/gpu.product`**
+> (NVIDIA GPU Operator / GPU Feature Discovery 가 부착)에서 얻어 `H100`·`B200` 처럼 축약 표시합니다.
+> 표기: `4×H100`, 여러 장치면 `6 (H100×4,B200×2)`, GPU 없음/idle 은 `-`, 조회 실패는 `?`.
+> 헤드라인 GPU 총합도 `(namespace, service)` 기준 dedup. 기본 ON(`--no-gpu-info` 로 끔). 멀티노드 GPU 미지원.
+
 > in-cluster 에서 ServiceAccount 토큰이 있으면 **자동으로 켜집니다**(`--no-backend-count` 로 끔).
-> 필요한 RBAC 는 [deploy/k8s.yaml](deploy/k8s.yaml) 의 ClusterRole 참고 — 최소한 `endpointslices` 읽기.
+> 필요한 RBAC 는 [deploy/k8s.yaml](deploy/k8s.yaml) 의 ClusterRole 참고 — 최소한 `endpointslices` 읽기,
+> GPU 정보까지 보려면 `pods`·`nodes` 읽기.
 
 ## 사용법
 
@@ -138,6 +146,7 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 | `--timeout N` | HTTP 타임아웃(초, 기본 10) |
 | `--demo` | 샘플 데이터로 미리보기 |
 | `--no-backend-count` | LB 뒤 backend Pod 개수 수집 끄기 |
+| `--no-gpu-info` | GPU 개수/장치명 수집 끄기 (기본 ON; Pod·Node 읽기 권한 필요) |
 | `--enable-user-view` | 키 필수 모드 활성 — 키 입력해야 조회, admin 키는 전체 뷰 (기본 OFF) |
 | `--user-view-show-internal` | per-user(일반 키) 뷰에서 내부 `api_base`/namespace 도 표시 (기본 숨김) |
 | `--health-timeout N` | LiteLLM `/health` 타임아웃(초, 기본 90 — 모델 많으면 늘리기) |

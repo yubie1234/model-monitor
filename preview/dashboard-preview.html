@@ -105,6 +105,9 @@
   .bk.zero .num{color:var(--warn)}
   .bk .note{font-size:10.5px;color:var(--faint)}
   .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .gpu{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12.5px;color:var(--faint)}
+  .gpu.on{color:#b083f0}
+  .val.gpuval{color:#b083f0}
 
   /* 모델 기준 그룹 뷰 */
   .pill.deg{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
@@ -175,7 +178,7 @@
   .uv-status.ok{color:var(--up)} .uv-status.bad{color:var(--down)}
   .uv-note{font-size:10.5px;color:var(--faint)}
 </style>
-<script>window.__SNAPSHOT__={"version": "0.2.0", "ts": "2026-06-26 08:48:17", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor-2.kserve.svc:8080/v1", "id": "a1b2c4", "type": "kserve", "backends_ready": 2, "backends_desired": 2, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor-2", "status": "UP", "status_source": "health"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "status": "UP", "status_source": "health"}, {"model_name": "Router-Qwen3.6-35B", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c5", "type": "vllm", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "status": "UP", "status_source": "health"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "status": "DOWN", "status_source": "health"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor-2.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 6, "deployments_total": 6, "deployments_healthy": 5, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 6, "backend_pods_desired": 10, "backend_pods_known": true}, "demo": true};</script>
+<script>window.__SNAPSHOT__={"version": "0.4.0", "ts": "2026-06-26 13:50:39", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "gpu_ready": 6, "gpu_products": {"H100": 6}, "status": "UP", "status_source": "health"}, {"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor-2.kserve.svc:8080/v1", "id": "a1b2c4", "type": "kserve", "backends_ready": 2, "backends_desired": 2, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor-2", "gpu_ready": 2, "gpu_products": {"B200": 2}, "status": "UP", "status_source": "health"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "gpu_ready": 0, "gpu_products": {}, "status": "UP", "status_source": "health"}, {"model_name": "Router-Qwen3.6-35B", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c5", "type": "vllm", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "gpu_ready": 6, "gpu_products": {"H100": 6}, "status": "UP", "status_source": "health"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "gpu_ready": 4, "gpu_products": {"H100": 4}, "status": "UP", "status_source": "health"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "gpu_ready": 0, "gpu_products": {}, "status": "DOWN", "status_source": "health"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor-2.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 6, "deployments_total": 6, "deployments_healthy": 5, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 6, "backend_pods_desired": 10, "backend_pods_known": true, "gpu_total": 12, "gpu_products": {"H100": 10, "B200": 2}, "gpu_known": true}, "demo": true};</script>
 </head>
 <body>
 <div class="wrap">
@@ -185,21 +188,21 @@
     <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
-    <a class="exp" href="/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
-    <a class="exp" href="/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
+    <a class="exp" id="exp-json" href="/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
+    <a class="exp" id="exp-html" href="/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
     <div class="meta">
       <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
     </div>
   </header>
 
   <div id="userbar" style="display:none">
-    <span class="uv-title">🔑 내 키로 보기</span>
+    <span class="uv-title">🔑 키로 조회</span>
     <input id="uv-key" type="password" autocomplete="off" spellcheck="false"
-           placeholder="LiteLLM 키 입력 (sk-…)">
-    <label class="toggle"><input type="checkbox" id="uv-on"> 내 모델만 보기</label>
+           placeholder="LiteLLM 키 입력 후 Enter (sk-…)">
+    <button id="uv-go" class="exp" type="button">조회</button>
     <button id="uv-clear" class="exp" type="button">지우기</button>
     <span class="uv-status" id="uv-status"></span>
-    <span class="uv-note">키는 이 브라우저(탭)에만 보관 · 매 요청 헤더로만 전송 · 서버 저장 안 함</span>
+    <span class="uv-note">키는 이 브라우저(탭)에만 보관 · 매 요청 헤더로만 전송 · 서버 저장 안 함 · admin 키면 전체 뷰</span>
   </div>
 
   <div id="banner"></div>
@@ -268,9 +271,43 @@ function fmtNum(n){
   return (Math.round(Number(n)*100)/100).toLocaleString();
 }
 function uvKey(){ return (sessionStorage.getItem(UV_KEY)||"").trim(); }
-function uvActive(){ return USER_VIEW && $("#uv-on") && $("#uv-on").checked && uvKey(); }
+// 키 필수 모드: 키가 저장돼 있으면 키로 조회한다(있으면 active).
+function uvActive(){ return USER_VIEW && !!uvKey(); }
 function setUvStatus(msg, cls){ const el=$("#uv-status");
   if(el){ el.textContent=msg||""; el.className="uv-status "+(cls||""); } }
+
+// 키 필수 모드 초기/클리어 상태: 목록 대신 "키 입력" 안내만 보인다(폴링·노출 없음).
+function showNeedKey(){
+  lastSnap = null;
+  $("#banner").innerHTML = '<div class="note-banner">🔑 키를 입력하면 '
+    + '내 모델 목록이 보입니다. (admin 키를 넣으면 전체 뷰)</div>';
+  $("#cards").innerHTML = "";
+  $("#f-count").textContent = "";
+  const dt=$("#deployments");
+  dt.querySelector("thead").innerHTML="";
+  dt.querySelector("tbody").innerHTML='<tr><td class="empty">키 입력 대기 중</td></tr>';
+  const gt=$("#groups");
+  gt.querySelector("thead").innerHTML="";
+  gt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';
+  setUvStatus("", "");
+}
+
+// export 는 admin 키일 때만. 링크 클릭을 가로채 헤더에 키를 실어 fetch -> blob 다운로드/열기.
+function exportWithKey(path, open){
+  const key=uvKey(); if(!key) return;
+  fetch(path,{headers:{"X-LiteLLM-Key":key},cache:"no-store"}).then(r=>{
+    if(!r.ok){ setUvStatus("export 는 admin 키가 필요합니다","bad"); return null; }
+    return r.blob();
+  }).then(b=>{
+    if(!b) return;
+    const u=URL.createObjectURL(b);
+    if(open){ window.open(u,"_blank"); }
+    else { const a=document.createElement("a"); a.href=u;
+           a.download="model-monitor-snapshot.json"; document.body.appendChild(a);
+           a.click(); a.remove(); }
+    setTimeout(()=>URL.revokeObjectURL(u), 15000);
+  }).catch(()=>setUvStatus("export 실패","bad"));
+}
 
 function backendCell(d){
   const r=d.backends_ready, des=d.backends_desired, src=d.backend_source||"none";
@@ -339,8 +376,32 @@ function sharedMap(all){
   (all||[]).forEach(d=>{const k=svcKeyOf(d);(mp[k]=mp[k]||new Set()).add(d.model_name);});
   return mp;
 }
+// GPU 셀: ? (미상) / - (없음·idle) / "4×H100" / "6 (B200×2,H100×4)"
+function gpuText(g, products){
+  if(g==null) return "?";
+  if(g===0) return "-";
+  const ps=products||{}, keys=Object.keys(ps);
+  if(keys.length===1) return g+"×"+keys[0];
+  if(keys.length>1) return g+" ("+keys.sort().map(k=>k+"×"+ps[k]).join(",")+")";
+  return ""+g;
+}
+function gpuCell(d){
+  const g=d.gpu_ready;
+  if(g==null) return '<span class="srccol"'+(d.gpu_error?' title="'+esc(d.gpu_error)+'"':'')+'>?'+(d.gpu_error?' ⚠':'')+'</span>';
+  return '<span class="gpu'+(g>0?' on':'')+'">'+esc(gpuText(g,d.gpu_products))+'</span>';
+}
+function sumGpu(bes){
+  let total=null; const products={};
+  bes.forEach(b=>{ if(b.gpu_ready!=null){ total=(total||0)+b.gpu_ready;
+    const ps=b.gpu_products||{}; for(const k in ps) products[k]=(products[k]||0)+ps[k]; } });
+  return {g:total, products:products};
+}
+function aggGpuCell(g, products){
+  if(g==null) return '<span class="srccol">?</span>';
+  return '<span class="gpu'+(g>0?' on':'')+'">Σ '+esc(gpuText(g,products))+'</span>';
+}
 // model_name 으로 묶은 tbody 행들(부모 그룹 행 + 자식 백엔드 행)
-function groupedRows(merged, shared, showBk){
+function groupedRows(merged, shared, showBk, showGpu){
   const order=[], groups={};
   merged.forEach(d=>{ if(!groups[d.model_name]){groups[d.model_name]=[];order.push(d.model_name);}
     groups[d.model_name].push(d); });
@@ -351,7 +412,9 @@ function groupedRows(merged, shared, showBk){
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
       +'<td><span class="chip">'+esc(type)+'</span></td>';
-    if(showBk) html+='<td>'+aggCell(agg.r,agg.d)+'</td><td></td><td></td>';
+    if(showBk){ html+='<td>'+aggCell(agg.r,agg.d)+'</td>';
+      if(showGpu){const sg=sumGpu(bes); html+='<td>'+aggGpuCell(sg.g,sg.products)+'</td>';}
+      html+='<td></td><td></td>'; }
     html+='<td></td></tr>';
     bes.forEach(b=>{
       const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
@@ -360,9 +423,10 @@ function groupedRows(merged, shared, showBk){
       html+='<tr class="child-row"><td>'+statusPill(b.status||"?")+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
           +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
-      if(showBk) html+='<td>'+backendCell(b)+'</td>'
-        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
-        +'<td class="srccol">'+esc(b.backend_source||"-")+'</td>';
+      if(showBk){ html+='<td>'+backendCell(b)+'</td>';
+        if(showGpu) html+='<td>'+gpuCell(b)+'</td>';
+        html+='<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
+          +'<td class="srccol">'+esc(b.backend_source||"-")+'</td>'; }
       html+='<td class="api" title="'+esc(b.api_base)+'">'+esc(b.api_base||"-")+'</td></tr>';
     });
     return html;
@@ -388,6 +452,7 @@ function buildGraph(deps){
   deps.forEach(d=>{ const k=svcKeyOf(d);
     if(!svc[k]){ svc[k]={key:k,label:d.service||backendHost(d.api_base)||"external",
       r:d.backends_ready,des:d.backends_desired,status:d.status,
+      gpu:d.gpu_ready,gpu_products:d.gpu_products,
       ext:(d.backend_source==="external"),stz:d.scale_to_zero,models:new Set()}; svcOrder.push(k); }
     svc[k].models.add(d.model_name); });
   const NW=176, NH=42, GAP=16, PADX=16, PADY=34, W=600;
@@ -411,7 +476,8 @@ function buildGraph(deps){
       +'<text class="nsub" x="'+(colL+12)+'" y="'+(y+33)+'">model_name</text></g>'; });
   let snodes="";
   svcOrder.forEach(k=>{ const o=svc[k], sh=o.models.size>1, y=sY[k];
-    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" pods"+(sh?"  ·  shared ×"+o.models.size:""));
+    const gtxt=(o.gpu!=null && o.gpu>0)?("  ·  "+gpuText(o.gpu,o.gpu_products)):"";
+    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" pods"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
     snodes+='<g class="gnode be '+beNodeCls(o)+(sh?' shared':'')+'" data-key="'+attrId(k)+'" data-kind="b">'
       +'<rect x="'+colR+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
       +'<text class="ntext" x="'+(colR+12)+'" y="'+(y+19)+'">'+esc(trunc(o.label,22))+'</text>'
@@ -495,11 +561,19 @@ function render(snap){
       +'<span style="color:var(--faint);font-size:16px"> / '
       +(s.backend_pods_desired||"?")+'</span>', "",
       "LB 뒤 ready / desired");
+  // GPU 카드는 전체(admin) 뷰에서만 — per-user 뷰는 내부정보로 숨김
+  if(s.gpu_known && !snap.user_view){
+    const gp=s.gpu_products||{};
+    const gsub=Object.keys(gp).length
+      ? Object.keys(gp).sort().map(k=>k+"×"+gp[k]).join(" · ") : "장치 미상";
+    cards += card("GPU", (s.gpu_total||0), "gpuval", gsub);
+  }
   $("#cards").innerHTML = cards;
 
   // deployments
   const showBk = !!snap.backend_count_enabled;
   const uHide = !!snap.user_view;   // per-user 뷰는 내부 컬럼(MODE/SRC/API_BASE) 숨김
+  const showGpu = !!s.gpu_known && !uHide;   // GPU 컬럼도 내부정보 — user 뷰 숨김
   const dt = $("#deployments");
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
@@ -510,10 +584,12 @@ function render(snap){
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
     if(showBk) head += '<th>BACKENDS (ready/desired)</th>';
+    if(showBk && showGpu) head += '<th>GPU</th>';
     if(showBk && !uHide) head += '<th>MODE</th><th>SRC</th>';
     if(!uHide) head += "<th>API_BASE</th>";
     head += "</tr>";
-    const ncol = 3 + (showBk?1:0) + (showBk&&!uHide?2:0) + (uHide?0:1);
+    const ncol = 3 + (showBk?1:0) + (showBk&&showGpu?1:0)
+      + (showBk&&!uHide?2:0) + (uHide?0:1);
     dt.querySelector("thead").innerHTML = head;
     // per-user 뷰(uHide)는 내부 토폴로지(Service/api_base)를 숨기므로 그룹/그래프를
     // 쓰지 않고 컬럼 축소된 평면 행을 그린다. 전체(admin) 뷰에서만 모델 그룹핑을 적용.
@@ -524,13 +600,14 @@ function render(snap){
     } else if(grouped){
       // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
       // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
-      body = groupedRows(merged, sharedMap(all), showBk);
+      body = groupedRows(merged, sharedMap(all), showBk, showGpu);
     } else {
       body = merged.map(d=>{
         let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
           +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
+        if(showBk && showGpu) row += "<td>"+gpuCell(d)+"</td>";
         if(showBk && !uHide) row +=
           '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
           +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
@@ -578,6 +655,12 @@ function render(snap){
     gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
   }
 
+  // 키 필수 모드: export(JSON/정지페이지) 버튼은 admin 키로 본 전체 뷰일 때만 노출.
+  if(USER_VIEW){
+    const show = snap.admin_view ? "" : "none";
+    const ej=$("#exp-json"), eh=$("#exp-html");
+    if(ej) ej.style.display=show; if(eh) eh.style.display=show;
+  }
   if(snap.version) $("#ver").textContent = "v"+snap.version;
   $("#foot").textContent = "model_monitor v"+(snap.version||"?")
     +" · 표준 라이브러리만 사용 · 데이터 출처는 LiteLLM + Kubernetes API";
@@ -612,6 +695,12 @@ async function tick(){
     const u=$("#updated"); if(u) u.textContent += "  · saved snapshot (frozen)";
     return;
   }
+  // 키 필수 모드: 키가 없으면 무인증 호출을 아예 하지 않고 안내만.
+  if(USER_VIEW && !uvActive()){
+    showNeedKey();
+    $("#livedot").style.background = "var(--warn)";
+    return;
+  }
   try{
     let snap;
     if(uvActive()){
@@ -625,11 +714,12 @@ async function tick(){
         $("#livedot").style.background = "var(--down)";
         return;
       }
-      setUvStatus("내 모델만 보는 중 ("+(snap.accessible_count||0)+"개)", "ok");
+      setUvStatus(snap.admin_view ? "관리자 전체 뷰"
+        : "내 모델만 보는 중 ("+(snap.accessible_count||0)+"개)", "ok");
     } else {
+      // 레거시(키 필수 OFF): 무인증 global 뷰.
       const r = await fetch("/api/snapshot",{cache:"no-store"});
       snap = await r.json();
-      if(USER_VIEW) setUvStatus("", "");
     }
     render(snap);
     $("#livedot").style.background = "var(--up)";
@@ -650,25 +740,30 @@ $("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-group").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-graph").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 
-// per-user(키별) 뷰: 서버가 활성일 때만 키 입력 바를 노출한다.
+// 키 필수 모드: 키 입력 바 노출 + 조회/지우기/Enter, export 는 admin 키 헤더로.
 if(USER_VIEW){
   $("#userbar").style.display = "";
+  // 초기엔 export 버튼 숨김(admin 뷰가 로드되면 render 가 노출).
+  const ej=$("#exp-json"), eh=$("#exp-html");
+  if(ej) ej.style.display="none"; if(eh) eh.style.display="none";
   const keyInput = $("#uv-key");
   keyInput.value = uvKey();   // 같은 탭 내 새로고침 시 복원(sessionStorage)
-  keyInput.addEventListener("input", ()=>{
-    // 키는 sessionStorage 에만 둔다(탭 닫으면 소멸). DOM/title 에 새지 않게 값만 보관.
-    sessionStorage.setItem(UV_KEY, keyInput.value.trim());
-  });
-  $("#uv-on").addEventListener("change", ()=>{
-    if($("#uv-on").checked && !uvKey()){ keyInput.focus();
-      setUvStatus("키를 먼저 입력하세요", "bad"); return; }
+  // 키는 "조회"(또는 Enter) 시에만 저장·전송한다(타이핑 중 부분키 조회 방지).
+  function submitKey(){
+    const v = keyInput.value.trim();
+    if(!v){ setUvStatus("키를 입력하세요", "bad"); keyInput.focus(); return; }
+    sessionStorage.setItem(UV_KEY, v);   // 탭 닫으면 소멸
     tick();
-  });
+  }
+  $("#uv-go").addEventListener("click", submitKey);
+  keyInput.addEventListener("keydown", e=>{ if(e.key==="Enter") submitKey(); });
   $("#uv-clear").addEventListener("click", ()=>{
-    sessionStorage.removeItem(UV_KEY); keyInput.value="";
-    $("#uv-on").checked = false; setUvStatus("", "");
-    tick();
+    sessionStorage.removeItem(UV_KEY); keyInput.value=""; tick();
   });
+  if(ej) ej.addEventListener("click", e=>{ e.preventDefault();
+    exportWithKey("/snapshot.json", false); });
+  if(eh) eh.addEventListener("click", e=>{ e.preventDefault();
+    exportWithKey("/snapshot.html", true); });
 }
 tick(); loop();
 </script>
