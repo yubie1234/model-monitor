@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.2.0**
+**버전: v0.3.0**
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 모니터. 터미널(TUI)과 웹 대시보드(`--serve`)를 모두 제공합니다.
 
@@ -68,10 +68,12 @@ python3 model_monitor.py --config config.yaml --serve --port 8088
 #     http://localhost:8088/snapshot.json   # raw JSON 파일 다운로드(클릭 한 번)
 #     http://localhost:8088/snapshot.html   # 데이터가 박제된 self-contained 정지 페이지(저장해 공유)
 
-# 키별(per-user) 뷰 — 사용자가 자기 LiteLLM 키를 입력하면 그 키로 볼 수 있는 모델만 표시
+# 키별(per-user) 뷰 — 켜면 "키 필수 모드": 키를 입력해야 목록이 보인다
 #   기본 OFF. 켜기 전에 ① /v1/models 가 키별로 필터되는지 ② TLS 종단 을 확인할 것.
 python3 model_monitor.py --config config.yaml --serve --enable-user-view
-#   -> 대시보드 상단 "🔑 내 키로 보기" 바에 키 입력 + "내 모델만 보기" 토글
+#   -> 대시보드 상단 "🔑 키로 조회" 바에 키 입력 후 Enter/조회
+#   -> 일반 키: 그 키로 볼 수 있는 모델만 (내부 api_base 숨김)
+#   -> admin 키(= 구동 시 쓴 키): 전체 뷰 + 내부 주소 + export 버튼 노출
 #   -> 키는 브라우저(sessionStorage)에만, 매 요청 X-LiteLLM-Key 헤더로만 전송(서버 저장·로그 없음)
 #   -> 키 무효/만료면 fail-closed (전체 뷰로 폴백하지 않고 에러만 표시)
 
@@ -81,20 +83,27 @@ python3 model_monitor.py --demo --watch
 python3 model_monitor.py --demo --serve --port 8088
 ```
 
-### 키별(per-user) 뷰 — `--enable-user-view`
+### 키별(per-user) 뷰 — `--enable-user-view` ("키 필수 모드")
 
-LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 사용자가 **본인 키를 입력**하면 그 키로
-**볼 수 있는 모델만** 상태(UP/DOWN)·backend Pod 수와 함께 보여주는 개인 뷰입니다.
+LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 켜면 **키를 입력해야만 목록이 보이며**,
+입력한 키 기준으로 필터된 뷰를 보여줍니다.
 
-- **동작**: 키별 권한은 LiteLLM `GET /v1/models` 결과를 그대로 신뢰(와일드카드/팀 상속/access
-  group 을 우리가 재현하지 않음). 비싼 데이터(상태·Pod 수)는 키와 무관한 admin 백그라운드
-  스냅샷을 **그대로 필터**해 재사용하므로 추가 부하가 작습니다.
-- **보안**: 키는 헤더(`X-LiteLLM-Key`) 전용(쿼리스트링 금지), 서버 비저장·비로그, 브라우저
-  sessionStorage 에만 보관(탭 닫으면 소멸). per-user 뷰에선 내부 `api_base`/namespace 를 숨깁니다.
+- **데이터 흐름**: 무거운 데이터(상태·Pod 수·`model/info`·`/health`)는 **admin 키로 백그라운드에서
+  한 번만 수집해 공유 캐시**에 둡니다(키와 무관). 요청이 오면 이 캐시를 키별로 **필터**만 하므로,
+  서로 다른 키로 조회해도 무거운 호출이 중복되지 않습니다.
+- **입력 키에 따라**:
+  - 일반 키 → 그 키의 `GET /v1/models`(접근 모델 집합)로 필터한 뷰 + "내 키" 카드(spend/budget/limit).
+    내부 `api_base`/namespace 는 **숨김**.
+  - admin 키(= 모니터 구동 시 쓴 키) → 내부 주소 포함 **전체 뷰** + export(JSON/정지 페이지) 버튼.
+- **접근 캐시**: 같은 키의 `/v1/models` 결과를 **짧은 TTL(기본 30s)** 캐시해 폴링 중복 호출을 제거
+  (해시만 보관, 원문 키 비저장). 성공만 캐시 → 무효 키는 매번 재검증. 취소/만료 키는 최대 TTL 동안 stale.
+  config `user_view.cache_ttl` 로 조절.
+- **보안**: 키는 헤더(`X-LiteLLM-Key`) 전용(쿼리 금지), 서버 비저장·비로그, 브라우저 sessionStorage
+  에만 보관(탭 닫으면 소멸). 무인증 `GET /api/snapshot`·export 는 **잠김**(export 는 admin 키 헤더로만).
   키 검증 실패 시 전체 뷰로 폴백하지 않습니다(fail-closed).
 - **⚠️ 전제**: ① LiteLLM 버전/설정에 따라 `/v1/models` 가 키별로 필터되지 않을 수 있으니 **먼저
   확인**(안 되면 켜지 말 것 — 전체 모델 유출) ② 키를 평문 반복 전송하므로 **TLS 뒤에서만** 노출.
-  이 때문에 기능은 **기본 OFF** 입니다. (정지 페이지/`snapshot.json` 등 export 는 전체 전용 유지)
+  이 때문에 기능은 **기본 OFF** 입니다. (`--enable-user-view` OFF면 기존 열린 global 대시보드 그대로)
 
 ### 설정 우선순위
 CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
@@ -129,8 +138,8 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 | `--timeout N` | HTTP 타임아웃(초, 기본 10) |
 | `--demo` | 샘플 데이터로 미리보기 |
 | `--no-backend-count` | LB 뒤 backend Pod 개수 수집 끄기 |
-| `--enable-user-view` | 키별(per-user) 뷰 활성 (`POST /api/snapshot/user`, 기본 OFF) |
-| `--user-view-show-internal` | per-user 뷰에서 내부 `api_base`/namespace 도 표시 (기본 숨김) |
+| `--enable-user-view` | 키 필수 모드 활성 — 키 입력해야 조회, admin 키는 전체 뷰 (기본 OFF) |
+| `--user-view-show-internal` | per-user(일반 키) 뷰에서 내부 `api_base`/namespace 도 표시 (기본 숨김) |
 | `--health-timeout N` | LiteLLM `/health` 타임아웃(초, 기본 90 — 모델 많으면 늘리기) |
 | `--no-health` | `/health` 호출 안 함 (status 는 k8s backend readiness 로만 판정) |
 | `--k8s-api-server` / `--k8s-token-file` / `--k8s-ca-file` | k8s 접근 오버라이드 |

@@ -21,6 +21,8 @@ model_monitor.py — LiteLLM -> KServe -> vLLM/SGLang 백엔드에서 실제로 
 
 import argparse
 import copy
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -30,7 +32,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
@@ -142,6 +144,8 @@ def resolve_settings(args):
         "user_view_hide_internal": not (
             getattr(args, "user_view_show_internal", False)
             or uv.get("show_internal")),
+        # 키별 접근 캐시 TTL(초). 폴링 중복 /v1/models 호출을 줄인다.
+        "user_view_cache_ttl": float(uv.get("cache_ttl") or 30.0),
     }
     return settings
 
@@ -279,6 +283,43 @@ def collect_user_access(url, user_key, timeout):
             "key_alias": info.get("key_alias"),
         }
     return out
+
+
+class AccessCache:
+    """키별 접근 결과(`collect_user_access`)를 짧게 캐시 — 폴링 중복 호출 제거.
+
+    캐시 키는 **원문 키가 아니라 sha256 해시**(키는 절대 저장 안 함).
+    **성공(ok=True) 응답만** 캐시한다 — 무효/만료 키는 매 요청 재검증되어 fail-closed
+    즉시성이 유지된다. 대신 취소/만료된 *유효했던* 키는 최대 TTL 동안 stale 할 수 있다.
+    """
+
+    def __init__(self, ttl=30.0, maxsize=512):
+        self.ttl = ttl
+        self.maxsize = maxsize
+        self._d = {}            # sha256(key) -> (expiry, access)
+        self._lock = threading.Lock()
+
+    def get_or_collect(self, key, collect, now):
+        """캐시에 살아있으면 그대로, 아니면 collect() 호출 후(성공 시) 캐시."""
+        h = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        with self._lock:
+            ent = self._d.get(h)
+            if ent and ent[0] > now:
+                return ent[1]
+        access = collect()
+        if isinstance(access, dict) and access.get("ok"):
+            with self._lock:
+                self._prune(now)
+                self._d[h] = (now + self.ttl, access)
+        return access
+
+    def _prune(self, now):
+        if len(self._d) < self.maxsize:
+            return
+        for k in [k for k, (e, _) in self._d.items() if e <= now]:
+            self._d.pop(k, None)
+        while len(self._d) >= self.maxsize:
+            self._d.pop(next(iter(self._d)), None)
 
 
 def collect_backend(backend, timeout):
@@ -1577,21 +1618,21 @@ _DASHBOARD_HTML = r"""<!doctype html>
     <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
-    <a class="exp" href="/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
-    <a class="exp" href="/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
+    <a class="exp" id="exp-json" href="/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
+    <a class="exp" id="exp-html" href="/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
     <div class="meta">
       <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
     </div>
   </header>
 
   <div id="userbar" style="display:none">
-    <span class="uv-title">🔑 내 키로 보기</span>
+    <span class="uv-title">🔑 키로 조회</span>
     <input id="uv-key" type="password" autocomplete="off" spellcheck="false"
-           placeholder="LiteLLM 키 입력 (sk-…)">
-    <label class="toggle"><input type="checkbox" id="uv-on"> 내 모델만 보기</label>
+           placeholder="LiteLLM 키 입력 후 Enter (sk-…)">
+    <button id="uv-go" class="exp" type="button">조회</button>
     <button id="uv-clear" class="exp" type="button">지우기</button>
     <span class="uv-status" id="uv-status"></span>
-    <span class="uv-note">키는 이 브라우저(탭)에만 보관 · 매 요청 헤더로만 전송 · 서버 저장 안 함</span>
+    <span class="uv-note">키는 이 브라우저(탭)에만 보관 · 매 요청 헤더로만 전송 · 서버 저장 안 함 · admin 키면 전체 뷰</span>
   </div>
 
   <div id="banner"></div>
@@ -1660,9 +1701,43 @@ function fmtNum(n){
   return (Math.round(Number(n)*100)/100).toLocaleString();
 }
 function uvKey(){ return (sessionStorage.getItem(UV_KEY)||"").trim(); }
-function uvActive(){ return USER_VIEW && $("#uv-on") && $("#uv-on").checked && uvKey(); }
+// 키 필수 모드: 키가 저장돼 있으면 키로 조회한다(있으면 active).
+function uvActive(){ return USER_VIEW && !!uvKey(); }
 function setUvStatus(msg, cls){ const el=$("#uv-status");
   if(el){ el.textContent=msg||""; el.className="uv-status "+(cls||""); } }
+
+// 키 필수 모드 초기/클리어 상태: 목록 대신 "키 입력" 안내만 보인다(폴링·노출 없음).
+function showNeedKey(){
+  lastSnap = null;
+  $("#banner").innerHTML = '<div class="note-banner">🔑 키를 입력하면 '
+    + '내 모델 목록이 보입니다. (admin 키를 넣으면 전체 뷰)</div>';
+  $("#cards").innerHTML = "";
+  $("#f-count").textContent = "";
+  const dt=$("#deployments");
+  dt.querySelector("thead").innerHTML="";
+  dt.querySelector("tbody").innerHTML='<tr><td class="empty">키 입력 대기 중</td></tr>';
+  const gt=$("#groups");
+  gt.querySelector("thead").innerHTML="";
+  gt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';
+  setUvStatus("", "");
+}
+
+// export 는 admin 키일 때만. 링크 클릭을 가로채 헤더에 키를 실어 fetch -> blob 다운로드/열기.
+function exportWithKey(path, open){
+  const key=uvKey(); if(!key) return;
+  fetch(path,{headers:{"X-LiteLLM-Key":key},cache:"no-store"}).then(r=>{
+    if(!r.ok){ setUvStatus("export 는 admin 키가 필요합니다","bad"); return null; }
+    return r.blob();
+  }).then(b=>{
+    if(!b) return;
+    const u=URL.createObjectURL(b);
+    if(open){ window.open(u,"_blank"); }
+    else { const a=document.createElement("a"); a.href=u;
+           a.download="model-monitor-snapshot.json"; document.body.appendChild(a);
+           a.click(); a.remove(); }
+    setTimeout(()=>URL.revokeObjectURL(u), 15000);
+  }).catch(()=>setUvStatus("export 실패","bad"));
+}
 
 function backendCell(d){
   const r=d.backends_ready, des=d.backends_desired, src=d.backend_source||"none";
@@ -1970,6 +2045,12 @@ function render(snap){
     gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
   }
 
+  // 키 필수 모드: export(JSON/정지페이지) 버튼은 admin 키로 본 전체 뷰일 때만 노출.
+  if(USER_VIEW){
+    const show = snap.admin_view ? "" : "none";
+    const ej=$("#exp-json"), eh=$("#exp-html");
+    if(ej) ej.style.display=show; if(eh) eh.style.display=show;
+  }
   if(snap.version) $("#ver").textContent = "v"+snap.version;
   $("#foot").textContent = "model_monitor v"+(snap.version||"?")
     +" · 표준 라이브러리만 사용 · 데이터 출처는 LiteLLM + Kubernetes API";
@@ -2004,6 +2085,12 @@ async function tick(){
     const u=$("#updated"); if(u) u.textContent += "  · saved snapshot (frozen)";
     return;
   }
+  // 키 필수 모드: 키가 없으면 무인증 호출을 아예 하지 않고 안내만.
+  if(USER_VIEW && !uvActive()){
+    showNeedKey();
+    $("#livedot").style.background = "var(--warn)";
+    return;
+  }
   try{
     let snap;
     if(uvActive()){
@@ -2017,11 +2104,12 @@ async function tick(){
         $("#livedot").style.background = "var(--down)";
         return;
       }
-      setUvStatus("내 모델만 보는 중 ("+(snap.accessible_count||0)+"개)", "ok");
+      setUvStatus(snap.admin_view ? "관리자 전체 뷰"
+        : "내 모델만 보는 중 ("+(snap.accessible_count||0)+"개)", "ok");
     } else {
+      // 레거시(키 필수 OFF): 무인증 global 뷰.
       const r = await fetch("/api/snapshot",{cache:"no-store"});
       snap = await r.json();
-      if(USER_VIEW) setUvStatus("", "");
     }
     render(snap);
     $("#livedot").style.background = "var(--up)";
@@ -2042,25 +2130,30 @@ $("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-group").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-graph").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 
-// per-user(키별) 뷰: 서버가 활성일 때만 키 입력 바를 노출한다.
+// 키 필수 모드: 키 입력 바 노출 + 조회/지우기/Enter, export 는 admin 키 헤더로.
 if(USER_VIEW){
   $("#userbar").style.display = "";
+  // 초기엔 export 버튼 숨김(admin 뷰가 로드되면 render 가 노출).
+  const ej=$("#exp-json"), eh=$("#exp-html");
+  if(ej) ej.style.display="none"; if(eh) eh.style.display="none";
   const keyInput = $("#uv-key");
   keyInput.value = uvKey();   // 같은 탭 내 새로고침 시 복원(sessionStorage)
-  keyInput.addEventListener("input", ()=>{
-    // 키는 sessionStorage 에만 둔다(탭 닫으면 소멸). DOM/title 에 새지 않게 값만 보관.
-    sessionStorage.setItem(UV_KEY, keyInput.value.trim());
-  });
-  $("#uv-on").addEventListener("change", ()=>{
-    if($("#uv-on").checked && !uvKey()){ keyInput.focus();
-      setUvStatus("키를 먼저 입력하세요", "bad"); return; }
+  // 키는 "조회"(또는 Enter) 시에만 저장·전송한다(타이핑 중 부분키 조회 방지).
+  function submitKey(){
+    const v = keyInput.value.trim();
+    if(!v){ setUvStatus("키를 입력하세요", "bad"); keyInput.focus(); return; }
+    sessionStorage.setItem(UV_KEY, v);   // 탭 닫으면 소멸
     tick();
-  });
+  }
+  $("#uv-go").addEventListener("click", submitKey);
+  keyInput.addEventListener("keydown", e=>{ if(e.key==="Enter") submitKey(); });
   $("#uv-clear").addEventListener("click", ()=>{
-    sessionStorage.removeItem(UV_KEY); keyInput.value="";
-    $("#uv-on").checked = false; setUvStatus("", "");
-    tick();
+    sessionStorage.removeItem(UV_KEY); keyInput.value=""; tick();
   });
+  if(ej) ej.addEventListener("click", e=>{ e.preventDefault();
+    exportWithKey("/snapshot.json", false); });
+  if(eh) eh.addEventListener("click", e=>{ e.preventDefault();
+    exportWithKey("/snapshot.html", true); });
 }
 tick(); loop();
 </script>
@@ -2076,8 +2169,24 @@ def serve_dashboard(settings, host, port, interval, demo):
     HTTP 요청에는 마지막으로 수집한 스냅샷을 즉시 돌려준다 -> 브라우저가 멈추거나
     BrokenPipe 가 나지 않는다.
     """
+    # user_view_on = "키 필수 모드". 켜지면 무인증 global 데이터 경로를 잠그고,
+    # 모든 데이터는 키로만(POST /api/snapshot/user) 나간다. admin 키는 전체 뷰 해제.
     user_view_on = bool(settings.get("user_view")) and not demo
     hide_internal = bool(settings.get("user_view_hide_internal", True))
+    admin_key = settings.get("api_key") or ""
+    uaccess = AccessCache(ttl=float(settings.get("user_view_cache_ttl", 30.0)))
+
+    def is_admin_key(key):
+        # 모니터를 띄울 때 쓴 admin 키와 동일하면 admin (상수시간 비교).
+        return bool(admin_key) and bool(key) and hmac.compare_digest(key, admin_key)
+
+    def cached_access(key):
+        return uaccess.get_or_collect(
+            key,
+            lambda: collect_user_access(settings.get("litellm_url"), key,
+                                        settings.get("timeout", 10.0)),
+            time.monotonic())
+
     html = (_DASHBOARD_HTML
             .replace("__INTERVAL_MS__", str(int(interval * 1000)))
             .replace("__USER_VIEW__", "true" if user_view_on else "false"))
@@ -2174,20 +2283,37 @@ def serve_dashboard(settings, host, port, interval, demo):
                 return dict(snap, collect_error=err)
             return snap
 
+        def _admin_ok(self):
+            """export/잠긴 global 접근 허용 여부 — admin 키 헤더가 맞아야 True."""
+            return is_admin_key((self.headers.get("X-LiteLLM-Key") or "").strip())
+
         def do_GET(self):
             path = self.path.split("?", 1)[0]
             if path in ("/", "/index.html"):
                 self._send(200, html, "text/html; charset=utf-8")
             elif path == "/api/snapshot":
+                # 키 필수 모드: 무인증 global 데이터 경로를 잠근다(키로만 조회).
+                if user_view_on:
+                    self._json(403, {"error": "키 필수 모드입니다 — "
+                                              "POST /api/snapshot/user 로 조회하세요.",
+                                     "needs_key": True})
+                    return
                 self._send(200, json.dumps(self._snapshot(), ensure_ascii=False),
                            "application/json; charset=utf-8")
             elif path == "/snapshot.json":
+                # 키 필수 모드면 admin 키 헤더가 있어야 export 허용(전체 데이터 보호).
+                if user_view_on and not self._admin_ok():
+                    self._json(403, {"error": "export 는 admin 키가 필요합니다."})
+                    return
                 # 브라우저에서 클릭 한 번에 파일로 받게 attachment 로 내려준다.
                 self._send(200, json.dumps(self._snapshot(), ensure_ascii=False),
                            "application/json; charset=utf-8",
                            {"Content-Disposition":
                             'attachment; filename="model-monitor-snapshot.json"'})
             elif path in ("/snapshot.html", "/export"):
+                if user_view_on and not self._admin_ok():
+                    self._send(403, "export 는 admin 키가 필요합니다.", "text/plain")
+                    return
                 # 데이터가 박제된 self-contained 페이지(폴링 없음) — 저장해서 공유용.
                 self._send(200, frozen_html(self._snapshot()),
                            "text/html; charset=utf-8")
@@ -2231,12 +2357,17 @@ def serve_dashboard(settings, host, port, interval, demo):
                 self._json(400, {"error": "X-LiteLLM-Key 헤더가 필요합니다.",
                                  "user_view": True})
                 return
+            # admin 키(= 모니터 구동 키)면 전체 global 뷰를 비-redacted 로 돌려준다.
+            if is_admin_key(key):
+                self._json(200, dict(self._snapshot(), admin_view=True))
+                return
             url = settings.get("litellm_url")
             if not url:
                 self._json(503, {"error": "LiteLLM 이 설정되지 않았습니다.",
                                  "user_view": True})
                 return
-            access = collect_user_access(url, key, settings.get("timeout", 10.0))
+            # 일반 키: 접근 목록을 짧은 TTL 캐시로 조회(폴링 중복 호출 제거).
+            access = cached_access(key)
             if not access["ok"]:
                 # fail-closed: 절대 unfiltered global 로 폴백하지 않는다.
                 # 내부 토폴로지(주소) 누출 방지 위해 사유는 일반화한 메시지로만.
