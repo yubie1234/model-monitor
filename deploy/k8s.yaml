@@ -31,12 +31,6 @@ rules:
   - apiGroups: [""]
     resources: ["endpoints", "services"]   # 구버전 폴백 + selector 확인
     verbs: ["get", "list"]
-  - apiGroups: [""]
-    resources: ["pods"]                    # GPU 개수: Pod resources.limits[nvidia.com/gpu]
-    verbs: ["get", "list"]
-  - apiGroups: [""]
-    resources: ["nodes"]                   # GPU 장치명: 노드 라벨 nvidia.com/gpu.product
-    verbs: ["get", "list"]
   - apiGroups: ["apps"]
     resources: ["deployments"]             # 라벨 합산 + RawDeployment 보정
     verbs: ["get", "list"]                  # list: serving.kserve.io/inferenceservice 라벨 조회
@@ -89,7 +83,7 @@ metadata:
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "0.3.0"
+    app.kubernetes.io/version: "0.1.3"
 spec:
   replicas: 1
   selector:
@@ -99,7 +93,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "0.3.0"
+        app.kubernetes.io/version: "0.1.3"
     spec:
       serviceAccountName: model-monitor
       containers:
