@@ -61,6 +61,14 @@ The core pipeline is `build_snapshot(settings)` → a single `snap` dict consume
 ### Settings precedence
 CLI args > env (`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config file. Resolved once in `resolve_settings`. Config is `.json` (always works) or `.yaml` (only if PyYAML present).
 
+## Branch strategy
+
+`main` is split into two long-lived lines, and feature work is branched off separately:
+
+- **`develop`** — integration branch for ongoing development.
+- **`product`** — branch tracking the product/release line.
+- **`feature/<name>`** — one branch per feature (e.g. `feature/per-user-dashboard`). Do feature development here, not directly on `develop`/`product`/`main`.
+
 ## Conventions
 
 - **Versioning:** `__version__` in `model_monitor.py` is the single source of truth — it drives the Docker image tag (`ci.sh`/`push.sh` grep it), the `--version` flag, and the `version` field in TUI/web/`/api/snapshot`. Bump it there; the README header version should follow.
