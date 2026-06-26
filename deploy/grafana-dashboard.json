@@ -234,7 +234,7 @@
       },
       "options": {"colorMode": "background", "graphMode": "none", "textMode": "value", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
       "targets": [
-        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "count(model_monitor_model_up == 0 and model_monitor_model_scale_to_zero == 0) or vector(0)", "refId": "A"}
+        {"datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"}, "expr": "count(model_monitor_model_up == 0 and on(model) model_monitor_model_scale_to_zero == 0) or vector(0)", "refId": "A"}
       ]
     },
     {
