@@ -128,6 +128,17 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 - **키 필수 모드(`--enable-user-view`)** 에선 다른 global export 처럼 `/metrics` 도 **admin 키 헤더
   (`X-LiteLLM-Key`)** 가 있어야 노출됩니다(Prometheus 스크레이프 설정에 헤더 추가).
 
+#### Grafana / Prometheus 연동
+
+바로 쓸 수 있는 구성 파일을 함께 제공합니다:
+
+- [deploy/grafana-dashboard.json](deploy/grafana-dashboard.json) — Grafana 대시보드(Import → JSON 붙여넣기
+  → Prometheus 데이터소스 선택). 개요 stat, **이상 징후**(진짜 DOWN / LB UP인데 Pod 0 / 수집 신뢰도),
+  추세 그래프, 모델별 상태 타임라인, 상세 테이블로 구성. `namespace`/`model` 변수로 필터.
+- [deploy/prometheus-alerts.yaml](deploy/prometheus-alerts.yaml) — 스크레이프 설정 예시 + 알림 룰
+  (`PrometheusRule`): `ModelDown`(idle 제외), `BackendPodsZeroWhileUp`, `BackendCapacityDegraded`,
+  `ModelMonitorDown`, `ModelMonitorCollectErrors`.
+
 ### 설정 우선순위
 CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 
