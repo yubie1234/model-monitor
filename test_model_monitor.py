@@ -6,6 +6,7 @@
 가장 까다롭고 KServe/Knative 버전에 민감한 파싱·병합·집계 로직을 고정한다.
 """
 
+import copy
 import unittest
 
 import model_monitor as m
@@ -236,6 +237,132 @@ class TestDemoSnapshot(unittest.TestCase):
         # 카드 healthy 수 == 표의 UP 행 수
         self.assertEqual(s["deployments_healthy"], statuses.count("UP"))
         self.assertEqual(s["deployments_unhealthy"], statuses.count("DOWN"))
+
+
+class TestCollectUserAccess(unittest.TestCase):
+    """per-user 키 접근 수집 — http_get_json 을 가짜로 갈아끼워 분기만 고정."""
+
+    def _patch(self, fake):
+        self._orig = m.http_get_json
+        m.http_get_json = fake
+
+    def tearDown(self):
+        if getattr(self, "_orig", None):
+            m.http_get_json = self._orig
+
+    def test_fail_closed_on_v1_models_error(self):
+        # 키 무효/만료 -> ok=False, accessible 빈 집합 (global 폴백 금지의 근거)
+        self._patch(lambda url, key=None, timeout=10:
+                    (False, None, "HTTP 401 Unauthorized"))
+        out = m.collect_user_access("http://litellm:4000", "sk-bad", 5)
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["accessible"], [])
+        self.assertIsNotNone(out["error"])
+
+    def test_accessible_from_v1_models_sorted_and_meta(self):
+        def fake(url, key=None, timeout=10):
+            if url.endswith("/v1/models"):
+                return (True, {"data": [{"id": "b"}, {"id": "a"}, {"id": None}]},
+                        None)
+            if url.endswith("/key/info"):
+                return (True, {"info": {"spend": 2.0, "max_budget": 10,
+                                        "tpm_limit": 100, "rpm_limit": 5,
+                                        "key_alias": "team-x"}}, None)
+            return (False, None, "404")
+        self._patch(fake)
+        out = m.collect_user_access("http://litellm:4000/", "sk-good", 5)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["accessible"], ["a", "b"])     # 정렬·None 제외
+        self.assertEqual(out["key_info"]["spend"], 2.0)
+        self.assertEqual(out["key_info"]["tpm_limit"], 100)
+        self.assertEqual(out["key_info"]["key_alias"], "team-x")
+
+    def test_key_info_failure_is_nonfatal(self):
+        # /key/info 못 읽어도(비-admin 버전) 모델 목록(접근권)은 그대로 살아야 함
+        def fake(url, key=None, timeout=10):
+            if url.endswith("/v1/models"):
+                return (True, {"data": [{"id": "a"}]}, None)
+            return (False, None, "HTTP 403")
+        self._patch(fake)
+        out = m.collect_user_access("http://litellm:4000", "sk", 5)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["accessible"], ["a"])
+        self.assertIsNone(out["key_info"])
+
+
+class TestFilterSnapshotForUser(unittest.TestCase):
+    def _global(self):
+        return {
+            "version": "x", "backend_count_enabled": True,
+            "collect_error": "boom http://internal:8080",
+            "litellm": {
+                "url": "http://litellm:4000",
+                "errors": ["model/info: HTTP 500 http://internal-a:8080"],
+                "health": {"healthy_count": 1},
+                "groups": [{"model_group": "gpt-x"}, {"model_group": "secret-y"}],
+                "deployments": [
+                    {"model_name": "gpt-x", "api_base": "http://internal-a/v1",
+                     "underlying": "vllm/x", "type": "vllm", "status": "UP",
+                     "backends_ready": 2, "backends_desired": 2,
+                     "backend_source": "deployment"},
+                    {"model_name": "secret-y", "api_base": "http://internal-b/v1",
+                     "type": "vllm", "status": "DOWN",
+                     "backends_ready": 0, "backends_desired": 1,
+                     "backend_source": "deployment"},
+                ],
+            },
+            "backends": [], "summary": {},
+        }
+
+    def test_filters_and_recomputes_summary(self):
+        g = self._global()
+        access = {"accessible": ["gpt-x"], "key_info": {"spend": 1.5}}
+        out = m.filter_snapshot_for_user(g, access)
+        self.assertEqual([d["model_name"] for d in out["litellm"]["deployments"]],
+                         ["gpt-x"])
+        self.assertEqual([gp["model_group"] for gp in out["litellm"]["groups"]],
+                         ["gpt-x"])
+        self.assertTrue(out["user_view"])
+        self.assertEqual(out["accessible_count"], 1)
+        self.assertEqual(out["key_info"]["spend"], 1.5)
+        self.assertEqual(out["litellm"]["models"], ["gpt-x"])
+        # summary 재계산: 접근 가능한 gpt-x(UP) 1개만 집계
+        self.assertEqual(out["summary"]["deployments_healthy"], 1)
+        self.assertEqual(out["summary"]["deployments_registered"], 1)
+        self.assertEqual(out["summary"]["backend_pods_ready"], 2)
+
+    def test_hide_internal_strips_topology(self):
+        out = m.filter_snapshot_for_user(
+            self._global(), {"accessible": ["gpt-x"]}, hide_internal=True)
+        d = out["litellm"]["deployments"][0]
+        self.assertNotIn("api_base", d)
+        self.assertNotIn("underlying", d)
+        self.assertEqual(out["litellm"]["errors"], [])
+        self.assertNotIn("health", out["litellm"])
+        self.assertNotIn("url", out["litellm"])
+        self.assertNotIn("collect_error", out)
+        # 상태·Pod 수(키 무관, deployment 단위)는 그대로 유지
+        self.assertEqual(d["status"], "UP")
+        self.assertEqual(d["backends_ready"], 2)
+
+    def test_show_internal_keeps_api_base(self):
+        out = m.filter_snapshot_for_user(
+            self._global(), {"accessible": ["gpt-x"]}, hide_internal=False)
+        self.assertEqual(out["litellm"]["deployments"][0]["api_base"],
+                         "http://internal-a/v1")
+
+    def test_does_not_mutate_global(self):
+        # 공유 캐시 오염 방지: 원본 global 스냅샷은 절대 변형되면 안 된다.
+        g = self._global()
+        before = copy.deepcopy(g)
+        m.filter_snapshot_for_user(g, {"accessible": ["gpt-x"]})
+        self.assertEqual(g, before)
+
+    def test_no_access_yields_empty_view(self):
+        out = m.filter_snapshot_for_user(self._global(), {"accessible": []})
+        self.assertEqual(out["litellm"]["deployments"], [])
+        self.assertEqual(out["accessible_count"], 0)
+        self.assertEqual(out["summary"]["deployments_registered"], 0)
 
 
 if __name__ == "__main__":

@@ -56,40 +56,42 @@ LiteLLM은 가상 키(virtual key)마다 접근 가능한 모델이 다르다. �
 
 ## 5. 구현 계획
 
+> **구현 상태(2026-06): 1차 구현 완료** — `feature/per-user-dashboard`.
+> 기능은 **기본 OFF**, `--enable-user-view`(또는 config `user_view.enabled`)로만 켠다.
+> 켜기 전에 **4. 사전 검증(Go/No-Go) + TLS** 를 라이브에서 확인할 것.
+
 ### 백엔드 ([model_monitor.py](model_monitor.py))
-- [ ] `collect_user_access(url, user_key, timeout)` — 그 키로 `/v1/models`(접근 model_name 집합) +
+- [x] `collect_user_access(url, user_key, timeout)` — 그 키로 `/v1/models`(접근 model_name 집합) +
       `/key/info`(키 메타) 수집
-- [ ] **권한 판정의 단일 출처는 `/v1/models`(이미 해석된 결과).** `/key/info.models` 로 접근권을
-      재유도하지 말 것 — 그러면 우리가 피하려던 와일드카드/팀상속 해석이 되살아난다.
-      `/key/info` 는 메타(spend/budget/limit) 표시용으로만 쓴다.
-      → 따라서 와일드카드/무제한(`*`,`openai/*`,빈 목록)은 `/v1/models` 가 알아서 풀어주므로 별도 처리 거의 불필요.
-- [ ] `filter_snapshot_for_user(global_snap, accessible_set, key_info)` —
-      deployments/groups 를 `accessible_set` 으로 필터, `summarize()` 재사용해 summary 재계산,
+- [x] **권한 판정의 단일 출처는 `/v1/models`(이미 해석된 결과).** `/key/info.models` 로 접근권을
+      재유도하지 않음 — `/key/info` 는 메타(spend/budget/limit) 표시용 best-effort.
+      → 와일드카드/무제한(`*`,`openai/*`,빈 목록)은 `/v1/models` 가 알아서 풀어주므로 별도 처리 없음.
+- [x] `filter_snapshot_for_user(global_snap, access, hide_internal)` —
+      deployments/groups 를 접근 집합으로 필터, `summarize()` 재사용해 summary 재계산,
       `key_info` 첨부 (상태·Pod 수는 global 값 그대로 join)
-- [ ] ⚠️ **공유 캐시 오염 주의** — 서버는 단일 `state["snap"]` 을 락으로 공유한다(`_snapshot()` 은 얕은 복사).
-      필터는 반드시 **deepcopy 한 사본 위에서** 수행할 것. global 스냅샷의 `litellm.deployments` 를
-      제자리(in-place) 로 필터하면 **모든 사용자의 global 뷰가 깨진다.**
+- [x] ⚠️ **공유 캐시 오염 방지** — `copy.deepcopy` 한 사본 위에서만 필터.
+      (회귀 테스트 `test_does_not_mutate_global` 로 고정)
 
 ### 웹 ([serve_dashboard](model_monitor.py))
-- [ ] 라우트 `POST /api/snapshot/user` — 키를 **헤더(`X-LiteLLM-Key`) 전용**으로 받는다.
-      ❗ **쿼리스트링 금지** — 쿼리는 ingress/LB/프록시 액세스 로그·브라우저 히스토리·Referer 에 남아
-      "키 미노출" 원칙과 정면 모순된다(앱의 `log_message` 억제로는 앞단 프록시를 못 막음).
-      캐시된 global 스냅샷 + `collect_user_access` → `filter_*` → 필터된 JSON 반환. **키는 저장/로그 없이 pass-through.**
-- [ ] **fail-closed** — 키 검증 실패(401/만료)면 빈 결과/명확한 에러만. **절대 unfiltered global 로 폴백 금지.**
-- [ ] 박제 export(`/snapshot.html`, `/snapshot.json`)에 **per-user 데이터·키가 절대 굽히지 않도록** 확인(global 전용 유지).
-- [ ] UI: 헤더에 키 입력(`type=password`) + "내 모델만 보기" 토글.
-      키는 **브라우저만 보관**(sessionStorage, 탭 닫으면 소멸), 매 요청에 실어 보냄.
-- [ ] "내 키" 카드: 접근 가능 모델 수 / spend / 예산 잔액 / tpm·rpm / 만료.
+- [x] 라우트 `POST /api/snapshot/user` — 키를 **헤더(`X-LiteLLM-Key`) 전용**으로 받음(쿼리 금지).
+      캐시된 global 스냅샷 + `collect_user_access` → `filter_*` → 필터된 JSON. **키는 저장/로그 없이 pass-through.**
+- [x] **fail-closed** — 키 검증 실패(401/만료)면 명확한 에러만(사유는 일반화해 토폴로지 비노출).
+      **절대 unfiltered global 로 폴백 안 함.** (E2E·`test_fail_closed_on_v1_models_error` 로 확인)
+- [x] 박제 export(`/snapshot.html`, `/snapshot.json`)는 **global 전용 유지** — per-user 경로는 GET 과 분리된 POST,
+      정지 페이지에선 키 입력 바도 숨김.
+- [x] UI: 헤더 아래 키 입력 바(`type=password`) + "내 모델만 보기" 토글.
+      키는 **브라우저만 보관**(sessionStorage, 탭 닫으면 소멸), 매 요청 헤더로 전송.
+- [x] "내 키" 카드: 접근 가능 모델 수 / spend / 예산 잔액 / tpm·rpm / 만료.
 
 ### 보안
-- [ ] 키는 비밀 — 서버 영속 저장 금지, **액세스 로그·에러 메시지에 키 노출 금지**(헤더 전용·쿼리 금지로 1차 차단).
-- [ ] per-user 뷰에서 내부 `api_base`(클러스터 토폴로지) **숨김** 고려 → 상태/Pod 수만, 내부 URL은 admin 전용.
-- [ ] 잘못된/만료 키 → global 뷰로 새지 않게 **명확한 에러** 표시(위 fail-closed 와 동일 원칙).
-- [ ] 키가 DOM/`title` 속성에 안 들어가게 렌더 점검(`esc()` 사용처 확인).
-- [ ] ⚠️ **TLS 전제** — 현재 배포는 HTTP(비TLS)다. 키를 폴링마다 평문으로 반복 전송하면 노출된다.
-      per-user 기능은 **TLS 뒤에서만** 노출하거나(인그레스 TLS 종단), 폴링 주기를 늘릴 것.
-- [ ] **남용 방지(선택)** — 인증 없는 엔드포인트가 임의 키를 LiteLLM 에 중계 = 키 검증/브루트포스 통로.
-      내부 도구라 치명적이진 않으나, 가벼운 per-IP throttle 고려.
+- [x] 키는 비밀 — 서버 영속 저장 금지, 액세스 로그 억제(`log_message`)·에러 메시지에 키 비노출(헤더 전용).
+- [x] per-user 뷰에서 내부 `api_base`/`underlying`/namespace·수집 에러 **숨김**(기본) → 상태/Pod 수만.
+      내부 URL 도 보려면 `--user-view-show-internal`.
+- [x] 잘못된/만료 키 → global 로 새지 않게 **명확한 에러**(fail-closed).
+- [x] 키가 DOM/`title` 에 안 들어가게 렌더(키 입력은 value 로만, 카드/표에 미렌더).
+- [ ] ⚠️ **TLS 전제(운영 책임)** — 현재 배포는 HTTP(비TLS). 키를 폴링마다 평문 전송하면 노출된다.
+      per-user 는 **TLS 뒤에서만** 노출(인그레스 TLS 종단). 그래서 기능을 기본 OFF 로 둠.
+- [ ] **남용 방지(선택)** — 가벼운 per-IP throttle 미구현. 필요 시 추가.
 
 ## 6. 열린 질문 (결정 필요)
 
