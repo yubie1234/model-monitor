@@ -141,14 +141,15 @@
   /* Model ↔ Backend 그래프 */
   #graph-sec .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
     color:var(--faint);font-size:11px}
-  .graphwrap{overflow:auto;max-height:560px;border:1px solid var(--border);border-radius:9px;
+  .graphwrap{overflow:auto;max-height:440px;border:1px solid var(--border);border-radius:9px;
     background:#0c1118;padding:6px 8px}
-  .graphwrap svg{display:block;width:100%;height:auto;min-width:520px}
-  .glabel{font-family:var(--mono);font-size:10px;fill:var(--muted);
+  /* 와이드 화면에서 그래프가 컨테이너 폭만큼 늘어나 과하게 커지지 않게 상한을 둔다. */
+  .graphwrap svg{display:block;width:100%;height:auto;min-width:420px;max-width:600px;margin:0 auto}
+  .glabel{font-family:var(--mono);font-size:9px;fill:var(--muted);
     text-transform:uppercase;letter-spacing:.08em}
   .gnode rect{stroke-width:1.5}
-  .gnode .ntext{font-family:var(--mono);font-size:12px;font-weight:600;fill:var(--text)}
-  .gnode .nsub{font-family:var(--mono);font-size:10px;fill:var(--faint)}
+  .gnode .ntext{font-family:var(--mono);font-size:11px;font-weight:600;fill:var(--text)}
+  .gnode .nsub{font-family:var(--mono);font-size:9px;fill:var(--faint)}
   .gnode.model rect{fill:rgba(110,139,255,.12);stroke:rgba(110,139,255,.55)}
   .gnode.be.up rect{fill:rgba(63,185,80,.10);stroke:rgba(63,185,80,.5)}
   .gnode.be.down rect{fill:rgba(248,81,73,.10);stroke:rgba(248,81,73,.5)}
@@ -494,7 +495,7 @@ function buildGraph(deps){
       gpu:d.gpu_ready,gpu_products:d.gpu_products,
       ext:(d.backend_source==="external"),stz:d.scale_to_zero,models:new Set()}; svcOrder.push(k); }
     svc[k].models.add(d.model_name); });
-  const NW=176, NH=42, GAP=16, PADX=16, PADY=34, W=600;
+  const NW=148, NH=34, GAP=12, PADX=14, PADY=28, W=520;
   const colL=PADX, colR=W-PADX-NW;
   const rows=Math.max(names.length, svcOrder.length);
   const H=PADY+rows*NH+(rows>0?(rows-1)*GAP:0)+18;
@@ -511,17 +512,17 @@ function buildGraph(deps){
   names.forEach(n=>{ const y=mY[n];
     mnodes+='<g class="gnode model" data-key="'+attrId(n)+'" data-kind="m">'
       +'<rect x="'+colL+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
-      +'<text class="ntext" x="'+(colL+12)+'" y="'+(y+19)+'">'+esc(trunc(n,22))+'</text>'
-      +'<text class="nsub" x="'+(colL+12)+'" y="'+(y+33)+'">model_name</text></g>'; });
+      +'<text class="ntext" x="'+(colL+11)+'" y="'+(y+14)+'">'+esc(trunc(n,18))+'</text>'
+      +'<text class="nsub" x="'+(colL+11)+'" y="'+(y+26)+'">model_name</text></g>'; });
   let snodes="";
   svcOrder.forEach(k=>{ const o=svc[k], sh=o.models.size>1, y=sY[k];
     const gtxt=(o.gpu!=null && o.gpu>0)?("  ·  "+gpuText(o.gpu,o.gpu_products)):"";
-    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" pods"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
+    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" replicas"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
     snodes+='<g class="gnode be '+beNodeCls(o)+(sh?' shared':'')+'" data-key="'+attrId(k)+'" data-kind="b">'
       +'<rect x="'+colR+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
-      +'<text class="ntext" x="'+(colR+12)+'" y="'+(y+19)+'">'+esc(trunc(o.label,22))+'</text>'
-      +'<text class="nsub" x="'+(colR+12)+'" y="'+(y+33)+'">'+esc(sub)+'</text>'
-      +(sh?'<text class="badge-shared" x="'+(colR+NW-8)+'" y="'+(y+15)+'" text-anchor="end">⇄</text>':'')
+      +'<text class="ntext" x="'+(colR+11)+'" y="'+(y+14)+'">'+esc(trunc(o.label,18))+'</text>'
+      +'<text class="nsub" x="'+(colR+11)+'" y="'+(y+26)+'">'+esc(sub)+'</text>'
+      +(sh?'<text class="badge-shared" x="'+(colR+NW-7)+'" y="'+(y+13)+'" text-anchor="end">⇄</text>':'')
       +'</g>'; });
   return '<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Model 과 Backend 라우팅 그래프">'
     +'<text class="glabel" x="'+colL+'" y="20">Models</text>'

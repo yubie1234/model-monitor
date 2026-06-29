@@ -5,4 +5,4 @@ Docker 이미지 태그(ci.sh/push.sh), /api/snapshot 의 version 필드, 대시
 모두 이 값이 쓰인다. 버전을 올리려면 여기만 바꾼다.
 """
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
