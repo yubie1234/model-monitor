@@ -5,7 +5,7 @@
 #   ./ci.sh                              # product 빌드: <버전> + :latest
 #   BRANCH=develop ./ci.sh               # <버전>-develop (:latest 안 붙임)
 #   BRANCH=product ./ci.sh               # <버전> + :latest (미지정과 동일)
-#   IMAGE=<레지스트리>/ai-tool/llm-monitor ./ci.sh   # 레지스트리 경로 지정
+#   IMAGE=<레지스트리>/ai-tool/model-monitor ./ci.sh   # 레지스트리 경로 지정
 #   TAG=test ./ci.sh                     # 태그 직접 지정(BRANCH 로직 무시)
 #
 # 이미지 태그는 기본적으로 app/__init__.py 의 __version__ 값을 따른다.
@@ -17,7 +17,7 @@ set -euo pipefail
 # 스크립트 위치를 빌드 컨텍스트로 (어디서 실행해도 동작)
 cd "$(dirname "$0")"
 
-IMAGE="${IMAGE:-ai-tool/llm-monitor}"
+IMAGE="${IMAGE:-ai-tool/model-monitor}"
 
 # 앱 버전(__version__)을 이미지 태그로 사용
 VERSION="$(grep -oE '__version__ = "[^"]+"' app/__init__.py \
@@ -47,6 +47,7 @@ build_tags=( -t "${IMAGE}:${TAG}" )
 echo "[ci] building image: ${IMAGE}:${TAG}$([ "$IS_PRODUCT" = "1" ] && echo " (+ ${IMAGE}:latest)")"
 
 docker build \
+  --network=host \
   --build-arg "VERSION=${VTAG}" \
   -f Dockerfile \
   "${build_tags[@]}" \

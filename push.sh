@@ -18,7 +18,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 REPO_URL="10.92.20.77:5002"            # 고정 레지스트리
-IMAGE="${IMAGE:-ai-tool/llm-monitor}"  # ci.sh 가 빌드한 로컬 이미지명
+IMAGE="${IMAGE:-ai-tool/model-monitor}"  # ci.sh 가 빌드한 로컬 이미지명
 
 # 빌드와 동일하게 __version__ + BRANCH 규칙으로 태그를 정한다(ci.sh 와 일치).
 VERSION="$(grep -oE '__version__ = "[^"]+"' app/__init__.py \

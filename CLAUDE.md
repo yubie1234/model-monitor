@@ -57,7 +57,7 @@ python3 -m app                                            # uses Settings host/p
 MONITOR_DEMO=true uvicorn app.main:app --port 8088
 
 # Build + push image (tag follows __version__ in app/__init__.py)
-./ci.sh                  # docker build -> ai-tool/llm-monitor:<version> + :latest
+./ci.sh                  # docker build -> ai-tool/model-monitor:<version> + :latest
 ./push.sh                # retag to 10.92.20.77:5002 and push
 ```
 

@@ -4,12 +4,16 @@ FROM python:3.12-slim
 
 # 이미지 메타데이터(버전은 빌드 시 --build-arg VERSION 으로 주입; ci.sh 가 채움)
 ARG VERSION=dev
-LABEL org.opencontainers.image.title="ai-tool/llm-monitor" \
+LABEL org.opencontainers.image.title="ai-tool/model-monitor" \
       org.opencontainers.image.description="LiteLLM/KServe/vLLM·SGLang 모델 현황 + LB 뒤 backend Pod/GPU 모니터 (FastAPI)" \
       org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.source="https://github.com/yubie1234/llm-monitor"
+      org.opencontainers.image.source="https://github.com/yubie1234/model-monitor"
 
 WORKDIR /app
+
+# 사내 PyPI 프록시(Nexus) 설정 — air-gapped 빌드 시 외부 PyPI 대신 사용.
+RUN pip config --global set global.trusted_host 10.20.20.123
+RUN pip config --global set global.index_url http://10.20.20.123:8081/repository/pypi-proxy/simple
 
 # 의존성 먼저 설치(레이어 캐시)
 COPY requirements.txt /app/requirements.txt
