@@ -26,3 +26,6 @@ model-monitor-snapshot*.json
 *.tar
 *.log
 *.tmp
+# 이 레포 전용이 아닌 로컬 미러링 보조 스크립트(프로젝트 산출물 아님)
+mirror-archive.sh
+mirror-bundle.sh

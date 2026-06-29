@@ -4,32 +4,59 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`model-monitor` is a single-file monitor for a LiteLLM → KServe → vLLM/SGLang stack. It answers two questions: **which models are actually serving**, and **how many backend Pods sit behind each `api_base` (load balancer)**. It renders to a terminal (TUI), a web dashboard (`--serve`), or JSON.
+`model-monitor` is a **FastAPI service** for a LiteLLM → KServe → vLLM/SGLang stack. It answers two questions: **which models are actually serving**, and **how many backend Pods (and GPUs) sit behind each `api_base` (load balancer)**. It exposes a web dashboard (`/`), a JSON API (`/api/snapshot`), and Prometheus metrics (`/metrics`).
 
-**Default constraint: zero third-party dependencies — Python 3.6+ standard library only.** The whole point is that `model_monitor.py` runs on an air-gapped node with no `pip install`. Default to stdlib imports (`http.server`, `urllib`, `ssl`, `json`, `argparse`, `threading`, etc.). PyYAML is used *only if already present* (config loading degrades to JSON otherwise) — never make it a hard requirement. **If a task genuinely needs an external package, do not add it silently — ask the user first** and confirm it's acceptable given the air-gapped deployment target before introducing the dependency.
+It used to be a single stdlib-only `model_monitor.py` (TUI/`--json`/`--serve`). It was migrated to FastAPI with a package layout; the TUI and CLI rendering modes were dropped — **web API only**.
 
-Almost all code lives in **`model_monitor.py`** (~2100 lines). There is no package structure.
+**Dependency policy:** the *web layer* uses FastAPI (`fastapi`, `uvicorn`, `pydantic`, `pydantic-settings`). But the *collection layer* (`app/core`, `app/services`) deliberately stays on the **Python standard library** (`urllib`, `ssl`, `json`, `asyncio`, `hashlib`, `hmac`) — no `requests`/`httpx`/k8s-client. Keep it that way: collectors must remain importable and testable without the web stack. PyYAML is optional (config loading degrades to JSON without it). **If a task needs a new external package, ask the user first** — the deployment target is air-gapped and every dependency must be vendored into the image.
+
+## Layout
+
+```
+app/
+  __init__.py          # __version__ — single source of truth
+  main.py              # create_app(), lifespan → starts/stops Refresher; wires app.state
+  __main__.py          # `python -m app` launcher (uvicorn.run)
+  config.py            # Settings (pydantic-settings) + config-file merge → collector dict
+  auth.py              # admin-key check (X-LiteLLM-Key) for locked global endpoints
+  core/
+    http.py            # http_get_json (urllib, stdlib)
+    k8s.py             # K8sClient (in-cluster, urllib+ssl)
+  services/
+    litellm.py         # collect_litellm / collect_backend / discover_backends
+    backend_count.py   # parse_api_base / count_via_* / resolve_backend_count (+GPU hook)
+    gpu.py             # collect_gpu_for_service + Pod/Node GPU helpers
+    snapshot.py        # build_snapshot / merge_deployments_with_health / summarize
+    user_access.py     # collect_user_access / AccessCache / filter_snapshot_for_user
+    prometheus.py      # render_prometheus_metrics (text exposition 0.0.4)
+    demo.py            # demo_snapshot
+    state.py           # SnapshotStore + async Refresher (replaces the old daemon threads)
+  schemas/snapshot.py  # Pydantic response models (typed OpenAPI docs)
+  api/routes.py        # /api/snapshot, /api/snapshot/user (POST), /snapshot.json, /metrics, /healthz
+  web/routes.py        # / (dashboard), /snapshot.html (frozen page)
+  web/templates/dashboard.html
+test_model_monitor.py  # stays at repo root; imports the new modules via an `m.*` shim
+```
 
 ## Commands
 
 ```bash
-# Run tests (stdlib unittest, no deps)
+# Run tests (stdlib unittest — only imports app.core/app.services, no FastAPI needed)
 python3 -m unittest -v
-python3 test_model_monitor.py                          # equivalent
-
-# Run a single test
 python3 -m unittest -v test_model_monitor.TestResolveBackendCount.test_kserve_rawdeployment_label_sum
 
-# Run the app against live endpoints
-python3 model_monitor.py --litellm-url http://litellm:4000 --api-key sk-1234
-python3 model_monitor.py --config config.yaml --watch          # live refresh
-python3 model_monitor.py --config config.yaml --serve --port 8088   # web dashboard
+# Install deps (FastAPI stack)
+python3 -m pip install -r requirements.txt
 
-# Develop/preview with NO live endpoints (sample data)
-python3 model_monitor.py --demo
-python3 model_monitor.py --demo --serve --port 8088
+# Run the service
+uvicorn app.main:app --host 0.0.0.0 --port 8088
+LITELLM_BASE_URL=http://litellm:4000 LITELLM_API_KEY=sk-1234 uvicorn app.main:app
+python3 -m app                                            # uses Settings host/port
 
-# Build + push image (tag follows __version__ in model_monitor.py)
+# Preview with NO live endpoints (sample data — also disables user-view)
+MONITOR_DEMO=true uvicorn app.main:app --port 8088
+
+# Build + push image (tag follows __version__ in app/__init__.py)
 ./ci.sh                  # docker build -> ai-tool/llm-monitor:<version> + :latest
 ./push.sh                # retag to 10.92.20.77:5002 and push
 ```
@@ -38,36 +65,42 @@ There is no linter configured. The CI (`ci.sh`) only builds the Docker image —
 
 ## Architecture / data flow
 
-The core pipeline is `build_snapshot(settings)` → a single `snap` dict consumed identically by the TUI (`render`), web (`serve_dashboard`), and `--json`. Keep all three in sync by changing the snapshot, not the renderers.
+The core pipeline is `build_snapshot(settings)` → a single `snap` dict consumed identically by the JSON API, the dashboard JS, the frozen page, and the Prometheus renderer. Keep them in sync by changing the snapshot, not the renderers. `settings` is a plain dict (built by `config.build_collector_settings`); collectors and `K8sClient.from_settings` only see this dict, which is why unit tests can pass hand-written dicts.
 
-1. **`collect_litellm`** hits four LiteLLM endpoints. The critical and non-obvious mapping: `api_base` comes from `GET /model/info` (plaintext, needs an admin key), **not** from `/v1/models` (OpenAI-spec, names only). `/health` actively pings every backend and can take tens of seconds.
+1. **`collect_litellm`** (`services/litellm.py`) hits four LiteLLM endpoints. The critical and non-obvious mapping: `api_base` comes from `GET /model/info` (plaintext, needs an admin key), **not** from `/v1/models` (OpenAI-spec, names only). `/health` actively pings every backend and can take tens of seconds.
 
-2. **Backend Pod counting** (`resolve_backend_count` + `K8sClient`) — the central value-add. An `api_base` is a k8s Service (LB) address, so probing it only proves the LB is up, not how many Pods serve behind it. That count comes from the control plane, tried in priority order:
+2. **Backend Pod counting** (`services/backend_count.resolve_backend_count` + `core/k8s.K8sClient`) — the central value-add. An `api_base` is a k8s Service (LB) address, so probing it only proves the LB is up, not how many Pods serve behind it. Tried in priority order:
    - KServe ISVC → Deployment by `serving.kserve.io/inferenceservice=<isvc>` label (`readyReplicas`/`replicas`)
    - EndpointSlice ready endpoints (activator Pods excluded)
    - Knative PodAutoscaler `actualScale`
    - Deployment `readyReplicas`/`replicas`
-   - fall back to `?` — **never fabricate a count**. Failures record a `k8s_error` for the UI tooltip.
+   - fall back to `?` — **never fabricate a count**. Failures record a `k8s_error`.
 
-   `parse_api_base` turns an `api_base` URL into `(namespace, service)`; IPs/public domains classify as `external` and short-circuit (no k8s calls). A `(ns, svc)` cache dedupes k8s lookups across deployments sharing a Service. The k8s client auto-enables in-cluster via the ServiceAccount token (`--no-backend-count` disables).
+   `parse_api_base` turns an `api_base` URL into `(namespace, service)`; IPs/public domains classify as `external` and short-circuit. A `(ns, svc)` cache dedupes k8s lookups across deployments sharing a Service. Auto-enables in-cluster via the ServiceAccount token (`MONITOR_BACKEND_COUNT=false` disables).
 
-   **GPU info** (`collect_gpu_for_service`, on by default, `--no-gpu-info` / no Pod-Node RBAC → silent `?`): for each `(ns, svc)` it lists the Pods (by KServe ISVC label, else the Service selector), sums `resources.limits["nvidia.com/gpu"]` over **Ready** Pods (GPU count), and reads each Pod's node label `nvidia.com/gpu.product` for the device model (`H100`/`B200`), cached per node. Single-node-per-Pod is assumed (no multi-node GPU). Attaches `gpu_ready` + `gpu_products` (`{device: count}` — captures **heterogeneous GPU** when one model's replicas span device types) to the deployment, deduped by `(ns, svc)` in `summarize` like pod counts. Rendered as per-device color **chips** (table/graph) and a segmented **bar** (headline card); TUI uses colored device tokens. Needs `pods` + `nodes` read RBAC (in `deploy/k8s.yaml`). Note: the backend-replica metric is labeled **Replicas** in the UI (not "Pods").
+   **GPU info** (`services/gpu.collect_gpu_for_service`, on by default, `MONITOR_GPU_INFO=false` / no Pod-Node RBAC → silent `?`): for each `(ns, svc)` it lists Pods (by KServe ISVC label, else the Service selector), sums `resources.limits["nvidia.com/gpu"]` over **Ready** Pods, and reads each Pod's node label `nvidia.com/gpu.product` for the device model (`H100`/`B200`), cached per node. Attaches `gpu_ready` + `gpu_products` (`{device: count}` — captures **heterogeneous GPU**) to the deployment, deduped by `(ns, svc)` in `summarize` like pod counts. Needs `pods` + `nodes` read RBAC.
 
-3. **`merge_deployments_with_health`** joins `/model/info` (api_base) with `/health` (status) by api_base. When `/health` is missing/timed out, status falls back to k8s backend readiness (`backends_ready > 0` → UP, `scale_to_zero` → `?`). Deployments are sorted by name so output order is stable across LiteLLM responses.
+3. **`merge_deployments_with_health`** joins `/model/info` (api_base) with `/health` (status) by api_base. When `/health` is missing/timed out, status falls back to k8s backend readiness (`backends_ready > 0` → UP, `scale_to_zero` → `?`). Sorted by name for stable order.
 
-4. **`summarize`** computes the headline counts. Invariant covered by tests: the dashboard cards (`deployments_healthy`/`unhealthy`) must always equal the UP/DOWN rows in the table, even when `/health` times out. **Backend Pod totals (`backend_pods_ready`/`desired`) are deduped by `(namespace, service)`** — several `model_name`s can share one backend Service (or one name can load-balance across several), so summing per deployment row would double-count shared Pods. The per-row table still shows every deployment.
+4. **`summarize`** computes the headline counts. Invariant covered by tests: cards (`deployments_healthy`/`unhealthy`) always equal the UP/DOWN rows, even when `/health` times out. **Backend Pod and GPU totals are deduped by `(namespace, service)`** — several `model_name`s can share one backend Service, so summing per row would double-count shared Pods/GPUs.
 
-### Model-grouped view & Model↔Backend graph (web + TUI)
-Both renderers group deployments by `model_name`: a model with one un-shared backend stays a single row; a model with several backends (load-balancing) shows a composite status (`UP`/`DEGRADED`/`DOWN`) + `Σ ready/desired` with child rows per backend. A backend Service used by more than one model is flagged **shared** (`⇄`). The web dashboard adds a **Model ↔ Backend bipartite SVG graph** (pure SVG, no deps) showing routing — shared backends are where edges converge. Toggles: `group by model`, `show graph`. The grouped/graph logic needs no extra snapshot data — it derives from `model_name`/`namespace`/`service`/`status` already present.
+### Background collection (no request ever blocks)
+Collectors are synchronous (blocking `urllib`). The FastAPI **lifespan** starts an async `Refresher` (`services/state.py`) that runs them off the event loop via `asyncio.to_thread`: a fast refresh loop rebuilds the snapshot every `interval` **without** `/health`, and a separate slow `health_loop` fetches `/health` and injects it into the next snapshot. The latest snapshot lives in a `SnapshotStore`; handlers return it immediately.
 
-### Per-user (key) view — `--enable-user-view` (off by default)
-"Key-required mode": the user enters their own LiteLLM key (header `X-LiteLLM-Key` only, never query/logs/server-store; browser `sessionStorage`). The expensive snapshot is collected once with the admin key and **filtered** per key via `filter_snapshot_for_user` (access set from that key's `GET /v1/models`, cached with a short TTL). A normal key sees only its models with internal `api_base`/namespace **redacted** (and the grouped table falls back to flat, graph hidden — they expose internal topology); the admin key sees the full view + export buttons. **fail-closed**: an invalid key never falls back to the global view. Template placeholder `__USER_VIEW__` is injected by `serve_dashboard` (alongside `__INTERVAL_MS__`).
+### Model-grouped view & Model↔Backend graph (web only)
+The dashboard JS groups deployments by `model_name` (composite `UP`/`DEGRADED`/`DOWN` + `Σ ready/desired`, child rows per backend), flags shared backends (`⇄`), and draws a pure-SVG bipartite **Model ↔ Backend** graph. This logic lives entirely in `web/templates/dashboard.html` (no extra snapshot data; derived from `model_name`/`namespace`/`service`/`status`). The old single-file had Python TUI equivalents — those were **not** ported (no TUI).
 
-### Web dashboard threading
-`--serve` does **not** collect on the request path. A background `refresh_loop` rebuilds the snapshot on an interval and `/health` is collected in a *separate* `health_loop` thread (because it's slow), then injected. HTTP handlers return the last cached snapshot immediately — no request ever blocks on collection. Endpoints: `/` (HTML), `/api/snapshot` (live JSON, locked when user-view is on), `/api/snapshot/user` (POST, key-filtered), `/snapshot.json` (download), `/snapshot.html` (self-contained frozen page). The committed `preview/dashboard-preview.html` is the template with the demo snapshot injected — regenerate it from `_DASHBOARD_HTML` after changing the template so it doesn't drift.
+### Per-user (key) view — `MONITOR_USER_VIEW=true` (off by default; demo disables it)
+"Key-required mode": the user enters their own LiteLLM key (header `X-LiteLLM-Key` only — never query/logs/server-store; browser `sessionStorage`). `POST /api/snapshot/user` filters the shared snapshot per key via `services/user_access.filter_snapshot_for_user` (access set from that key's `GET /v1/models`, cached with a short TTL in `AccessCache` — sha256 of the key, success-only). A normal key sees only its models with internal `api_base`/namespace **redacted**; the admin key (= the monitor's own `api_key`, constant-time compared in `auth.is_admin_key`) sees the full view + exports. **fail-closed**: an invalid key never falls back to global. When on, `GET /api/snapshot` is 403-locked and `/snapshot.json`, `/snapshot.html`, `/metrics` require the admin key header. Template placeholder `__USER_VIEW__` is injected by `web/routes.load_dashboard_html` (alongside `__INTERVAL_MS__`).
+
+### Prometheus `/metrics`
+`services/prometheus.render_prometheus_metrics(snap)` formats the cached snapshot as text exposition 0.0.4 (no collection on the scrape path). Status encoded UP=1/DOWN=0/idle=-1; duplicate label series (one `model_name`, several deployments) are collapsed (`_dedup_samples`, DOWN wins); `api_base` is never a label. `deploy/grafana-dashboard.json` + `deploy/prometheus-alerts.yaml` ship ready-to-use.
+
+### Endpoints
+`/` (HTML), `/api/snapshot` (live JSON; locked under user-view), `/api/snapshot/user` (POST, key-filtered), `/snapshot.json` (download), `/snapshot.html` (frozen self-contained page), `/metrics` (Prometheus), `/healthz` + `/readyz`. Only `/api/snapshot` and `/api/snapshot/user` appear in the OpenAPI schema.
 
 ### Settings precedence
-CLI args > env (`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config file. Resolved once in `resolve_settings`. Config is `.json` (always works) or `.yaml` (only if PyYAML present).
+env (`LITELLM_BASE_URL`, `LITELLM_API_KEY`, `MONITOR_*`) > config file (`MONITOR_CONFIG_FILE`) > default — resolved in `config.build_collector_settings`. The file supplies nested settings (`backend_count.*`, `backends`, `namespace_overrides`, `user_view.*`, `metrics.*`). Config is `.json` (always) or `.yaml` (PyYAML only). The old CLI flags are gone.
 
 ## Branch strategy
 
@@ -75,13 +108,12 @@ CLI args > env (`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config file. Resolved o
 
 - **`develop`** — integration branch for ongoing development.
 - **`product`** — branch tracking the product/release line.
-- **`feature/<name>`** — one branch per feature (e.g. `feature/per-user-dashboard`). Do feature development here, not directly on `develop`/`product`/`main`.
-
-**PR 필수 규칙 (no direct push):** `develop` 또는 `product` 에 변경을 반영할 때는 **반드시 PR 절차를 거친다.** 이 브랜치들로 직접 `git push` 하지 않는다. feature/integration 브랜치를 push 한 뒤 PR 을 열고, **PR 의 base 가 `develop`(또는 의도한 `product`)인지 반드시 확인한다** — push 직후 GitHub 가 안내하는 "create PR" 링크는 base 를 레포 기본 브랜치(`main`)로 자동 지정하므로, base 를 수동으로 바꾸지 않으면 엉뚱하게 `main` 으로 머지된다. 여러 feature 를 묶을 때는 `develop` 기준 통합 브랜치를 만들어 각 feature 를 `--no-ff` 로 병합한 뒤, 그 통합 브랜치를 PR 로 `develop` 에 올린다.
+- **`feature/<name>`** — one branch per feature (branch off `develop`). Do feature development here, not directly on `develop`/`product`/`main`.
 
 ## Conventions
 
-- **Versioning:** `__version__` in `model_monitor.py` is the single source of truth — it drives the Docker image tag (`ci.sh`/`push.sh` grep it), the `--version` flag, and the `version` field in TUI/web/`/api/snapshot`. Bump it there; the README header version should follow.
-- Tests deliberately pin the fiddliest logic (KServe/Knative-version-sensitive `parse_api_base`, `resolve_backend_count`, `merge_deployments_with_health`, `summarize`). Use the `FakeClient` pattern (route by path substring) instead of real k8s. Add regression tests here when touching parsing/merge/count logic.
+- **Versioning:** `__version__` in `app/__init__.py` is the single source of truth — it drives the Docker image tag (`ci.sh`/`push.sh` grep it), the FastAPI app `version`, the `version` field in `/api/snapshot`, and `model_monitor_build_info`. Bump it there; the README header version should follow.
+- **Schemas vs. dicts:** the snapshot is built and tested as plain dicts; `schemas/snapshot.py` Pydantic models only document/validate at the API boundary (all fields Optional, `extra="allow"` so nothing is dropped). Don't push Pydantic into the collectors.
+- Tests pin the fiddliest logic (`parse_api_base`, `resolve_backend_count`, GPU, `merge_deployments_with_health`, `summarize`, `filter_snapshot_for_user`, `AccessCache`, `render_prometheus_metrics`). Use the `FakeClient` pattern (route by path substring). The suite imports only `app.core`/`app.services` via the `m.*` shim (no FastAPI). Add regression tests when touching parsing/merge/count/filter/metrics logic.
 - Comments and user-facing strings are in Korean — match the surrounding language when editing.
-- One k8s/backend failure must never abort the whole snapshot: per-deployment collection is wrapped in try/except that records the error and continues.
+- One k8s/backend failure must never abort the whole snapshot: per-deployment collection is wrapped in try/except that records the error and continues. The per-user filter must operate on a **deepcopy** — never mutate the shared global snapshot.

@@ -6,7 +6,7 @@
 #   IMAGE=<레지스트리>/ai-tool/llm-monitor ./ci.sh   # 레지스트리 경로 지정
 #   TAG=test ./ci.sh                     # 태그 직접 지정
 #
-# 이미지 태그는 기본적으로 model_monitor.py 의 __version__ 값을 따른다.
+# 이미지 태그는 기본적으로 app/__init__.py 의 __version__ 값을 따른다.
 set -euo pipefail
 
 # 스크립트 위치를 빌드 컨텍스트로 (어디서 실행해도 동작)
@@ -15,7 +15,7 @@ cd "$(dirname "$0")"
 IMAGE="${IMAGE:-ai-tool/llm-monitor}"
 
 # 앱 버전(__version__)을 이미지 태그로 사용
-VERSION="$(grep -oE '__version__ = "[^"]+"' model_monitor.py \
+VERSION="$(grep -oE '__version__ = "[^"]+"' app/__init__.py \
             | sed -E 's/.*"([^"]+)".*/\1/' || true)"
 VERSION="${VERSION:-0.0.0}"
 TAG="${TAG:-$VERSION}"
