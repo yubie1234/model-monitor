@@ -3,12 +3,13 @@
 #
 # 사용법:
 #   ./ci.sh && ./push.sh                       # product: <버전> + latest
-#   BRANCH=develop ./ci.sh && BRANCH=develop ./push.sh   # <버전>-develop (latest 제외)
-#   TAG=test ./push.sh                         # 특정 태그만(BRANCH 로직 무시)
+#   BRANCH=develop ./ci.sh && BRANCH=develop ./push.sh   # <버전>-develop + :develop
+#   TAG=test ./push.sh                         # 버전 태그 직접 지정(floating 태그는 그대로)
 #
-# ci.sh 와 동일한 BRANCH 규칙으로 태그를 정한다(빌드와 push 에 같은 BRANCH 를 넘길 것):
-#   - 미지정/product -> <버전>           (+ latest)
-#   - 그 외 값        -> <버전>-<BRANCH>  (latest 제외)
+# ci.sh 와 동일한 규칙으로 (버전 태그 + 브랜치별 floating 태그)를 정한다
+# (빌드와 push 에 같은 BRANCH 를 넘길 것):
+#   - 미지정/product -> <버전>           + latest
+#   - 그 외 값        -> <버전>-<BRANCH>  + <BRANCH>   (예: :develop)
 #
 # 레지스트리는 10.92.20.77:5002 로 고정.
 # 주의: HTTP(비TLS) 레지스트리라면 docker daemon / 노드 containerd 에
@@ -27,10 +28,11 @@ VERSION="${VERSION:-0.0.0}"
 
 BRANCH_RAW="${BRANCH:-}"
 BRANCH_SAN="$(printf '%s' "$BRANCH_RAW" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
+# MTAG = 브랜치별 floating(이동) 태그: product(또는 미지정)=latest, 그 외=<BRANCH>.
 if [ -z "$BRANCH_RAW" ] || [ "$BRANCH_RAW" = "product" ]; then
-  VTAG="${VERSION}"; IS_PRODUCT=1
+  VTAG="${VERSION}"; MTAG="latest"
 else
-  VTAG="${VERSION}-${BRANCH_SAN}"; IS_PRODUCT=0
+  VTAG="${VERSION}-${BRANCH_SAN}"; MTAG="${BRANCH_SAN}"
 fi
 TAG="${TAG:-$VTAG}"
 
@@ -42,9 +44,9 @@ docker image inspect "${IMAGE}:${TAG}" >/dev/null 2>&1 || {
   exit 1
 }
 
-# 태그 목록: 버전 태그(+ product 면 latest) retag 후 push.
+# 태그 목록: 버전 태그 + floating 태그(MTAG: product=latest, 그 외=<BRANCH>) retag 후 push.
 push_tags=( "${TAG}" )
-[ "$IS_PRODUCT" = "1" ] && push_tags+=( latest )
+[ "${MTAG}" != "${TAG}" ] && push_tags+=( "${MTAG}" )
 for t in "${push_tags[@]}"; do
   src="${IMAGE}:${t}"
   dst="${REPO_URL}/${IMAGE}:${t}"
