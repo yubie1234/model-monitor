@@ -33,6 +33,10 @@ class Settings(BaseSettings):
                       validation_alias=AliasChoices("MONITOR_PORT", "PORT"))
     interval: float = Field(5.0, validation_alias=AliasChoices("MONITOR_INTERVAL"))
     demo: bool = Field(False, validation_alias=AliasChoices("MONITOR_DEMO"))
+    # path prefix 뒤에 서비스를 둘 때(예: example.com/service/model-monitor).
+    # FastAPI root_path + 대시보드 자기 호출 URL 접두사로 쓰인다. 비우면 루트(/).
+    # Ingress 가 이 prefix 를 떼고(rewrite) 앱에 전달하는 전제.
+    root_path: str = Field("", validation_alias=AliasChoices("MONITOR_ROOT_PATH"))
 
     # --- LiteLLM ---
     litellm_url: Optional[str] = Field(
@@ -80,6 +84,19 @@ class Settings(BaseSettings):
     # --- 설정 파일 경로 (중첩 설정 출처) ---
     config_file: Optional[str] = Field(
         None, validation_alias=AliasChoices("MONITOR_CONFIG_FILE", "CONFIG_FILE"))
+
+
+def normalize_root_path(root_path: str) -> str:
+    """root_path 정규화: 앞에 '/' 보장, 뒤 '/' 제거. 비면 '' (루트).
+
+    예) 'service/model-monitor/' -> '/service/model-monitor', '' -> '', '/' -> ''
+    """
+    rp = (root_path or "").strip()
+    if not rp or rp == "/":
+        return ""
+    if not rp.startswith("/"):
+        rp = "/" + rp
+    return rp.rstrip("/")
 
 
 def load_config_file(path: str) -> Dict[str, Any]:

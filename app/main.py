@@ -14,7 +14,12 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.api.routes import router as api_router
-from app.config import Settings, build_collector_settings, get_settings
+from app.config import (
+    Settings,
+    build_collector_settings,
+    get_settings,
+    normalize_root_path,
+)
 from app.services.state import Refresher, SnapshotStore
 from app.services.user_access import AccessCache
 from app.web.routes import load_dashboard_html, router as web_router
@@ -33,12 +38,16 @@ async def lifespan(app: FastAPI):
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or get_settings()
     collector_settings = build_collector_settings(settings)
+    # path prefix 뒤 배포 지원(예: /service/model-monitor). 비면 루트.
+    root_path = normalize_root_path(settings.root_path)
 
     app = FastAPI(
         title="model-monitor",
         version=__version__,
         description="LiteLLM → KServe → vLLM/SGLang 모델 현황 + LB 뒤 backend Pod 개수 모니터",
         lifespan=lifespan,
+        # root_path: /docs·openapi 링크가 prefix 를 포함하도록(Ingress 가 prefix 를 떼는 전제).
+        root_path=root_path,
     )
 
     store = SnapshotStore()
@@ -59,8 +68,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.access_cache = AccessCache(
         ttl=float(collector_settings["user_view_cache_ttl"]))
 
+    app.state.root_path = root_path
     app.state.dashboard_html = load_dashboard_html(
-        settings.interval, app.state.user_view_on)
+        settings.interval, app.state.user_view_on, base_path=root_path)
 
     app.include_router(api_router)
     app.include_router(web_router)

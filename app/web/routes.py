@@ -17,12 +17,18 @@ router = APIRouter(tags=["web"])
 _TEMPLATE = Path(__file__).parent / "templates" / "dashboard.html"
 
 
-def load_dashboard_html(interval: float, user_view: bool = False) -> str:
-    """대시보드 템플릿에 폴링 주기 + per-user 뷰 활성 여부를 주입해 반환."""
+def load_dashboard_html(interval: float, user_view: bool = False,
+                        base_path: str = "") -> str:
+    """대시보드 템플릿에 폴링 주기 + per-user 뷰 + path prefix 를 주입해 반환.
+
+    base_path 는 서비스가 prefix(예: /service/model-monitor) 뒤에 있을 때 대시보드의
+    자기 호출(fetch/export 링크)에 붙는 접두사. 루트면 빈 문자열.
+    """
     html = _TEMPLATE.read_text(encoding="utf-8")
     return (html
             .replace("__INTERVAL_MS__", str(int(interval * 1000)))
-            .replace("__USER_VIEW__", "true" if user_view else "false"))
+            .replace("__USER_VIEW__", "true" if user_view else "false")
+            .replace("__BASE_PATH__", base_path))
 
 
 def frozen_html(html: str, snap: dict) -> str:

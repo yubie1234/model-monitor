@@ -200,8 +200,8 @@
     <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
-    <a class="exp" id="exp-json" href="/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
-    <a class="exp" id="exp-html" href="/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
+    <a class="exp" id="exp-json" href="__BASE_PATH__/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
+    <a class="exp" id="exp-html" href="__BASE_PATH__/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
     <div class="meta">
       <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
     </div>
@@ -271,6 +271,9 @@
 <script>
 const REFRESH_MS = __INTERVAL_MS__;
 const USER_VIEW = __USER_VIEW__;   // 서버에서 per-user 뷰 활성 여부 주입
+// 서비스가 path prefix(예: /service/model-monitor) 뒤에 떠 있으면 그 접두사.
+// 대시보드의 모든 자기 호출(fetch/export 링크)에 붙여 prefix 환경에서도 동작한다.
+const BASE_PATH = "__BASE_PATH__";
 const UV_KEY = "llm_monitor_key";  // 키는 sessionStorage 에만(탭 닫으면 소멸)
 const $ = (s)=>document.querySelector(s);
 let lastSnap = null;   // 필터 변경 시 재수집 없이 다시 렌더하려고 보관
@@ -307,7 +310,7 @@ function showNeedKey(){
 // export 는 admin 키일 때만. 링크 클릭을 가로채 헤더에 키를 실어 fetch -> blob 다운로드/열기.
 function exportWithKey(path, open){
   const key=uvKey(); if(!key) return;
-  fetch(path,{headers:{"X-LiteLLM-Key":key},cache:"no-store"}).then(r=>{
+  fetch(BASE_PATH+path,{headers:{"X-LiteLLM-Key":key},cache:"no-store"}).then(r=>{
     if(!r.ok){ setUvStatus("export 는 admin 키가 필요합니다","bad"); return null; }
     return r.blob();
   }).then(b=>{
@@ -743,7 +746,7 @@ async function tick(){
     let snap;
     if(uvActive()){
       // 키는 헤더 전용(쿼리 금지). 매 요청에 실어 보내고 서버는 저장하지 않는다.
-      const r = await fetch("/api/snapshot/user",
+      const r = await fetch(BASE_PATH+"/api/snapshot/user",
         {method:"POST", cache:"no-store",
          headers:{"X-LiteLLM-Key": uvKey()}});
       snap = await r.json().catch(()=>({}));
@@ -756,7 +759,7 @@ async function tick(){
         : "내 모델만 보는 중 ("+(snap.accessible_count||0)+"개)", "ok");
     } else {
       // 레거시(키 필수 OFF): 무인증 global 뷰.
-      const r = await fetch("/api/snapshot",{cache:"no-store"});
+      const r = await fetch(BASE_PATH+"/api/snapshot",{cache:"no-store"});
       snap = await r.json();
     }
     render(snap);

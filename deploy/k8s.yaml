@@ -113,6 +113,10 @@ spec:
             # 중첩 설정(litellm/backend_count/user_view/metrics)은 config 파일에서 읽는다.
             - { name: MONITOR_CONFIG_FILE, value: "/etc/model-monitor/config.json" }
             - { name: MONITOR_INTERVAL, value: "5" }
+            # path prefix 뒤 노출(아래 Ingress 와 동일 prefix). 루트로 쓰려면 이 줄 제거.
+            # Ingress 가 prefix 를 rewrite 로 떼고 앱에 전달하지만, 대시보드 자기 호출 URL·
+            # /docs 링크가 prefix 를 포함하도록 앱에도 같은 값을 알려준다.
+            - { name: MONITOR_ROOT_PATH, value: "/service/model-monitor" }
           ports:
             - { containerPort: 8088, name: http }
           readinessProbe:
@@ -139,3 +143,42 @@ spec:
   selector: { app: model-monitor }
   ports:
     - { port: 80, targetPort: 8088, name: http }
+---
+# path prefix 뒤로 노출: https://example.com/service/model-monitor
+#
+# 동작: nginx ingress 가 prefix(/service/model-monitor)를 rewrite 로 떼고 앱(루트)에
+#       전달한다. 앱은 MONITOR_ROOT_PATH 로 같은 prefix 를 알고 있어, 대시보드 자기
+#       호출(fetch /api/snapshot 등)과 /docs 링크에 prefix 를 붙여 브라우저가
+#       example.com/service/model-monitor/... 로 요청 -> ingress 가 다시 떼어 앱에 전달.
+#
+# 전제: nginx ingress controller. 다른 컨트롤러면 rewrite 주석/문법을 맞게 바꿀 것.
+#   - host(example.com)와 ingressClassName(nginx) 은 실제 환경 값으로 교체.
+#   - TLS 를 쓰면 spec.tls 블록 추가(키 필수 모드/키 전송은 TLS 뒤에서만 권장).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: model-monitor
+  namespace: model-monitor
+  annotations:
+    # 캡처 그룹 $2(= prefix 뒤 나머지 경로)로 rewrite -> 앱은 루트(/...) 로 받는다.
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: example.com
+      http:
+        paths:
+          # /service/model-monitor 와 그 하위 전체를 매칭(정규식). $2 = 나머지 경로.
+          - path: /service/model-monitor(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: model-monitor
+                port:
+                  number: 80
+# TLS 예시(인증서 Secret 준비 후 주석 해제):
+# spec:
+#   tls:
+#     - hosts: [example.com]
+#       secretName: model-monitor-tls

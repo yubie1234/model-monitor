@@ -212,6 +212,15 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
    kubectl -n model-monitor port-forward svc/model-monitor 8088:80   # 브라우저로 확인
    ```
 
+### Path prefix 뒤로 노출 (`example.com/service/model-monitor`)
+
+서비스를 루트가 아닌 prefix 경로 뒤에 둘 수 있습니다. [deploy/k8s.yaml](deploy/k8s.yaml) 에 nginx Ingress 가 포함돼 있습니다.
+
+- **Ingress**: prefix(`/service/model-monitor`)를 `rewrite-target` 으로 떼고 앱(루트)에 전달.
+- **앱**: `MONITOR_ROOT_PATH=/service/model-monitor` 를 주면 ① FastAPI `root_path`(/docs·OpenAPI 링크가 prefix 포함) ② 대시보드의 자기 호출(fetch `/api/snapshot`, export 링크)에 prefix 를 붙여 — 브라우저가 `example.com/service/model-monitor/...` 로 요청 → Ingress 가 다시 떼어 앱에 전달.
+- **두 값(Ingress path prefix·`MONITOR_ROOT_PATH`)은 반드시 동일**해야 합니다. 루트(/)로 쓰려면 `MONITOR_ROOT_PATH` 를 비우고 Ingress 의 prefix/`rewrite-target` 을 제거하세요.
+- `deploy/k8s.yaml` 의 `host`(example.com)·`ingressClassName`(nginx) 은 실제 환경 값으로 교체. nginx 외 컨트롤러면 rewrite 문법을 맞게 바꾸세요. probe(`/healthz`·`/readyz`)는 Pod 로 직접 가므로 prefix 영향 없음.
+
 > Deployment 는 `image: 10.92.20.77:5002/ai-tool/llm-monitor:latest` + `imagePullPolicy: Always` 라 latest 최신본을 매번 레지스트리에서 받습니다.
 > HTTP(비TLS) 레지스트리면 빌드 노드의 docker(`/etc/docker/daemon.json` 의 `insecure-registries`)와 클러스터 노드의 containerd 에 `10.92.20.77:5002` 를 insecure 레지스트리로 등록해야 push/pull 이 됩니다.
 
