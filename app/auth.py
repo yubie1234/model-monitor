@@ -4,9 +4,13 @@ admin 키 = 모니터를 구동할 때 쓴 LiteLLM 키. 이 키 헤더(X-LiteLLM
 잠긴 global 데이터(export/metrics/전체 스냅샷)에 접근할 수 있다.
 """
 
-import hmac
+from __future__ import annotations
 
-from fastapi import Request
+import hmac
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # 타입 힌트 전용 — auth 로직 자체는 FastAPI 없이도 동작/테스트된다.
+    from fastapi import Request
 
 KEY_HEADER = "X-LiteLLM-Key"
 

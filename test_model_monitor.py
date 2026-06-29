@@ -8,10 +8,16 @@ m.* 네임스페이스로 모아 노출한다. (web/route 계층은 별도이고
 여기서는 import 하지 않는다 — 핵심 로직은 stdlib 만으로 검증 가능.)
 """
 
+import asyncio
 import copy
+import json
+import os
+import tempfile
 import types
 import unittest
+from unittest import mock
 
+from app import auth as _auth
 from app.core import k8s as _k8s
 from app.services import backend_count as _bc
 from app.services import demo as _demo
@@ -19,7 +25,18 @@ from app.services import gpu as _gpu
 from app.services import litellm as _ll
 from app.services import prometheus as _prom
 from app.services import snapshot as _snap
+from app.services import state as _state
 from app.services import user_access as _ua
+
+# config.build_collector_settings 는 순수 dict 병합 함수지만, app.config 모듈을
+# import 하려면 pydantic(-settings) 이 있어야 한다. 웹 스택이 없는 최소 환경에서도
+# 나머지 테스트는 돌아가도록 import 를 보호하고, 없으면 해당 클래스만 skip 한다.
+try:
+    from app.config import build_collector_settings as _build_cs
+    _HAS_PYDANTIC = True
+except Exception:  # pragma: no cover - web 스택 미설치 환경
+    _build_cs = None
+    _HAS_PYDANTIC = False
 
 m = types.SimpleNamespace(
     parse_api_base=_bc.parse_api_base,
@@ -38,6 +55,12 @@ m = types.SimpleNamespace(
     AccessCache=_ua.AccessCache,
     filter_snapshot_for_user=_ua.filter_snapshot_for_user,
     render_prometheus_metrics=_prom.render_prometheus_metrics,
+    is_admin_key=_auth.is_admin_key,
+    request_key=_auth.request_key,
+    admin_ok=_auth.admin_ok,
+    SnapshotStore=_state.SnapshotStore,
+    Refresher=_state.Refresher,
+    build_collector_settings=_build_cs,
 )
 
 
@@ -711,6 +734,181 @@ class TestPrometheusMetrics(unittest.TestCase):
     def test_loading_snapshot_reports_down(self):
         text = m.render_prometheus_metrics({"loading": True, "version": "x"})
         self.assertIn("model_monitor_up 0", text)
+
+
+# ----- 웹/배선 계층(FastAPI 전환으로 새로 추가된 코드) 단위 테스트 -----
+# admin 게이트/설정 병합/백그라운드 스토어는 보안·동작 핵심인데 순수 함수라
+# FastAPI 없이도 검증 가능하다(라우트 자체는 통합 영역이라 제외).
+
+class _FakeRequest:
+    """auth 헬퍼 검증용 최소 request 더미(헤더 + app.state.admin_key 만)."""
+
+    def __init__(self, headers=None, admin_key=""):
+        self.headers = headers or {}
+        self.app = types.SimpleNamespace(
+            state=types.SimpleNamespace(admin_key=admin_key))
+
+
+class TestAuth(unittest.TestCase):
+    def test_admin_key_match(self):
+        self.assertTrue(m.is_admin_key("sk-admin", "sk-admin"))
+
+    def test_admin_key_mismatch(self):
+        self.assertFalse(m.is_admin_key("sk-admin", "sk-other"))
+
+    def test_empty_admin_never_matches(self):
+        # admin_key 미설정(빈/None)이면 어떤 키도 통과 못 한다(fail-closed).
+        self.assertFalse(m.is_admin_key("", "sk-x"))
+        self.assertFalse(m.is_admin_key("", ""))
+        self.assertFalse(m.is_admin_key(None, "sk-x"))
+
+    def test_empty_request_key_never_matches(self):
+        self.assertFalse(m.is_admin_key("sk-admin", ""))
+        self.assertFalse(m.is_admin_key("sk-admin", None))
+
+    def test_request_key_reads_and_strips_header(self):
+        req = _FakeRequest(headers={"X-LiteLLM-Key": "  sk-x  "})
+        self.assertEqual(m.request_key(req), "sk-x")
+
+    def test_request_key_absent_is_empty(self):
+        self.assertEqual(m.request_key(_FakeRequest()), "")
+
+    def test_admin_ok_true_only_for_matching_admin_header(self):
+        ok = _FakeRequest(headers={"X-LiteLLM-Key": "sk-admin"},
+                          admin_key="sk-admin")
+        self.assertTrue(m.admin_ok(ok))
+        bad = _FakeRequest(headers={"X-LiteLLM-Key": "sk-nope"},
+                           admin_key="sk-admin")
+        self.assertFalse(m.admin_ok(bad))
+        nokey = _FakeRequest(admin_key="sk-admin")
+        self.assertFalse(m.admin_ok(nokey))
+
+
+class TestSnapshotStore(unittest.TestCase):
+    def test_loading_placeholder_when_empty(self):
+        store = m.SnapshotStore()
+        snap = asyncio.run(store.get())
+        self.assertTrue(snap.get("loading"))
+        self.assertIsNone(snap.get("litellm"))
+
+    def test_set_get_roundtrip_no_error_flag(self):
+        store = m.SnapshotStore()
+
+        async def go():
+            await store.set({"version": "x", "summary": {}}, None)
+            return await store.get()
+
+        snap = asyncio.run(go())
+        self.assertEqual(snap["version"], "x")
+        self.assertNotIn("collect_error", snap)
+
+    def test_collect_error_attached_as_copy(self):
+        store = m.SnapshotStore()
+        base = {"version": "x", "summary": {}}
+
+        async def go():
+            await store.set(base, None)
+            await store.set_error("boom")
+            return await store.get()
+
+        out = asyncio.run(go())
+        self.assertEqual(out.get("collect_error"), "boom")
+        # 반환은 사본(dict(snap, ...)) 이라 캐시 원본은 오염되지 않아야 한다.
+        self.assertNotIn("collect_error", base)
+
+
+class TestRefresherDemo(unittest.TestCase):
+    def test_collect_once_demo_populates_store(self):
+        store = m.SnapshotStore()
+        r = m.Refresher({}, store, interval=5.0, demo=True)
+        snap = asyncio.run(r.collect_once())
+        self.assertTrue(snap.get("demo"))
+        self.assertIn("summary", snap)
+        cached = asyncio.run(store.get())
+        self.assertTrue(cached.get("demo"))
+
+    def test_interval_has_floor(self):
+        r = m.Refresher({}, m.SnapshotStore(), interval=0.0, demo=True)
+        self.assertGreaterEqual(r.interval, 1.0)
+
+
+def _settings_ns(**over):
+    """Settings(pydantic) 의 기본값을 흉내낸 더미 — build_collector_settings 는
+    속성 접근만 하므로 SimpleNamespace 로 충분하다(pydantic 인스턴스 불필요).
+    env 우선순위는 os.environ 으로 별도 제어한다."""
+    base = dict(
+        host="0.0.0.0", port=8088, interval=5.0, demo=False,
+        litellm_url=None, api_key=None, timeout=10.0, health=True,
+        health_timeout=90.0, probe_backends=False,
+        backend_count=True, gpu_info=True,
+        k8s_api_server=None, k8s_token_file="/t/token", k8s_ca_file="/t/ca",
+        k8s_insecure=False, k8s_timeout=5.0,
+        user_view=False, user_view_show_internal=False,
+        user_view_cache_ttl=30.0, metrics=True, config_file=None,
+    )
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+@unittest.skipUnless(_HAS_PYDANTIC, "app.config import 에 pydantic-settings 필요")
+class TestBuildCollectorSettings(unittest.TestCase):
+    def test_defaults_no_env_no_file(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            c = m.build_collector_settings(_settings_ns())
+        self.assertTrue(c["backend_count"])
+        self.assertTrue(c["gpu_info"])
+        self.assertFalse(c["user_view"])
+        self.assertTrue(c["metrics"])
+        self.assertTrue(c["user_view_hide_internal"])  # show_internal False -> hide
+        self.assertIsNone(c["litellm_url"])
+
+    def test_gpu_requires_backend_count(self):
+        # backend_count 가 꺼지면 gpu_info 를 켜도 의미 없으니 함께 꺼진다.
+        with mock.patch.dict(os.environ,
+                             {"MONITOR_BACKEND_COUNT": "false",
+                              "MONITOR_GPU_INFO": "true"}, clear=True):
+            c = m.build_collector_settings(
+                _settings_ns(backend_count=False, gpu_info=True))
+        self.assertFalse(c["backend_count"])
+        self.assertFalse(c["gpu_info"])
+
+    def test_file_used_when_env_absent(self):
+        cfg = {"litellm": {"url": "http://file-llm:4000"},
+               "backend_count": {"enabled": False},
+               "user_view": {"enabled": True, "show_internal": True}}
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                c = m.build_collector_settings(_settings_ns(config_file=path))
+        finally:
+            os.unlink(path)
+        self.assertEqual(c["litellm_url"], "http://file-llm:4000")
+        self.assertFalse(c["backend_count"])           # 파일값 반영
+        self.assertTrue(c["user_view"])                # 파일값 반영
+        self.assertFalse(c["user_view_hide_internal"])  # show_internal True
+
+    def test_env_beats_file(self):
+        cfg = {"litellm": {"url": "http://file-llm:4000"},
+               "backend_count": {"enabled": True}}
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        try:
+            # Settings(env) 가 이미 env 를 반영한 상태 + os.environ 에 플래그 존재.
+            with mock.patch.dict(os.environ,
+                                 {"LITELLM_BASE_URL": "http://env-llm:4000",
+                                  "MONITOR_BACKEND_COUNT": "false"}, clear=True):
+                c = m.build_collector_settings(_settings_ns(
+                    litellm_url="http://env-llm:4000", backend_count=False,
+                    config_file=path))
+        finally:
+            os.unlink(path)
+        self.assertEqual(c["litellm_url"], "http://env-llm:4000")  # env 우선
+        self.assertFalse(c["backend_count"])                       # env 우선
 
 
 if __name__ == "__main__":
