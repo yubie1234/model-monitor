@@ -113,6 +113,12 @@ spec:
             # 중첩 설정(litellm/backend_count/user_view/metrics)은 config 파일에서 읽는다.
             - { name: MONITOR_CONFIG_FILE, value: "/etc/model-monitor/config.json" }
             - { name: MONITOR_INTERVAL, value: "5" }
+            # LiteLLM /health 폴링 끄기. /health 는 모든 백엔드를 실제 ping 하는데,
+            # KServe Serverless(scale-to-zero) 백엔드를 주기적으로 깨워 scale 동작을
+            # 방해한다. 끄면 백엔드를 건드리지 않고 상태는 k8s readiness(Knative
+            # actualScale)로 판정 — scale-to-zero 는 idle('?'), ready>0 은 UP.
+            # 백엔드가 전부 상시 기동(non-serverless)이고 /health 상태가 필요하면 "true".
+            - { name: MONITOR_HEALTH, value: "false" }
             # path prefix 뒤 노출(아래 Ingress 와 동일 prefix). 루트로 쓰려면 이 줄 제거.
             # Ingress 가 prefix 를 rewrite 로 떼고 앱에 전달하지만, 대시보드 자기 호출 URL·
             # /docs 링크가 prefix 를 포함하도록 앱에도 같은 값을 알려준다.
