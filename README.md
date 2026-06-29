@@ -198,12 +198,14 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 
 1. **이미지 빌드** ([ci.sh](ci.sh) → [Dockerfile](Dockerfile)) — 로컬 `ai-tool/llm-monitor:<버전>` + `:latest`:
    ```bash
-   ./ci.sh
+   ./ci.sh                  # product: <버전> + :latest
+   BRANCH=develop ./ci.sh   # <버전>-develop (:latest 안 붙임)
    ```
-2. **레지스트리에 push** ([push.sh](push.sh)) — `10.92.20.77:5002` 로 retag 후 push:
+   `BRANCH` 로 브랜치별 이미지 태그를 구분합니다: **미지정/`product` → `<버전>` (+ `:latest`)**, **그 외 값(develop 등) → `<버전>-<BRANCH>` (`:latest` 제외)**. (`TAG=...` 로 직접 지정하면 BRANCH 로직은 무시.)
+2. **레지스트리에 push** ([push.sh](push.sh)) — `10.92.20.77:5002` 로 retag 후 push (빌드와 **같은 `BRANCH`** 를 넘길 것):
    ```bash
-   ./push.sh
-   #  -> 10.92.20.77:5002/ai-tool/llm-monitor:<버전> + :latest
+   ./push.sh                                       # <버전> + latest
+   BRANCH=develop ./push.sh                        # <버전>-develop
    ```
 3. **배포** ([deploy/k8s.yaml](deploy/k8s.yaml) — Namespace / ServiceAccount / **ClusterRole(RBAC)** / ConfigMap / Deployment / Service):
    ```bash
