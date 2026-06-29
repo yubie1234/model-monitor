@@ -1,0 +1,59 @@
+name: tag-on-merge
+
+# develop / product 에 머지(push)되면 app/__init__.py 의 __version__ 기준으로 태그 생성.
+#   - product : v<version>           (release 태그, 불변 — 이미 있으면 실패 → 버전 bump 강제)
+#   - develop : v<version>-develop   (플로팅 pre-release 태그 — 머지마다 최신 커밋으로 이동)
+# 태그 push 는 branches 트리거를 다시 켜지 않으므로 루프가 생기지 않는다.
+
+on:
+  push:
+    branches: [develop, product]
+
+permissions:
+  contents: write   # 태그 push 에 필요
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # 태그 조회/생성을 위해 전체 히스토리
+
+      - name: Create version tag
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # 버전 단일 진실 공급원 = app/__init__.py (ci.sh/push.sh 와 동일 grep)
+          VERSION="$(grep -oE '__version__ = "[^"]+"' app/__init__.py \
+                      | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+          if [ -z "${VERSION}" ]; then
+            echo "::error::app/__init__.py 에서 __version__ 을 찾지 못했습니다."
+            exit 1
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ "${BRANCH}" = "product" ]; then
+            TAG="v${VERSION}"
+            # release 태그는 불변: 이미 있으면 실패시켜 버전 bump 를 강제한다.
+            if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+              echo "::error::태그 ${TAG} 가 이미 존재합니다. product 머지에는 app/__init__.py 의 __version__ bump 가 필요합니다."
+              exit 1
+            fi
+            git tag -a "${TAG}" -m "Release ${TAG} (product ${GITHUB_SHA})"
+            git push origin "refs/tags/${TAG}"
+            echo "created release tag ${TAG} -> ${GITHUB_SHA}"
+          else
+            # develop: 플로팅 pre-release 태그를 최신 커밋으로 이동(force).
+            TAG="v${VERSION}-develop"
+            git tag -f -a "${TAG}" -m "develop snapshot ${TAG} (${GITHUB_SHA})"
+            git push -f origin "refs/tags/${TAG}"
+            echo "moved develop tag ${TAG} -> ${GITHUB_SHA}"
+          fi
+
+          echo "TAG=${TAG}" >> "${GITHUB_STEP_SUMMARY}"

@@ -110,6 +110,13 @@ env (`LITELLM_BASE_URL`, `LITELLM_API_KEY`, `MONITOR_*`) > config file (`MONITOR
 - **`product`** — branch tracking the product/release line.
 - **`feature/<name>`** — one branch per feature (branch off `develop`). Do feature development here, not directly on `develop`/`product`/`main`.
 
+### Tagging on merge (automated)
+`.github/workflows/tag-on-merge.yml` tags `develop`/`product` on every merge (push), using `__version__` from `app/__init__.py`:
+- **`product`** → `v<version>` — immutable release tag. **Fails the workflow if the tag already exists**, forcing a `__version__` bump before a product release.
+- **`develop`** → `v<version>-develop` — floating pre-release tag, **force-moved** to the latest commit on each develop merge (so it always points at the newest develop snapshot for that version).
+
+So: bump `__version__` for a product release; develop merges just re-point the `-develop` tag. Tag pushes don't re-trigger the branch workflow (no loop).
+
 ## Conventions
 
 - **Versioning:** `__version__` in `app/__init__.py` is the single source of truth — it drives the Docker image tag (`ci.sh`/`push.sh` grep it), the FastAPI app `version`, the `version` field in `/api/snapshot`, and `model_monitor_build_info`. Bump it there; the README header version should follow.
