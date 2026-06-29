@@ -16,7 +16,7 @@ REPO_URL="10.92.20.77:5002"            # 고정 레지스트리
 IMAGE="${IMAGE:-ai-tool/llm-monitor}"  # ci.sh 가 빌드한 로컬 이미지명
 
 # 빌드와 동일하게 __version__ 을 태그로 사용
-VERSION="$(grep -oE '__version__ = "[^"]+"' model_monitor.py \
+VERSION="$(grep -oE '__version__ = "[^"]+"' app/__init__.py \
             | sed -E 's/.*"([^"]+)".*/\1/' || true)"
 VERSION="${VERSION:-0.0.0}"
 TAG="${TAG:-$VERSION}"

@@ -1,15 +1,44 @@
 #!/usr/bin/env python3
-"""model_monitor 단위 테스트 — 외부 패키지 0개(표준 라이브러리 unittest)만 사용.
+"""model-monitor 단위 테스트 — 핵심 수집/집계 로직(순수 함수)만 검증.
 
 실행:  python3 -m unittest -v        (또는)  python3 test_model_monitor.py
 
-가장 까다롭고 KServe/Knative 버전에 민감한 파싱·병합·집계 로직을 고정한다.
+FastAPI 구조로 재편한 뒤에도 테스트 본문은 그대로 두기 위해, 새 모듈들을
+m.* 네임스페이스로 모아 노출한다. (web/route 계층은 별도이고 FastAPI 가 필요해
+여기서는 import 하지 않는다 — 핵심 로직은 stdlib 만으로 검증 가능.)
 """
 
 import copy
+import types
 import unittest
 
-import model_monitor as m
+from app.core import k8s as _k8s
+from app.services import backend_count as _bc
+from app.services import demo as _demo
+from app.services import gpu as _gpu
+from app.services import litellm as _ll
+from app.services import prometheus as _prom
+from app.services import snapshot as _snap
+from app.services import user_access as _ua
+
+m = types.SimpleNamespace(
+    parse_api_base=_bc.parse_api_base,
+    resolve_backend_count=_bc.resolve_backend_count,
+    _is_serverless=_bc._is_serverless,
+    _strip_openai_suffix=_ll._strip_openai_suffix,
+    _classify_backend=_ll._classify_backend,
+    merge_deployments_with_health=_snap.merge_deployments_with_health,
+    summarize=_snap.summarize,
+    demo_snapshot=_demo.demo_snapshot,
+    K8sClient=_k8s.K8sClient,
+    _short_gpu_product=_gpu._short_gpu_product,
+    _pod_gpu=_gpu._pod_gpu,
+    _pod_ready=_gpu._pod_ready,
+    collect_user_access=_ua.collect_user_access,
+    AccessCache=_ua.AccessCache,
+    filter_snapshot_for_user=_ua.filter_snapshot_for_user,
+    render_prometheus_metrics=_prom.render_prometheus_metrics,
+)
 
 
 class FakeClient:
@@ -363,12 +392,14 @@ class TestCollectUserAccess(unittest.TestCase):
     """per-user 키 접근 수집 — http_get_json 을 가짜로 갈아끼워 분기만 고정."""
 
     def _patch(self, fake):
-        self._orig = m.http_get_json
-        m.http_get_json = fake
+        # collect_user_access 는 app.services.user_access 모듈 전역 http_get_json 을
+        # 부르므로, 그 모듈 속성을 교체해야 패치가 먹는다.
+        self._orig = _ua.http_get_json
+        _ua.http_get_json = fake
 
     def tearDown(self):
         if getattr(self, "_orig", None):
-            m.http_get_json = self._orig
+            _ua.http_get_json = self._orig
 
     def test_fail_closed_on_v1_models_error(self):
         # 키 무효/만료 -> ok=False, accessible 빈 집합 (global 폴백 금지의 근거)

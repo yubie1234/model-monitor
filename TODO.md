@@ -66,7 +66,7 @@ LiteLLM은 가상 키(virtual key)마다 접근 가능한 모델이 다르다. �
 > - **키별 접근 캐시(TTL 기본 30s)** — 폴링 중복 `/v1/models` 호출 제거. 해시만 보관(원문 키 비저장),
 >   성공만 캐시(무효 키는 매번 재검증). 무거운 데이터는 원래부터 admin 공유 캐시라 키 무관.
 
-### 백엔드 ([model_monitor.py](model_monitor.py))
+### 백엔드 ([app/services/](app/services/))
 - [x] `collect_user_access(url, user_key, timeout)` — 그 키로 `/v1/models`(접근 model_name 집합) +
       `/key/info`(키 메타) 수집
 - [x] **권한 판정의 단일 출처는 `/v1/models`(이미 해석된 결과).** `/key/info.models` 로 접근권을
@@ -78,7 +78,7 @@ LiteLLM은 가상 키(virtual key)마다 접근 가능한 모델이 다르다. �
 - [x] ⚠️ **공유 캐시 오염 방지** — `copy.deepcopy` 한 사본 위에서만 필터.
       (회귀 테스트 `test_does_not_mutate_global` 로 고정)
 
-### 웹 ([serve_dashboard](model_monitor.py))
+### 웹 ([app/api/routes.py](app/api/routes.py))
 - [x] 라우트 `POST /api/snapshot/user` — 키를 **헤더(`X-LiteLLM-Key`) 전용**으로 받음(쿼리 금지).
       캐시된 global 스냅샷 + `collect_user_access` → `filter_*` → 필터된 JSON. **키는 저장/로그 없이 pass-through.**
 - [x] **fail-closed** — 키 검증 실패(401/만료)면 명확한 에러만(사유는 일반화해 토폴로지 비노출).

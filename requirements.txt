@@ -1,0 +1,9 @@
+# model-monitor 런타임 의존성.
+# 수집 로직(LiteLLM/k8s 조회)은 표준 라이브러리(urllib/ssl)만 쓰지만,
+# 웹 서비스 계층은 FastAPI 스택을 사용한다.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+pydantic-settings>=2.2
+# 설정 파일을 .yaml 로 쓸 때만 필요(.json 은 표준 라이브러리로 동작)
+PyYAML>=6.0
