@@ -196,7 +196,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 
 빌드한 컨테이너 이미지로 배포합니다. in-cluster 로 뜨면 backend Pod 개수 수집이 자동으로 켜집니다(ServiceAccount 토큰 사용).
 
-1. **이미지 빌드** ([ci.sh](ci.sh) → [Dockerfile](Dockerfile)) — 로컬 `ai-tool/llm-monitor:<버전>` + `:latest`:
+1. **이미지 빌드** ([ci.sh](ci.sh) → [Dockerfile](Dockerfile)) — 로컬 `ai-tool/model-monitor:<버전>` + `:latest`:
    ```bash
    ./ci.sh                  # product: <버전> + :latest
    BRANCH=develop ./ci.sh   # <버전>-develop (:latest 안 붙임)
@@ -223,7 +223,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 - **두 값(Ingress path prefix·`MONITOR_ROOT_PATH`)은 반드시 동일**해야 합니다. 루트(/)로 쓰려면 `MONITOR_ROOT_PATH` 를 비우고 Ingress 의 prefix/`rewrite-target` 을 제거하세요.
 - `deploy/k8s.yaml` 의 `host`(example.com)·`ingressClassName`(nginx) 은 실제 환경 값으로 교체. nginx 외 컨트롤러면 rewrite 문법을 맞게 바꾸세요. probe(`/healthz`·`/readyz`)는 Pod 로 직접 가므로 prefix 영향 없음.
 
-> Deployment 는 `image: 10.92.20.77:5002/ai-tool/llm-monitor:latest` + `imagePullPolicy: Always` 라 latest 최신본을 매번 레지스트리에서 받습니다.
+> Deployment 는 `image: 10.92.20.77:5002/ai-tool/model-monitor:latest` + `imagePullPolicy: Always` 라 latest 최신본을 매번 레지스트리에서 받습니다.
 > HTTP(비TLS) 레지스트리면 빌드 노드의 docker(`/etc/docker/daemon.json` 의 `insecure-registries`)와 클러스터 노드의 containerd 에 `10.92.20.77:5002` 를 insecure 레지스트리로 등록해야 push/pull 이 됩니다.
 
 ### backend 개수 산출 방식 (KServe)
