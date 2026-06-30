@@ -160,14 +160,18 @@
   .gedge{stroke:var(--faint);stroke-width:1.6;fill:none;opacity:.5}
   .gedge.shared{stroke:var(--warn);stroke-width:2;opacity:.8}
   .badge-shared{font-family:var(--mono);font-size:9px;font-weight:700;fill:var(--warn)}
-  /* 노드 위에 마우스를 올리면 연결된 노드/간선만 남기고 나머지는 숨긴다(멀리 떨어진
-     노드도 무엇과 이어졌는지 한눈에). 숨긴 노드도 hit-area 는 살아 있어, 컬럼을 따라
-     마우스를 옮기면 그 노드가 떠오르며 자기 연결을 보여준다. */
+  /* 노드에 마우스를 올리면 연결된 노드/간선만 남기고(나머지는 숨김) 연결된 노드들을
+     hovered 노드 y 중심으로 끌어모아, 멀리 떨어져 있어도 무엇과 이어졌는지 바로
+     보이게 한다(이동/재배선은 wireGraph). 숨긴 노드도 hit-area 는 살아 있어 컬럼을
+     훑으면 떠오른다. */
   svg.focusing .gedge{opacity:0}
   svg.focusing .gnode{opacity:0}
   svg.focusing .gedge.on{opacity:.95}
   svg.focusing .gnode.on{opacity:1}
-  @media (prefers-reduced-motion:no-preference){.gedge,.gnode{transition:opacity .12s ease}}
+  @media (prefers-reduced-motion:no-preference){
+    .gnode{transition:opacity .12s ease, transform .22s cubic-bezier(.4,0,.2,1)}
+    .gedge{transition:opacity .12s ease, d .22s ease}
+  }
 
   .empty{color:var(--muted);padding:18px;text-align:center;font-style:italic}
   .err{color:var(--down);font-family:var(--mono);font-size:12px;
@@ -535,18 +539,48 @@ function buildGraph(deps){
 }
 function wireGraph(svg){
   if(!svg) return;
+  const edges=[...svg.querySelectorAll(".gedge")];
+  const nodes=[...svg.querySelectorAll(".gnode")];
+  edges.forEach(ed=>{ if(ed.dataset.d0==null) ed.dataset.d0=ed.getAttribute("d"); });
+  const STEP=42;   // 모을 때 노드 간격(원래 행 간격 46 보다 좁게 → 한 덩어리로 보임)
+  const rect=n=>n.querySelector("rect");
+  const cy=n=>{const r=rect(n);return +r.getAttribute("y")+(+r.getAttribute("height"))/2;};
+  const ax=(n,side)=>{const r=rect(n);
+    return side==="r" ? +r.getAttribute("x")+(+r.getAttribute("width")) : +r.getAttribute("x");};
+  const nodeOf=(k,key)=>svg.querySelector('.gnode[data-kind="'+k+'"][data-key="'+key+'"]');
+  const reroute=(ed,mN,bN,my,by)=>{const x1=ax(mN,"r"),x2=ax(bN,"l"),mx=(x1+x2)/2;
+    ed.setAttribute("d","M"+x1+" "+my+" C"+mx+" "+my+" "+mx+" "+by+" "+x2+" "+by);};
+
   const clear=()=>{svg.classList.remove("focusing");
-    svg.querySelectorAll(".on").forEach(e=>e.classList.remove("on"));};
-  svg.querySelectorAll(".gnode").forEach(node=>{
+    nodes.forEach(n=>{n.classList.remove("on");n.style.transform="";});
+    edges.forEach(ed=>{ed.classList.remove("on");ed.setAttribute("d",ed.dataset.d0);});};
+
+  nodes.forEach(node=>{
     node.addEventListener("mouseenter",()=>{
-      const kind=node.getAttribute("data-kind"), key=node.getAttribute("data-key");
+      const kind=node.dataset.kind, key=node.dataset.key;
       svg.classList.add("focusing"); node.classList.add("on");
-      svg.querySelectorAll(".gedge").forEach(ed=>{
-        const match = kind==="m" ? ed.getAttribute("data-m")===key : ed.getAttribute("data-b")===key;
-        if(match){ ed.classList.add("on");
-          const other = kind==="m" ? ed.getAttribute("data-b") : ed.getAttribute("data-m");
-          const on=svg.querySelector((kind==="m"?'.gnode.be[data-key="':'.gnode.model[data-key="')+other+'"]');
-          if(on) on.classList.add("on"); }
+      // 1) 연결된 간선과 반대쪽(상대 컬럼) 노드 수집
+      const matched=edges.filter(ed=>kind==="m"?ed.dataset.m===key:ed.dataset.b===key);
+      const others=[], oset=new Set();
+      matched.forEach(ed=>{ed.classList.add("on");
+        const o=nodeOf(kind==="m"?"b":"m", kind==="m"?ed.dataset.b:ed.dataset.m);
+        if(o&&!oset.has(o)){oset.add(o);o.classList.add("on");others.push(o);}});
+      // 2) 연결된 노드들을 hovered 노드 y 중심으로 끌어모은다(캔버스 밖이면 보정)
+      const Hc=cy(node), n=others.length, half=(n-1)/2*STEP;
+      const vbH=(svg.viewBox&&svg.viewBox.baseVal)?svg.viewBox.baseVal.height:0;
+      let shift=0;
+      if(vbH){ if(Hc-half<30) shift=30-(Hc-half);
+        else if(Hc+half>vbH-26) shift=(vbH-26)-(Hc+half); }
+      const ty=new Map();
+      others.forEach((o,i)=>{const y=Hc+shift+(i-(n-1)/2)*STEP; ty.set(o,y);
+        o.style.transform="translateY("+(y-cy(o))+"px)";});
+      // 3) 간선을 새 위치로 다시 그림(hovered 는 고정, 상대는 모인 위치)
+      matched.forEach(ed=>{
+        const o=nodeOf(kind==="m"?"b":"m", kind==="m"?ed.dataset.b:ed.dataset.m);
+        if(!o) return;
+        const oy=ty.has(o)?ty.get(o):cy(o);
+        const mN=kind==="m"?node:o, bN=kind==="b"?node:o;
+        reroute(ed, mN, bN, mN===node?Hc:oy, bN===node?Hc:oy);
       });
     });
     node.addEventListener("mouseleave",clear);
