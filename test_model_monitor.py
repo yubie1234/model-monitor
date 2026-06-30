@@ -393,6 +393,22 @@ class TestSorting(unittest.TestCase):
         out = m.merge_deployments_with_health(ll)
         self.assertEqual([d["model_name"] for d in out], ["Apple", "mango", "zoo"])
 
+    def test_order_is_deterministic_for_case_and_dup_ties(self):
+        # 회귀: 대소문자만 다른 이름('vllm-X'↔'vLLM-X')과 같은 이름의 deployment 가
+        # 여러 개면 lower 단일 키로는 동률이라 입력 순서를 따라가 폴링마다 뒤바뀐다.
+        # 입력 순서를 뒤집어도 출력 순서가 동일해야(결정적) 한다.
+        a = {"model_name": "vLLM-X", "api_base": "http://a/v1", "id": "1"}
+        b = {"model_name": "vllm-X", "api_base": "http://b/v1", "id": "2"}
+        c = {"model_name": "Qwen", "api_base": "http://c/v1", "id": "9"}
+        d = {"model_name": "Qwen", "api_base": "http://c/v1", "id": "8"}  # 이름·base 같고 id만 다름
+        order1 = [o["id"] for o in m.merge_deployments_with_health(
+            {"health": None, "deployments": [a, b, c, d]})]
+        order2 = [o["id"] for o in m.merge_deployments_with_health(
+            {"health": None, "deployments": [d, c, b, a]})]
+        self.assertEqual(order1, order2)                 # 입력 순서와 무관하게 동일
+        # 'Qwen'(이름·base 동률) 은 id 로, 'vLLM/vllm-X'(lower 동률) 는 원문으로 갈린다
+        self.assertEqual(order1, ["8", "9", "1", "2"])
+
     def test_demo_groups_and_deployments_sorted(self):
         snap = m.demo_snapshot()
         groups = [g["model_group"] for g in snap["litellm"]["groups"]]

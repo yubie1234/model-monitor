@@ -95,7 +95,13 @@ def merge_deployments_with_health(ll):
         merged.append({**d, "status": status, "status_source": src})
     # LiteLLM 은 replica 구성에 따라 model/info 순서가 매번 달라질 수 있어
     # model_name 기준으로 정렬해 표시 순서를 안정화한다(API/웹/JSON 공통).
-    merged.sort(key=lambda x: str(x.get("model_name") or "").lower())
+    # 동률(대소문자만 다른 이름 'vllm-X'↔'vLLM-X', 또는 같은 이름의 deployment 가
+    # 여러 개)일 때 입력 순서를 따라가면 폴링마다 순서가 뒤바뀐다. 그래서 lower 뒤로
+    # 원문 이름 → api_base → id 를 결정적 tiebreaker 로 둬 전순서를 고정한다.
+    merged.sort(key=lambda x: (str(x.get("model_name") or "").lower(),
+                               str(x.get("model_name") or ""),
+                               str(x.get("api_base") or ""),
+                               str(x.get("id") or "")))
     return merged
 
 

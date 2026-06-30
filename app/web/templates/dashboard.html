@@ -160,8 +160,11 @@
   .gedge{stroke:var(--faint);stroke-width:1.6;fill:none;opacity:.5}
   .gedge.shared{stroke:var(--warn);stroke-width:2;opacity:.8}
   .badge-shared{font-family:var(--mono);font-size:9px;font-weight:700;fill:var(--warn)}
-  svg.focusing .gedge{opacity:.07}
-  svg.focusing .gnode{opacity:.28}
+  /* 노드 위에 마우스를 올리면 연결된 노드/간선만 남기고 나머지는 숨긴다(멀리 떨어진
+     노드도 무엇과 이어졌는지 한눈에). 숨긴 노드도 hit-area 는 살아 있어, 컬럼을 따라
+     마우스를 옮기면 그 노드가 떠오르며 자기 연결을 보여준다. */
+  svg.focusing .gedge{opacity:0}
+  svg.focusing .gnode{opacity:0}
   svg.focusing .gedge.on{opacity:.95}
   svg.focusing .gnode.on{opacity:1}
   @media (prefers-reduced-motion:no-preference){.gedge,.gnode{transition:opacity .12s ease}}
@@ -487,7 +490,8 @@ function buildGraph(deps){
   if(!deps || !deps.length) return "";
   const names=[], seenN={};
   deps.forEach(d=>{ if(!seenN[d.model_name]){seenN[d.model_name]=1;names.push(d.model_name);} });
-  names.sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()));
+  // 대소문자만 다른 이름('vllm-X'↔'vLLM-X')은 lower 비교가 0이라 동률 → 원문으로 결정적 고정
+  names.sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()) || a.localeCompare(b));
   const svcOrder=[], svc={};
   deps.forEach(d=>{ const k=svcKeyOf(d);
     if(!svc[k]){ svc[k]={key:k,label:d.service||backendHost(d.api_base)||"external",

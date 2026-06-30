@@ -122,7 +122,8 @@ def demo_snapshot():
          "type": "vllm", "up": False, "models": [], "error": "connection error"},
     ]
     snap["litellm"]["groups"].sort(
-        key=lambda g: str(g.get("model_group") or "").lower())
+        key=lambda g: (str(g.get("model_group") or "").lower(),
+                       str(g.get("model_group") or "")))
     snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
     snap["summary"] = summarize(snap)
     snap["demo"] = True
