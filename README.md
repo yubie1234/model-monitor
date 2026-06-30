@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.2** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
+**버전: v0.5.3** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -41,7 +41,8 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 > 웹 대시보드는 deployment 를 model_name 으로 묶어 모델별 합성 상태와 `Σ ready/desired` 를
 > 보여주고(`group by model` 토글), 공유 백엔드는 `⇄ SHARED` 로 명시합니다. 상단 **Model ↔ Backend**
 > 그래프(`show graph` 토글)는 라우팅을 이분 그래프로 그려 공유 백엔드로 간선이 모이는 모습을
-> 한눈에 보여줍니다. 헤드라인 **Replicas** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
+> 한눈에 보여줍니다. 노드에 마우스를 올리면 **연결된 노드/간선만 남기고 나머지는 숨겨**(v0.5.3)
+> 멀리 떨어진 노드도 무엇과 이어졌는지 바로 보입니다. 헤드라인 **Replicas** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
 > 공유 백엔드가 모델 수만큼 이중 집계되지 않습니다. (UI 라벨은 `Replicas`/`REPLICAS` — k8s Pod=서빙 복제본.)
 
 > **GPU 개수 + 장치명 (v0.4.0)** — backend Pod 가 점유한 GPU 수(`resources.limits[nvidia.com/gpu]`

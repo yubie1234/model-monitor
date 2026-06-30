@@ -57,10 +57,13 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
     ok, data, err = http_get_json(base + "/model_group/info", api_key, timeout)
     if ok and isinstance(data, dict):
         result["reachable"] = True
-        # 이름순 정렬: LiteLLM 응답 순서가 replica 구성에 따라 바뀌어도 표시 고정
+        # 이름순 정렬: LiteLLM 응답 순서가 replica 구성에 따라 바뀌어도 표시 고정.
+        # 대소문자만 다른 그룹('vllm-X'↔'vLLM-X')은 lower 가 같아 동률이므로,
+        # 원문 이름을 2차 키로 둬 순서가 폴링마다 뒤바뀌지 않게 한다.
         result["groups"] = sorted(
             data.get("data", []) or [],
-            key=lambda g: str(g.get("model_group") or "").lower())
+            key=lambda g: (str(g.get("model_group") or "").lower(),
+                           str(g.get("model_group") or "")))
     elif err:
         result["errors"].append("model_group/info: %s" % err)
 
