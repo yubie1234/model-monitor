@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.4** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
+**버전: v0.5.5** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -245,6 +245,11 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   `knative: HTTP 403`)가 뜹니다. RBAC([deploy/k8s.yaml](deploy/k8s.yaml) ClusterRole)나 라벨/네임스페이스를 점검하세요.
 - 수집은 백그라운드 asyncio 태스크에서 주기적으로 돌고 HTTP 는 마지막 스냅샷을 즉시 반환합니다
   (요청 블로킹 없음).
+- **간헐적 502 (nginx ingress 뒤)**: 두 가지 원인을 모두 막았습니다 — ① per-user(`/api/snapshot/user`)
+  조회가 동기 LiteLLM 호출을 이벤트 루프에서 직접 돌려 단일 워커가 멈추던 문제는 `asyncio.to_thread`
+  로 해소(v0.5.4), ② uvicorn keep-alive 기본 5s 가 폴링 주기(5s)·nginx upstream keepalive 와
+  겹쳐 연결 재사용 시 reset 나던 문제는 `--timeout-keep-alive 75`(>nginx 60s)로 해소(v0.5.5).
+  여전히 502 면 ingress 의 `proxy-read-timeout`(느린 LiteLLM 대비)·워커 수를 점검하세요.
 
 ## 로드맵 / TODO
 
