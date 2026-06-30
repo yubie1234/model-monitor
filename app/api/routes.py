@@ -5,6 +5,7 @@
 데이터는 키로만(POST /api/snapshot/user) 나간다(admin 키는 전체 뷰 해제).
 """
 
+import asyncio
 import json
 import time
 
@@ -54,7 +55,11 @@ async def api_snapshot_user(request: Request):
             {"error": "LiteLLM 이 설정되지 않았습니다.", "user_view": True},
             status_code=503)
     # 일반 키: 접근 목록을 짧은 TTL 캐시로 조회(폴링 중복 호출 제거).
-    access = st.access_cache.get_or_collect(
+    # collect_user_access 는 동기(blocking urllib) LiteLLM 호출이므로 절대 이벤트
+    # 루프에서 직접 부르지 않는다 — to_thread 로 워커 스레드에서 돌린다(단일 워커
+    # 루프가 LiteLLM 왕복 동안 멈춰 다른 요청·프로브가 타임아웃→ingress 502 나는 것 방지).
+    access = await asyncio.to_thread(
+        st.access_cache.get_or_collect,
         key,
         lambda: collect_user_access(st.litellm_url, key, st.collect_timeout),
         time.monotonic())
