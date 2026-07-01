@@ -12,11 +12,13 @@ import asyncio
 import copy
 import json
 import os
+import re
 import tempfile
 import types
 import unittest
 from unittest import mock
 
+import app
 from app import auth as _auth
 from app.core import k8s as _k8s
 from app.services import backend_count as _bc
@@ -940,6 +942,38 @@ class TestBuildCollectorSettings(unittest.TestCase):
             os.unlink(path)
         self.assertEqual(c["litellm_url"], "http://env-llm:4000")  # env 우선
         self.assertFalse(c["backend_count"])                       # env 우선
+
+
+class TestVersionConsistency(unittest.TestCase):
+    """버전 문자열이 여러 파일에 흩어져 있고(단일 출처 __version__ 에 자동 연동되지
+    않는 수동 복제본), 릴리스 때 한 곳을 빠뜨리기 쉽다 — 실제로 deploy/k8s.yaml 의
+    버전 라벨을 빼먹은 적이 있다. app/__init__.py 의 __version__ 를 기준으로 README
+    헤더와 deploy/k8s.yaml 라벨이 모두 일치하는지 강제해 재발을 막는다.
+
+    새 버전 표기 위치를 추가하면(예: 또 다른 매니페스트) 여기 검사도 함께 늘릴 것.
+    """
+
+    ROOT = os.path.dirname(os.path.abspath(__file__))
+
+    def _read(self, *parts):
+        with open(os.path.join(self.ROOT, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def test_readme_header_matches_version(self):
+        mt = re.search(r"\*\*버전:\s*v([0-9]+\.[0-9]+\.[0-9]+)\*\*",
+                       self._read("README.md"))
+        self.assertIsNotNone(mt, "README 헤더에서 '**버전: vX.Y.Z**' 패턴을 찾지 못함")
+        self.assertEqual(mt.group(1), app.__version__,
+                         "README 헤더 버전이 __version__ 과 불일치")
+
+    def test_k8s_manifest_version_labels_match(self):
+        labels = re.findall(r'app\.kubernetes\.io/version:\s*"([^"]+)"',
+                            self._read("deploy", "k8s.yaml"))
+        self.assertTrue(labels,
+                        "deploy/k8s.yaml 에 app.kubernetes.io/version 라벨이 없음")
+        for v in labels:
+            self.assertEqual(v, app.__version__,
+                             "deploy/k8s.yaml 의 버전 라벨이 __version__ 과 불일치")
 
 
 if __name__ == "__main__":
