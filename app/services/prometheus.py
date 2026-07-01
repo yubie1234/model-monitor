@@ -116,6 +116,17 @@ def render_prometheus_metrics(snap):
     emit("model_monitor_backend_pods_known",
          "backend Pod 수를 하나라도 알아냈으면 1.", "gauge",
          [({}, 1 if s.get("backend_pods_known") else 0)])
+    emit("model_monitor_backend_gpus_ready_total",
+         "모든 LB 뒤 ready Pod 가 점유한 GPU 합계(공유 Service 는 1회만 집계).", "gauge",
+         [({}, s.get("gpu_total", 0))])
+    emit("model_monitor_backend_gpus_known",
+         "GPU 정보를 하나라도 알아냈으면 1(RBAC/기능 미설정이면 0).", "gauge",
+         [({}, 1 if s.get("gpu_known") else 0)])
+    emit("model_monitor_backend_gpus_ready_by_device",
+         "장치 모델(H100/B200 등)별 ready GPU 합계(공유 Service dedup, 이기종 GPU 구분).",
+         "gauge",
+         [({"device": prod}, n)
+          for prod, n in sorted((s.get("gpu_products") or {}).items())])
 
     # --- deployment(모델) 단위 ---
     def base_labels(d):
@@ -126,7 +137,7 @@ def render_prometheus_metrics(snap):
             lab["service"] = d["service"]
         return lab
 
-    up_s, ready_s, desired_s, s2z_s = [], [], [], []
+    up_s, ready_s, desired_s, s2z_s, gpu_s = [], [], [], [], []
     for d in deps:
         lab = base_labels(d)
         up_lab = dict(lab)
@@ -138,6 +149,8 @@ def render_prometheus_metrics(snap):
             pod_lab["backend_source"] = d["backend_source"]
         ready_s.append((pod_lab, d.get("backends_ready")))
         desired_s.append((pod_lab, d.get("backends_desired")))
+        # GPU 는 backend_source 라벨 없이 model/namespace/service 로만(장치 총량).
+        gpu_s.append((dict(lab), d.get("gpu_ready")))
         s2z_s.append(({"model": d.get("model_name") or ""},
                       1 if d.get("scale_to_zero") else 0))
 
@@ -151,6 +164,10 @@ def render_prometheus_metrics(snap):
     emit("model_monitor_model_backend_pods_desired",
          "이 모델 LB 뒤 목표 replica 수.", "gauge",
          _dedup_samples(desired_s, max))
+    emit("model_monitor_model_backend_gpus_ready",
+         "이 모델 LB 뒤 ready Pod 가 점유한 GPU 수. 공유 Service 는 여러 모델에 같은 "
+         "물리 GPU 가 잡히므로 단순 합산은 이중 집계 — 총합은 *_total 사용.", "gauge",
+         _dedup_samples(gpu_s, max))
     emit("model_monitor_model_scale_to_zero",
          "scale-to-zero 로 0 Pod 가 정상 idle 이면 1(장애 0 Pod 와 구분).", "gauge",
          _dedup_samples(s2z_s, max))

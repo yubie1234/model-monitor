@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.6** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
+**버전: v0.5.7** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -123,9 +123,11 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 
 - **요약 게이지**: `model_monitor_deployments_{total,healthy,unhealthy}`,
   `model_monitor_backend_pods_{ready,desired}_total`(공유 Service 는 1회만 집계),
-  `model_monitor_model_groups`, `model_monitor_backend_pods_known`.
+  `model_monitor_model_groups`, `model_monitor_backend_pods_known`,
+  `model_monitor_backend_gpus_ready_total`·`model_monitor_backend_gpus_ready_by_device{device=…}`(장치별, 이기종 GPU 구분)·`model_monitor_backend_gpus_known`(모두 `(namespace, service)` dedup).
 - **모델(deployment) 단위**: `model_monitor_model_up`(라벨 `model`/`namespace`/`service`/`status_source`,
   값 **UP=1 · DOWN=0 · 미상/idle=-1**), `model_monitor_model_backend_pods_{ready,desired}`,
+  `model_monitor_model_backend_gpus_ready`(공유 Service 는 이중 집계되니 합산 말고 `*_total` 사용),
   `model_monitor_model_scale_to_zero`(0 Pod 가 정상 idle 인지 장애인지 구분).
 - **스크레이프 신뢰도**: `model_monitor_up`, `model_monitor_build_info{version=…}`,
   `model_monitor_backend_count_enabled`, `model_monitor_collect_errors`(>0 이면 일부 Pod 수 부정확).

@@ -704,6 +704,58 @@ class TestPrometheusMetrics(unittest.TestCase):
         self.assertEqual(parsed["model_monitor_backend_pods_desired_total"], ["5"])
         self.assertEqual(parsed['model_monitor_build_info{version="9.9.9"}'], ["1"])
 
+    def test_gpu_metrics_and_shared_service_dedup(self):
+        # X, Y 가 같은 (ns, svc1) 을 공유(로드밸런싱/라우팅) — 물리 GPU 는 동일하므로
+        # 총합은 1회만 집계돼야 한다. Z 는 다른 Service(B200).
+        ll = {"groups": [], "health": None, "deployments": [
+            {"model_name": "X", "api_base": "http://x/v1",
+             "namespace": "ns", "service": "svc1",
+             "backends_ready": 3, "backends_desired": 3,
+             "backend_source": "deployment",
+             "gpu_ready": 6, "gpu_products": {"H100": 6}},
+            {"model_name": "Y", "api_base": "http://x/v1",  # 같은 (ns, svc1) 공유
+             "namespace": "ns", "service": "svc1",
+             "backends_ready": 3, "backends_desired": 3,
+             "backend_source": "deployment",
+             "gpu_ready": 6, "gpu_products": {"H100": 6}},
+            {"model_name": "Z", "api_base": "http://z/v1",
+             "namespace": "ns", "service": "svc2",
+             "backends_ready": 1, "backends_desired": 1,
+             "backend_source": "deployment",
+             "gpu_ready": 2, "gpu_products": {"B200": 2}},
+        ]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "x", "litellm": ll, "backends": [],
+                "backend_count_enabled": True}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        # 총합: svc1(6) 은 1회만 + svc2(2) = 8, 이중 집계 아님.
+        self.assertEqual(parsed["model_monitor_backend_gpus_ready_total"], ["8"])
+        self.assertEqual(parsed["model_monitor_backend_gpus_known"], ["1"])
+        # 장치별(이기종): H100=6(공유 dedup), B200=2.
+        self.assertEqual(
+            parsed['model_monitor_backend_gpus_ready_by_device{device="H100"}'],
+            ["6"])
+        self.assertEqual(
+            parsed['model_monitor_backend_gpus_ready_by_device{device="B200"}'],
+            ["2"])
+        # 모델별: 공유 X/Y 는 각각 6 으로 노출(합산 금지 — total 이 정답).
+        self.assertEqual(
+            parsed['model_monitor_model_backend_gpus_ready'
+                   '{model="X",namespace="ns",service="svc1"}'], ["6"])
+        self.assertEqual(
+            parsed['model_monitor_model_backend_gpus_ready'
+                   '{model="Y",namespace="ns",service="svc1"}'], ["6"])
+
+    def test_gpu_unknown_emits_zero_flag(self):
+        # GPU 정보가 전혀 없으면 known=0, total=0, 장치별 series 도 없어야 한다.
+        parsed = self._parse(m.render_prometheus_metrics(self._snap()))
+        self.assertEqual(parsed["model_monitor_backend_gpus_known"], ["0"])
+        self.assertEqual(parsed["model_monitor_backend_gpus_ready_total"], ["0"])
+        self.assertFalse(
+            any(k.startswith("model_monitor_backend_gpus_ready_by_device")
+                for k in parsed))
+
     def test_duplicate_series_collapsed(self):
         # 회귀: LiteLLM 은 한 model_name 에 여러 deployment 를 둘 수 있다(로드밸런싱).
         # 같은 라벨 series 가 중복되면 Prometheus 스크레이프가 깨지므로 1개로 합쳐야 한다.
