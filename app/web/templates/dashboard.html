@@ -59,6 +59,17 @@
     color:var(--muted);margin:0 0 10px;display:flex;align-items:center;gap:8px}
   .sec-title .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
     color:var(--faint);font-size:11px}
+  /* 접이식 섹션(<details>): summary 를 sec-title 로 쓰고 기본 접힘(open 없음). */
+  details.collapsible>summary{cursor:pointer;list-style:none;user-select:none}
+  details.collapsible>summary::-webkit-details-marker{display:none}
+  details.collapsible:not([open])>summary.sec-title{margin-bottom:0}
+  details.collapsible>summary:focus-visible{outline:2px solid var(--accent);
+    outline-offset:3px;border-radius:4px}
+  .chev{display:inline-block;color:var(--faint);font-size:10px}
+  details.collapsible[open] .chev{transform:rotate(90deg)}
+  .grp-count{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--faint);
+    background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:0 8px}
+  @media (prefers-reduced-motion:no-preference){.chev{transition:transform .15s ease}}
   .filters{display:flex;align-items:center;gap:7px;margin-left:auto;
     text-transform:none;letter-spacing:0}
   .filters label{font-size:10px;color:var(--faint)}
@@ -138,13 +149,23 @@
     background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.35);border-radius:4px;
     padding:0 5px;margin-left:8px;letter-spacing:.02em;white-space:nowrap}
 
-  /* Model ↔ Backend 그래프 */
-  #graph-sec .src{font-family:var(--mono);text-transform:none;letter-spacing:0;
-    color:var(--faint);font-size:11px}
+  /* Model ↔ Backend 그래프 + Deployments 를 한 섹션에서 좌우로 (필터 공유) */
+  .topo-split{display:grid;grid-template-columns:minmax(340px,5fr) 7fr;gap:16px;align-items:start}
+  /* 그래프 컬럼이 없을 때(숨김·유저뷰·데이터 없음) 표가 전체 폭을 차지 */
+  .topo-split.no-graph{grid-template-columns:1fr}
+  /* 좁은 화면에선 좌우 분할을 접어 위(그래프)-아래(표)로 쌓는다 */
+  @media (max-width:860px){.topo-split{grid-template-columns:1fr}}
+  .topo-graph,.topo-table{min-width:0}   /* grid 자식이 컬럼을 넘쳐 스크롤 깨지 않게 */
+  /* 그래프·표를 같은 높이 상한(vh) 안에서 각자 스크롤 — 내용이 짧으면 자연 높이(고정 아님)
+     라 답답하지 않고, 배포/노드가 많을 때만 컬럼 안에서 스크롤돼 페이지를 밀지 않는다. */
+  .topo-graph .graphwrap,
+  .topo-table .tablewrap{max-height:72vh;overflow:auto}
+  .lbl-sm{font-size:10px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);
+    font-family:var(--mono);margin:0 0 7px}
   .graphwrap{overflow:auto;max-height:440px;border:1px solid var(--border);border-radius:9px;
     background:#0c1118;padding:6px 8px}
-  /* 와이드 화면에서 그래프가 컨테이너 폭만큼 늘어나 과하게 커지지 않게 상한을 둔다. */
-  .graphwrap svg{display:block;width:100%;height:auto;min-width:420px;max-width:600px;margin:0 auto}
+  /* 좌측 컬럼 폭에 맞춰 채우되(min 320) 스택 모드에선 과하게 커지지 않게 상한. */
+  .graphwrap svg{display:block;width:100%;height:auto;min-width:320px;max-width:600px;margin:0 auto}
   .glabel{font-family:var(--mono);font-size:9px;fill:var(--muted);
     text-transform:uppercase;letter-spacing:.08em}
   .gnode{cursor:pointer}              /* 클릭하면 포커스 고정(pin) */
@@ -231,20 +252,12 @@
 
   <div class="cards" id="cards"></div>
 
-  <section id="graph-sec" style="display:none">
+  <!-- 그래프(토폴로지)와 Deployments 표를 한 섹션에서 좌우로 — 하나의 필터가 둘을 함께 제어 -->
+  <section id="topo-sec">
     <div class="sec-title">Model ↔ Backend
-      <span class="src">model_name → api_base(Service) 라우팅 · ⇄ 공유 백엔드</span>
+      <span class="src">model_name → api_base(Service) 라우팅 · ⇄ 공유 백엔드 · /health · k8s replicas · GPU</span>
       <span class="filters">
-        <label class="toggle"><input type="checkbox" id="f-graph" checked> show graph</label>
-      </span>
-    </div>
-    <div class="graphwrap" id="graphwrap"></div>
-  </section>
-
-  <section id="deployments-sec">
-    <div class="sec-title">Deployments
-      <span class="src">/model/info api_base · /health status · k8s replicas · GPU</span>
-      <span class="filters">
+        <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
         <select id="f-status">
@@ -264,15 +277,28 @@
         <span class="fcount" id="f-count"></span>
       </span>
     </div>
-    <div class="tablewrap"><table id="deployments">
-      <thead></thead><tbody></tbody>
-    </table></div>
-    <div id="dep-err"></div>
+    <div class="topo-split" id="topo-split">
+      <div class="topo-graph" id="graph-col">
+        <p class="lbl-sm">라우팅 그래프</p>
+        <div class="graphwrap" id="graphwrap"></div>
+      </div>
+      <div class="topo-table" id="table-col">
+        <p class="lbl-sm">Deployments</p>
+        <div class="tablewrap"><table id="deployments">
+          <thead></thead><tbody></tbody>
+        </table></div>
+        <div id="dep-err"></div>
+      </div>
+    </div>
   </section>
 
   <section id="groups-sec">
-    <div class="sec-title">Model Groups <span class="src">/model_group/info</span></div>
-    <div class="tablewrap"><table id="groups"><thead></thead><tbody></tbody></table></div>
+    <details class="collapsible">
+      <summary class="sec-title"><span class="chev" aria-hidden="true">▸</span>Model Groups
+        <span class="src">/model_group/info</span>
+        <span class="grp-count" id="groups-count"></span></summary>
+      <div class="tablewrap"><table id="groups"><thead></thead><tbody></tbody></table></div>
+    </details>
   </section>
 
   <footer id="foot">model_monitor · 표준 라이브러리만 사용 · 데이터 출처는 LiteLLM + Kubernetes API</footer>
@@ -670,11 +696,14 @@ function render(snap){
   const uHide = !!snap.user_view;   // per-user 뷰는 내부 컬럼(MODE/SRC/API_BASE) 숨김
   const showGpu = !!s.gpu_known && !uHide;   // GPU 컬럼도 내부정보 — user 뷰 숨김
   const dt = $("#deployments");
+  // status/type 필터는 표와 그래프에 똑같이 적용한다(그래프도 필터된 집합만 그림).
+  const fS = $("#f-status").value, fT = $("#f-type").value;
+  const filterDep = d => (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT);
+  let graphDeps = [];   // 그래프가 그릴 deployment(= 표와 동일한 필터 결과)
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
-    const fS = $("#f-status").value, fT = $("#f-type").value;
-    const merged = all.filter(d=>
-      (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT));
+    const merged = all.filter(filterDep);
+    graphDeps = merged;
     $("#f-count").textContent = (fS||fT)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
@@ -721,31 +750,39 @@ function render(snap){
   $("#dep-err").innerHTML = (ll && ll.errors && ll.errors.length)
     ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
 
-  // Model ↔ Backend 그래프 (스냅샷 데이터만으로 그림 — 추가 수집 없음).
-  // per-user 뷰(uHide)는 내부 토폴로지(Service 이름)를 숨기므로 그래프도 감춘다.
-  const gsec = $("#graph-sec"), gwrap = $("#graphwrap");
-  const deps = (ll && ll.deployments) || [];
-  if(uHide || !deps.length){
-    gsec.style.display = "none";
-  } else if($("#f-graph").checked){
-    gsec.style.display = "";
-    gwrap.style.display = "";
-    gwrap.innerHTML = buildGraph(deps);
-    wireGraph(gwrap.querySelector("svg"));
+  // Model ↔ Backend 그래프 — 표와 같은 필터(graphDeps)를 좌측 컬럼에 그린다(추가 수집 없음).
+  // per-user 뷰(uHide)는 내부 토폴로지(Service 이름)를 숨기므로 그래프 컬럼과 토글을 감춘다.
+  // 그래프가 숨겨지면 split 에 no-graph 를 붙여 표가 컬럼 전체 폭을 차지하게 한다.
+  const split = $("#topo-split"), gcol = $("#graph-col"), gwrap = $("#graphwrap");
+  const glbl = $("#f-graph-lbl");
+  const hasDeps = !!(ll && ll.deployments && ll.deployments.length);
+  if(glbl) glbl.style.display = uHide ? "none" : "";
+  const showGraph = !uHide && hasDeps && $("#f-graph").checked;
+  if(showGraph){
+    gcol.style.display = "";
+    split.classList.remove("no-graph");
+    gwrap.innerHTML = graphDeps.length
+      ? buildGraph(graphDeps)
+      : '<div class="empty">필터 결과 없음</div>';
+    const svg = gwrap.querySelector("svg");
+    if(svg) wireGraph(svg);
   } else {
-    gsec.style.display = "";        // 섹션(토글)은 두고 그래프만 숨김
-    gwrap.style.display = "none";
+    gcol.style.display = "none";     // 그래프 숨김 → 표가 전체 폭
+    split.classList.add("no-graph");
+    gwrap.innerHTML = "";            // 숨긴 동안 이전 SVG/리스너 정리
   }
 
-  // groups
-  const gt = $("#groups");
+  // groups — 기본 접힘 섹션. 접혀 있어도 개수는 summary 뱃지로 보이게 한다.
+  const gt = $("#groups"), gc = $("#groups-count");
   if(ll && ll.groups && ll.groups.length){
+    if(gc) gc.textContent = ll.groups.length;
     gt.querySelector("thead").innerHTML="<tr><th>MODEL_GROUP</th><th>PROVIDERS</th><th>MODE</th></tr>";
     gt.querySelector("tbody").innerHTML = ll.groups.map(g=>
       '<tr><td class="name">'+esc(g.model_group)+"</td>"
       +'<td class="mono" style="color:var(--muted)">'+esc((g.providers||[]).join(", ")||"-")+"</td>"
       +"<td>"+esc(g.mode||"-")+"</td></tr>").join("");
   } else {
+    if(gc) gc.textContent = "0";
     gt.querySelector("thead").innerHTML="";
     gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
   }
