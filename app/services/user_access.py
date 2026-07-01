@@ -60,28 +60,37 @@ class AccessCache:
     """키별 접근 결과(`collect_user_access`)를 짧게 캐시 — 폴링 중복 호출 제거.
 
     캐시 키는 **원문 키가 아니라 sha256 해시**(키는 절대 저장 안 함).
-    **성공(ok=True) 응답만** 캐시한다 — 무효/만료 키는 매 요청 재검증되어 fail-closed
-    즉시성이 유지된다. 대신 취소/만료된 *유효했던* 키는 최대 TTL 동안 stale 할 수 있다.
+
+    성공(ok=True)은 `ttl`(길게, 기본 30s), 실패(무효/만료/네트워크)는 `fail_ttl`
+    (짧게, 기본 3s)로 **둘 다 캐시**한다. 실패도 캐시하는 이유: 대시보드가 5초마다
+    폴링하는데 실패를 캐시 안 하면 무효 키가 매 폴링마다 blocking LiteLLM 왕복
+    (/v1/models + /key/info, 각 timeout)을 새로 일으켜 스레드·CPU 를 잡아먹고
+    ingress 502 를 유발한다. fail_ttl 을 짧게 둬 fail-closed 즉시성은 유지한다
+    (무효→유효로 바뀐 키는 최대 fail_ttl 뒤 재검증). 네거티브 캐시는 접근을
+    **부여**하지 않고 실패 결과(빈 accessible)만 잠깐 재사용하므로 보안상 안전하다.
     """
 
-    def __init__(self, ttl=30.0, maxsize=512):
+    def __init__(self, ttl=30.0, maxsize=512, fail_ttl=3.0):
         self.ttl = ttl
+        self.fail_ttl = fail_ttl
         self.maxsize = maxsize
         self._d = {}            # sha256(key) -> (expiry, access)
         self._lock = threading.Lock()
 
     def get_or_collect(self, key, collect, now):
-        """캐시에 살아있으면 그대로, 아니면 collect() 호출 후(성공 시) 캐시."""
+        """캐시에 살아있으면 그대로, 아니면 collect() 후 결과별 TTL 로 캐시."""
         h = hashlib.sha256(key.encode("utf-8")).hexdigest()
         with self._lock:
             ent = self._d.get(h)
             if ent and ent[0] > now:
                 return ent[1]
         access = collect()
-        if isinstance(access, dict) and access.get("ok"):
-            with self._lock:
-                self._prune(now)
-                self._d[h] = (now + self.ttl, access)
+        if isinstance(access, dict):
+            ttl = self.ttl if access.get("ok") else self.fail_ttl
+            if ttl > 0:
+                with self._lock:
+                    self._prune(now)
+                    self._d[h] = (now + ttl, access)
         return access
 
     def _prune(self, now):

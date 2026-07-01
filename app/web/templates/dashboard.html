@@ -147,7 +147,9 @@
   .graphwrap svg{display:block;width:100%;height:auto;min-width:420px;max-width:600px;margin:0 auto}
   .glabel{font-family:var(--mono);font-size:9px;fill:var(--muted);
     text-transform:uppercase;letter-spacing:.08em}
+  .gnode{cursor:pointer}              /* 클릭하면 포커스 고정(pin) */
   .gnode rect{stroke-width:1.5}
+  .gnode.pinned rect{stroke:var(--accent);stroke-width:2.5}  /* 고정된 노드 표시 */
   .gnode .ntext{font-family:var(--mono);font-size:11px;font-weight:600;fill:var(--text)}
   .gnode .nsub{font-family:var(--mono);font-size:9px;fill:var(--faint)}
   .gnode.model rect{fill:rgba(110,139,255,.12);stroke:rgba(110,139,255,.55)}
@@ -519,6 +521,7 @@ function buildGraph(deps){
   let mnodes="";
   names.forEach(n=>{ const y=mY[n];
     mnodes+='<g class="gnode model" data-key="'+attrId(n)+'" data-kind="m">'
+      +'<title>'+esc(n)+'</title>'   // 잘린 이름(…) 전체를 네이티브 tooltip 으로
       +'<rect x="'+colL+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
       +'<text class="ntext" x="'+(colL+11)+'" y="'+(y+14)+'">'+esc(trunc(n,18))+'</text>'
       +'<text class="nsub" x="'+(colL+11)+'" y="'+(y+26)+'">model_name</text></g>'; });
@@ -527,6 +530,7 @@ function buildGraph(deps){
     const gtxt=(o.gpu!=null && o.gpu>0)?("  ·  "+gpuText(o.gpu,o.gpu_products)):"";
     const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" replicas"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
     snodes+='<g class="gnode be '+beNodeCls(o)+(sh?' shared':'')+'" data-key="'+attrId(k)+'" data-kind="b">'
+      +'<title>'+esc(o.label)+(sub?' — '+esc(sub):'')+'</title>'  // 전체 라벨+상태 tooltip
       +'<rect x="'+colR+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
       +'<text class="ntext" x="'+(colR+11)+'" y="'+(y+14)+'">'+esc(trunc(o.label,18))+'</text>'
       +'<text class="nsub" x="'+(colR+11)+'" y="'+(y+26)+'">'+esc(sub)+'</text>'
@@ -550,41 +554,50 @@ function wireGraph(svg){
   const nodeOf=(k,key)=>svg.querySelector('.gnode[data-kind="'+k+'"][data-key="'+key+'"]');
   const reroute=(ed,mN,bN,my,by)=>{const x1=ax(mN,"r"),x2=ax(bN,"l"),mx=(x1+x2)/2;
     ed.setAttribute("d","M"+x1+" "+my+" C"+mx+" "+my+" "+mx+" "+by+" "+x2+" "+by);};
+  let pinned=null;   // 클릭으로 고정된 노드(없으면 null) — hover 보다 우선
 
   const clear=()=>{svg.classList.remove("focusing");
-    nodes.forEach(n=>{n.classList.remove("on");n.style.transform="";});
+    nodes.forEach(n=>{n.classList.remove("on","pinned");n.style.transform="";});
     edges.forEach(ed=>{ed.classList.remove("on");ed.setAttribute("d",ed.dataset.d0);});};
 
-  nodes.forEach(node=>{
-    node.addEventListener("mouseenter",()=>{
-      const kind=node.dataset.kind, key=node.dataset.key;
-      svg.classList.add("focusing"); node.classList.add("on");
-      // 1) 연결된 간선과 반대쪽(상대 컬럼) 노드 수집
-      const matched=edges.filter(ed=>kind==="m"?ed.dataset.m===key:ed.dataset.b===key);
-      const others=[], oset=new Set();
-      matched.forEach(ed=>{ed.classList.add("on");
-        const o=nodeOf(kind==="m"?"b":"m", kind==="m"?ed.dataset.b:ed.dataset.m);
-        if(o&&!oset.has(o)){oset.add(o);o.classList.add("on");others.push(o);}});
-      // 2) 연결된 노드들을 hovered 노드 y 중심으로 끌어모은다(캔버스 밖이면 보정)
-      const Hc=cy(node), n=others.length, half=(n-1)/2*STEP;
-      const vbH=(svg.viewBox&&svg.viewBox.baseVal)?svg.viewBox.baseVal.height:0;
-      let shift=0;
-      if(vbH){ if(Hc-half<30) shift=30-(Hc-half);
-        else if(Hc+half>vbH-26) shift=(vbH-26)-(Hc+half); }
-      const ty=new Map();
-      others.forEach((o,i)=>{const y=Hc+shift+(i-(n-1)/2)*STEP; ty.set(o,y);
-        o.style.transform="translateY("+(y-cy(o))+"px)";});
-      // 3) 간선을 새 위치로 다시 그림(hovered 는 고정, 상대는 모인 위치)
-      matched.forEach(ed=>{
-        const o=nodeOf(kind==="m"?"b":"m", kind==="m"?ed.dataset.b:ed.dataset.m);
-        if(!o) return;
-        const oy=ty.has(o)?ty.get(o):cy(o);
-        const mN=kind==="m"?node:o, bN=kind==="b"?node:o;
-        reroute(ed, mN, bN, mN===node?Hc:oy, bN===node?Hc:oy);
-      });
+  // 한 노드에 포커스: 비연결 숨김 + 연결 노드 끌어모으기 + 간선 재배선. (먼저 clear 해서
+  // hover↔hover, pin 전환이 항상 깨끗하게 다시 그려지도록 한다.)
+  const apply=(node)=>{
+    clear();
+    const kind=node.dataset.kind, key=node.dataset.key;
+    svg.classList.add("focusing"); node.classList.add("on");
+    if(node===pinned) node.classList.add("pinned");
+    const matched=edges.filter(ed=>kind==="m"?ed.dataset.m===key:ed.dataset.b===key);
+    const others=[], oset=new Set();
+    matched.forEach(ed=>{ed.classList.add("on");
+      const o=nodeOf(kind==="m"?"b":"m", kind==="m"?ed.dataset.b:ed.dataset.m);
+      if(o&&!oset.has(o)){oset.add(o);o.classList.add("on");others.push(o);}});
+    const Hc=cy(node), n=others.length, half=(n-1)/2*STEP;
+    const vbH=(svg.viewBox&&svg.viewBox.baseVal)?svg.viewBox.baseVal.height:0;
+    let shift=0;
+    if(vbH){ if(Hc-half<30) shift=30-(Hc-half);
+      else if(Hc+half>vbH-26) shift=(vbH-26)-(Hc+half); }
+    const ty=new Map();
+    others.forEach((o,i)=>{const y=Hc+shift+(i-(n-1)/2)*STEP; ty.set(o,y);
+      o.style.transform="translateY("+(y-cy(o))+"px)";});
+    matched.forEach(ed=>{
+      const o=nodeOf(kind==="m"?"b":"m", kind==="m"?ed.dataset.b:ed.dataset.m);
+      if(!o) return;
+      const oy=ty.has(o)?ty.get(o):cy(o);
+      const mN=kind==="m"?node:o, bN=kind==="b"?node:o;
+      reroute(ed, mN, bN, mN===node?Hc:oy, bN===node?Hc:oy);
     });
-    node.addEventListener("mouseleave",clear);
+  };
+
+  // hover = 임시 프리뷰, click = 고정(pin). 고정 중엔 다른 노드를 hover 해 미리 보고,
+  // 벗어나면 고정 노드로 복귀. 고정 노드 재클릭 또는 빈 배경 클릭으로 해제.
+  nodes.forEach(node=>{
+    node.addEventListener("mouseenter",()=>apply(node));
+    node.addEventListener("mouseleave",()=>{ pinned?apply(pinned):clear(); });
+    node.addEventListener("click",(e)=>{ if(e&&e.stopPropagation)e.stopPropagation();
+      if(pinned===node){pinned=null;clear();} else {pinned=node;apply(node);} });
   });
+  svg.addEventListener("click",()=>{ if(pinned){pinned=null;clear();} });
 }
 
 function render(snap){
@@ -764,6 +777,7 @@ function showUvError(msg){
   setUvStatus("키 검증 실패", "bad");
 }
 
+let ticking=false;
 async function tick(){
   // 정지 스냅샷(/snapshot.html)으로 열렸으면 폴링 없이 박제된 데이터만 렌더한다.
   if(window.__SNAPSHOT__){
@@ -781,12 +795,19 @@ async function tick(){
     $("#livedot").style.background = "var(--warn)";
     return;
   }
+  // 이전 폴링이 아직 진행 중이면 겹쳐 쏘지 않는다(느린 응답 시 요청 누적 → 스레드·CPU
+  // 경합 → ingress 502 방지). setInterval 은 in-flight 여부를 모르므로 여기서 막는다.
+  if(ticking) return;
+  ticking = true;
+  // 폴링 주기보다 오래 끌면 client 측에서 중단해 누적을 끊는다(서버 timeout 과 별개).
+  const ac = new AbortController();
+  const abortTimer = setTimeout(()=>ac.abort(), Math.max(8000, REFRESH_MS*3));
   try{
     let snap;
     if(uvActive()){
       // 키는 헤더 전용(쿼리 금지). 매 요청에 실어 보내고 서버는 저장하지 않는다.
       const r = await fetch(BASE_PATH+"/api/snapshot/user",
-        {method:"POST", cache:"no-store",
+        {method:"POST", cache:"no-store", signal: ac.signal,
          headers:{"X-LiteLLM-Key": uvKey()}});
       snap = await r.json().catch(()=>({}));
       if(!r.ok){
@@ -798,14 +819,18 @@ async function tick(){
         : "내 모델만 보는 중 ("+(snap.accessible_count||0)+"개)", "ok");
     } else {
       // 레거시(키 필수 OFF): 무인증 global 뷰.
-      const r = await fetch(BASE_PATH+"/api/snapshot",{cache:"no-store"});
+      const r = await fetch(BASE_PATH+"/api/snapshot",{cache:"no-store", signal: ac.signal});
       snap = await r.json();
     }
     render(snap);
     $("#livedot").style.background = "var(--up)";
   }catch(e){
     $("#livedot").style.background = "var(--down)";
-    $("#updated").textContent = "수집 실패: "+e;
+    $("#updated").textContent = (e && e.name==="AbortError")
+      ? "수집 지연(응답이 느려 중단) — 다음 주기에 재시도" : "수집 실패: "+e;
+  }finally{
+    clearTimeout(abortTimer);
+    ticking = false;
   }
 }
 
