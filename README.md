@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.5** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
+**버전: v0.5.6** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -42,7 +42,7 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 > 보여주고(`group by model` 토글), 공유 백엔드는 `⇄ SHARED` 로 명시합니다. 상단 **Model ↔ Backend**
 > 그래프(`show graph` 토글)는 라우팅을 이분 그래프로 그려 공유 백엔드로 간선이 모이는 모습을
 > 한눈에 보여줍니다. 노드에 마우스를 올리면 **연결된 노드를 그 옆으로 끌어모으고 나머지는 숨겨**(v0.5.4)
-> 멀리 떨어져 있어도 무엇과 이어졌는지 바로 보입니다(간선도 모인 위치로 다시 그림). 헤드라인 **Replicas** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
+> 멀리 떨어져 있어도 무엇과 이어졌는지 바로 보입니다(간선도 모인 위치로 다시 그림). **노드를 클릭하면 그 배치를 고정(pin)해 얼려두어**, 끌어모은 노드 위로 마우스를 올려 값(이름·replicas·GPU tooltip)을 읽어도 배치가 흐트러지지 않습니다(v0.5.6 — 예전엔 hover 가 고정을 가로채 풀리는 것처럼 보였음). 헤드라인 **Replicas** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
 > 공유 백엔드가 모델 수만큼 이중 집계되지 않습니다. (UI 라벨은 `Replicas`/`REPLICAS` — k8s Pod=서빙 복제본.)
 
 > **GPU 개수 + 장치명 (v0.4.0)** — backend Pod 가 점유한 GPU 수(`resources.limits[nvidia.com/gpu]`
