@@ -589,11 +589,13 @@ function wireGraph(svg){
     });
   };
 
-  // hover = 임시 프리뷰, click = 고정(pin). 고정 중엔 다른 노드를 hover 해 미리 보고,
-  // 벗어나면 고정 노드로 복귀. 고정 노드 재클릭 또는 빈 배경 클릭으로 해제.
+  // hover = 임시 프리뷰, click = 고정(pin). 고정하면 그 배치가 그대로 얼어붙어,
+  // 끌어모은 노드 위로 마우스를 올려 값(<title> tooltip)을 읽어도 배치가 흐트러지지 않는다.
+  // (고정 중엔 hover 를 무시 — 예전엔 hover 가 포커스를 가로채 "풀리는" 것처럼 보였다.)
+  // 다른 노드로 옮기려면 그 노드를 클릭(재고정), 빈 배경/고정 노드 재클릭으로 해제.
   nodes.forEach(node=>{
-    node.addEventListener("mouseenter",()=>apply(node));
-    node.addEventListener("mouseleave",()=>{ pinned?apply(pinned):clear(); });
+    node.addEventListener("mouseenter",()=>{ if(!pinned) apply(node); });
+    node.addEventListener("mouseleave",()=>{ if(!pinned) clear(); });
     node.addEventListener("click",(e)=>{ if(e&&e.stopPropagation)e.stopPropagation();
       if(pinned===node){pinned=null;clear();} else {pinned=node;apply(node);} });
   });
