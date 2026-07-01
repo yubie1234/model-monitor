@@ -29,4 +29,10 @@ USER 10001
 EXPOSE 8088
 
 # 기본 실행: FastAPI 서비스. 설정은 환경변수(LITELLM_BASE_URL 등) / MONITOR_CONFIG_FILE 로 주입.
-ENTRYPOINT ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8088"]
+#
+# --timeout-keep-alive 75: nginx ingress 의 upstream keepalive(기본 60s)보다 길게 둔다.
+#   uvicorn 기본은 5s 라 5초 폴링 대시보드에선 uvicorn 이 유휴 연결을 닫는 순간 nginx 가
+#   그 연결을 재사용하려다 reset → 간헐 502. 업스트림(uvicorn)이 프록시(nginx)보다 늦게
+#   닫게 만들어(75>60) 경합을 없앤다.
+ENTRYPOINT ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8088", \
+            "--timeout-keep-alive", "75"]

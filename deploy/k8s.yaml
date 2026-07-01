@@ -89,7 +89,7 @@ metadata:
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "0.5.4"
+    app.kubernetes.io/version: "0.5.5"
 spec:
   replicas: 1
   selector:
@@ -99,7 +99,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "0.5.4"
+        app.kubernetes.io/version: "0.5.5"
     spec:
       serviceAccountName: model-monitor
       containers:

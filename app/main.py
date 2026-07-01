@@ -7,6 +7,8 @@
 HTTP 핸들러는 항상 마지막 캐시 스냅샷을 즉시 돌려준다.
 """
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -25,14 +27,29 @@ from app.services.user_access import AccessCache
 from app.web.routes import load_dashboard_html, router as web_router
 
 
+# to_thread(=기본 executor)에서 도는 동시 blocking 작업 상한.
+# 파이썬 기본 풀은 min(32, os.cpu_count()+4) 인데, 컨테이너에서 os.cpu_count() 는
+# cgroup limit 이 아니라 노드 전체 CPU 를 반환한다 → 파드가 수백 m CPU 로 throttle
+# 되는데도 스레드는 수십 개까지 뜬다. blocking LiteLLM 왕복(per-user 조회)이 몰리면
+# 그 스레드들이 이벤트 루프와 CPU 를 경합해 응답·readiness 프로브가 느려지고 ingress
+# 가 502 를 낸다. 수집(Refresher build_snapshot/health)+per-user 조회를 감당할 만큼만
+# 남기고 작게 묶는다.
+_COLLECT_THREADS = 8
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 기본 executor 를 작은 풀로 교체(to_thread 전부가 이걸 쓴다).
+    executor = ThreadPoolExecutor(
+        max_workers=_COLLECT_THREADS, thread_name_prefix="mm-collect")
+    asyncio.get_running_loop().set_default_executor(executor)
     refresher: Refresher = app.state.refresher
     await refresher.start()
     try:
         yield
     finally:
         await refresher.stop()
+        executor.shutdown(wait=False)
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:

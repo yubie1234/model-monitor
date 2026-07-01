@@ -481,7 +481,7 @@ class TestCollectUserAccess(unittest.TestCase):
 
 
 class TestAccessCache(unittest.TestCase):
-    """키별 접근 캐시 — 폴링 중복 호출 제거, 성공만 캐시, TTL 만료."""
+    """키별 접근 캐시 — 폴링 중복 호출 제거, 성공/실패 각각 TTL 만료."""
 
     def test_caches_success_and_skips_recollect(self):
         cache = m.AccessCache(ttl=30.0)
@@ -504,14 +504,29 @@ class TestAccessCache(unittest.TestCase):
         cache.get_or_collect("sk-x", collect, now=131.0)        # TTL 경과
         self.assertEqual(calls["n"], 2)
 
-    def test_failure_not_cached(self):
-        cache = m.AccessCache(ttl=30.0)
+    def test_failure_cached_briefly_then_revalidated(self):
+        # 실패(무효/만료 키)도 짧은 fail_ttl 동안 캐시 — 5초 폴링이 매번 blocking
+        # LiteLLM 왕복을 새로 일으켜 스레드·CPU 를 잡아먹고 502 나는 걸 막는다.
+        cache = m.AccessCache(ttl=30.0, fail_ttl=3.0)
         calls = {"n": 0}
         def collect():
             calls["n"] += 1
             return {"ok": False, "error": "401"}
         cache.get_or_collect("sk-bad", collect, now=100.0)
-        cache.get_or_collect("sk-bad", collect, now=101.0)      # 실패는 매번 재검증
+        cache.get_or_collect("sk-bad", collect, now=101.0)      # fail_ttl 내 → 캐시 재사용
+        self.assertEqual(calls["n"], 1)
+        cache.get_or_collect("sk-bad", collect, now=104.0)      # fail_ttl 경과 → 재검증
+        self.assertEqual(calls["n"], 2)
+
+    def test_failure_ttl_zero_disables_negative_cache(self):
+        # fail_ttl=0 이면 옛 동작(실패는 절대 캐시 안 함)으로 되돌아간다.
+        cache = m.AccessCache(ttl=30.0, fail_ttl=0.0)
+        calls = {"n": 0}
+        def collect():
+            calls["n"] += 1
+            return {"ok": False}
+        cache.get_or_collect("sk-bad", collect, now=100.0)
+        cache.get_or_collect("sk-bad", collect, now=100.5)      # 매번 재검증
         self.assertEqual(calls["n"], 2)
 
     def test_distinct_keys_distinct_entries(self):
