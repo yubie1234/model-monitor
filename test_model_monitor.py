@@ -60,6 +60,8 @@ m = types.SimpleNamespace(
     is_admin_key=_auth.is_admin_key,
     request_key=_auth.request_key,
     admin_ok=_auth.admin_ok,
+    bearer_token=_auth.bearer_token,
+    metrics_ok=_auth.metrics_ok,
     SnapshotStore=_state.SnapshotStore,
     Refresher=_state.Refresher,
     build_collector_settings=_build_cs,
@@ -704,6 +706,58 @@ class TestPrometheusMetrics(unittest.TestCase):
         self.assertEqual(parsed["model_monitor_backend_pods_desired_total"], ["5"])
         self.assertEqual(parsed['model_monitor_build_info{version="9.9.9"}'], ["1"])
 
+    def test_gpu_metrics_and_shared_service_dedup(self):
+        # X, Y 가 같은 (ns, svc1) 을 공유(로드밸런싱/라우팅) — 물리 GPU 는 동일하므로
+        # 총합은 1회만 집계돼야 한다. Z 는 다른 Service(B200).
+        ll = {"groups": [], "health": None, "deployments": [
+            {"model_name": "X", "api_base": "http://x/v1",
+             "namespace": "ns", "service": "svc1",
+             "backends_ready": 3, "backends_desired": 3,
+             "backend_source": "deployment",
+             "gpu_ready": 6, "gpu_products": {"H100": 6}},
+            {"model_name": "Y", "api_base": "http://x/v1",  # 같은 (ns, svc1) 공유
+             "namespace": "ns", "service": "svc1",
+             "backends_ready": 3, "backends_desired": 3,
+             "backend_source": "deployment",
+             "gpu_ready": 6, "gpu_products": {"H100": 6}},
+            {"model_name": "Z", "api_base": "http://z/v1",
+             "namespace": "ns", "service": "svc2",
+             "backends_ready": 1, "backends_desired": 1,
+             "backend_source": "deployment",
+             "gpu_ready": 2, "gpu_products": {"B200": 2}},
+        ]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "x", "litellm": ll, "backends": [],
+                "backend_count_enabled": True}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        # 총합: svc1(6) 은 1회만 + svc2(2) = 8, 이중 집계 아님.
+        self.assertEqual(parsed["model_monitor_backend_gpus_ready_total"], ["8"])
+        self.assertEqual(parsed["model_monitor_backend_gpus_known"], ["1"])
+        # 장치별(이기종): H100=6(공유 dedup), B200=2.
+        self.assertEqual(
+            parsed['model_monitor_backend_gpus_ready_by_device{device="H100"}'],
+            ["6"])
+        self.assertEqual(
+            parsed['model_monitor_backend_gpus_ready_by_device{device="B200"}'],
+            ["2"])
+        # 모델별: 공유 X/Y 는 각각 6 으로 노출(합산 금지 — total 이 정답).
+        self.assertEqual(
+            parsed['model_monitor_model_backend_gpus_ready'
+                   '{model="X",namespace="ns",service="svc1"}'], ["6"])
+        self.assertEqual(
+            parsed['model_monitor_model_backend_gpus_ready'
+                   '{model="Y",namespace="ns",service="svc1"}'], ["6"])
+
+    def test_gpu_unknown_emits_zero_flag(self):
+        # GPU 정보가 전혀 없으면 known=0, total=0, 장치별 series 도 없어야 한다.
+        parsed = self._parse(m.render_prometheus_metrics(self._snap()))
+        self.assertEqual(parsed["model_monitor_backend_gpus_known"], ["0"])
+        self.assertEqual(parsed["model_monitor_backend_gpus_ready_total"], ["0"])
+        self.assertFalse(
+            any(k.startswith("model_monitor_backend_gpus_ready_by_device")
+                for k in parsed))
+
     def test_duplicate_series_collapsed(self):
         # 회귀: LiteLLM 은 한 model_name 에 여러 deployment 를 둘 수 있다(로드밸런싱).
         # 같은 라벨 series 가 중복되면 Prometheus 스크레이프가 깨지므로 1개로 합쳐야 한다.
@@ -774,12 +828,13 @@ class TestPrometheusMetrics(unittest.TestCase):
 # FastAPI 없이도 검증 가능하다(라우트 자체는 통합 영역이라 제외).
 
 class _FakeRequest:
-    """auth 헬퍼 검증용 최소 request 더미(헤더 + app.state.admin_key 만)."""
+    """auth 헬퍼 검증용 최소 request 더미(헤더 + app.state 자격만)."""
 
-    def __init__(self, headers=None, admin_key=""):
+    def __init__(self, headers=None, admin_key="", metrics_token=""):
         self.headers = headers or {}
         self.app = types.SimpleNamespace(
-            state=types.SimpleNamespace(admin_key=admin_key))
+            state=types.SimpleNamespace(
+                admin_key=admin_key, metrics_token=metrics_token))
 
 
 class TestAuth(unittest.TestCase):
@@ -815,6 +870,46 @@ class TestAuth(unittest.TestCase):
         self.assertFalse(m.admin_ok(bad))
         nokey = _FakeRequest(admin_key="sk-admin")
         self.assertFalse(m.admin_ok(nokey))
+
+    def test_non_ascii_key_is_false_not_500(self):
+        # latin-1 로 디코딩된 non-ASCII 헤더가 TypeError(→500)를 내면 안 된다.
+        self.assertFalse(m.is_admin_key("sk-admin", "sk-café"))
+
+    def test_bearer_token_parses_and_strips(self):
+        req = _FakeRequest(headers={"Authorization": "Bearer  tok-123 "})
+        self.assertEqual(m.bearer_token(req), "tok-123")
+        # 대소문자 무관 스킴
+        req2 = _FakeRequest(headers={"Authorization": "bearer tok-123"})
+        self.assertEqual(m.bearer_token(req2), "tok-123")
+
+    def test_bearer_token_absent_or_other_scheme_is_empty(self):
+        self.assertEqual(m.bearer_token(_FakeRequest()), "")
+        basic = _FakeRequest(headers={"Authorization": "Basic dXNlcjpwdw=="})
+        self.assertEqual(m.bearer_token(basic), "")
+
+    def test_metrics_ok_admin_header_still_works(self):
+        req = _FakeRequest(headers={"X-LiteLLM-Key": "sk-admin"},
+                           admin_key="sk-admin", metrics_token="")
+        self.assertTrue(m.metrics_ok(req))
+
+    def test_metrics_ok_bearer_token(self):
+        ok = _FakeRequest(headers={"Authorization": "Bearer scrape-tok"},
+                          admin_key="sk-admin", metrics_token="scrape-tok")
+        self.assertTrue(m.metrics_ok(ok))
+        wrong = _FakeRequest(headers={"Authorization": "Bearer nope"},
+                             admin_key="sk-admin", metrics_token="scrape-tok")
+        self.assertFalse(m.metrics_ok(wrong))
+
+    def test_metrics_ok_fail_closed_without_token_config(self):
+        # 토큰 미설정이면 Bearer 로는 절대 못 연다(admin 키만 유효).
+        req = _FakeRequest(headers={"Authorization": "Bearer anything"},
+                           admin_key="sk-admin", metrics_token="")
+        self.assertFalse(m.metrics_ok(req))
+        # 토큰이 admin 키를 대체하지도 않는다(스냅샷/export 용 admin_ok 는 불변).
+        tok = _FakeRequest(headers={"X-LiteLLM-Key": "scrape-tok"},
+                           admin_key="sk-admin", metrics_token="scrape-tok")
+        self.assertFalse(m.admin_ok(tok))
+        self.assertFalse(m.metrics_ok(tok))  # 토큰은 Bearer 로만 인정
 
 
 class TestSnapshotStore(unittest.TestCase):
@@ -877,7 +972,8 @@ def _settings_ns(**over):
         k8s_api_server=None, k8s_token_file="/t/token", k8s_ca_file="/t/ca",
         k8s_insecure=False, k8s_timeout=5.0,
         user_view=False, user_view_show_internal=False,
-        user_view_cache_ttl=30.0, metrics=True, config_file=None,
+        user_view_cache_ttl=30.0, metrics=True, metrics_token=None,
+        config_file=None,
     )
     base.update(over)
     return types.SimpleNamespace(**base)
@@ -942,6 +1038,28 @@ class TestBuildCollectorSettings(unittest.TestCase):
             os.unlink(path)
         self.assertEqual(c["litellm_url"], "http://env-llm:4000")  # env 우선
         self.assertFalse(c["backend_count"])                       # env 우선
+
+    def test_metrics_token_env_beats_file(self):
+        cfg = {"metrics": {"enabled": True, "token": "file-tok"}}
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                c_file = m.build_collector_settings(_settings_ns(config_file=path))
+            with mock.patch.dict(os.environ,
+                                 {"MONITOR_METRICS_TOKEN": "env-tok"}, clear=True):
+                c_env = m.build_collector_settings(_settings_ns(
+                    metrics_token="env-tok", config_file=path))
+        finally:
+            os.unlink(path)
+        self.assertEqual(c_file["metrics_token"], "file-tok")  # 파일값 반영
+        self.assertEqual(c_env["metrics_token"], "env-tok")    # env 우선
+        # 기본값은 None(토큰 비활성 — Bearer 경로 fail-closed).
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(m.build_collector_settings(
+                _settings_ns())["metrics_token"])
 
 
 class TestVersionConsistency(unittest.TestCase):

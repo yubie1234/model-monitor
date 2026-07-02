@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.6** — FastAPI 서비스로 전환 (기능은 develop 0.4.0 동등 + 그 이상)
+**버전: v0.5.8** — GPU 메트릭/Grafana 관측성 + 그래프↔필터 동기화 + 키 필수 모드 /metrics Bearer 토큰(MONITOR_METRICS_TOKEN)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -134,8 +134,14 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   Pod 0** 인 함정 탐지, `avg_over_time(model_monitor_model_up[30d])` 로 모델별 가동률 산출.
 - **주의**: 한 `model_name` 에 여러 deployment(로드밸런싱)가 있으면 동일 라벨 series 가 중복될 수 있어
   내부적으로 합칩니다(상태는 DOWN 우선). 내부 `api_base` 는 라벨로 노출하지 않습니다(카디널리티·보안).
-- **키 필수 모드(`MONITOR_USER_VIEW=true`)** 에선 다른 global export 처럼 `/metrics` 도 **admin 키 헤더
-  (`X-LiteLLM-Key`)** 가 있어야 노출됩니다(Prometheus 스크레이프 설정에 헤더 추가).
+- **키 필수 모드(`MONITOR_USER_VIEW=true`)** 에선 `/metrics` 도 인증이 필요합니다. 두 가지 방법:
+  **① metrics 전용 Bearer 토큰(권장)** — `MONITOR_METRICS_TOKEN`(또는 설정 파일 `metrics.token`)을
+  설정하고 Prometheus 는 표준 `authorization`(Bearer) 인증으로 스크레이프합니다. PodMonitor 의
+  `authorization.credentials`(Secret 참조)로도 그대로 동작하며, 이 토큰으로는 metrics 만 열리고
+  스냅샷/export 는 열리지 않아 admin 키를 Prometheus 에 배포할 필요가 없습니다.
+  **② admin 키 헤더(`X-LiteLLM-Key`)** — 기존 방식(임의 헤더를 지원하는 스크레이퍼만 가능).
+  활성 PodMonitor + 토큰 Secret 은 [deploy/k8s.yaml](deploy/k8s.yaml), scrape_config
+  예시는 [deploy/prometheus-alerts.yaml](deploy/prometheus-alerts.yaml) 참고.
 
 #### Grafana / Prometheus 연동
 
@@ -185,6 +191,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_BACKEND_COUNT` | LB 뒤 backend Pod 개수 수집 (true) |
 | `MONITOR_GPU_INFO` | GPU 개수/장치명 수집 (true; Pod·Node 읽기 권한 필요) |
 | `MONITOR_METRICS` | Prometheus `/metrics` (true) |
+| `MONITOR_METRICS_TOKEN` | 키 필수 모드에서 `/metrics` 스크레이프용 Bearer 토큰 (미설정=admin 키만) |
 | `MONITOR_USER_VIEW` | 키 필수(per-user) 모드 — 키 입력해야 조회, admin 키는 전체 뷰 (false) |
 | `MONITOR_USER_VIEW_SHOW_INTERNAL` | per-user 뷰에서 내부 api_base/namespace 도 표시 (false=숨김) |
 | `MONITOR_USER_VIEW_CACHE_TTL` | 키별 접근(/v1/models) 캐시 TTL 초 (30) |

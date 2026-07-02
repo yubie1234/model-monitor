@@ -42,6 +42,10 @@ user_view:
 
 # --- Prometheus 메트릭(/metrics) ---
 # --serve 면 기본 ON. 캐시 스냅샷을 노출만 하므로 /api/snapshot 과 같은 수준의 정보.
-# 끄려면 enabled: false (또는 --no-metrics). user_view 켜진 경우 admin 키 헤더가 있어야 노출.
+# 끄려면 enabled: false (또는 --no-metrics).
+# user_view 켜진 경우 /metrics 인증 필요 — admin 키 헤더(X-LiteLLM-Key) 또는
+# 아래 token(Authorization: Bearer, Prometheus authorization/PodMonitor secretKeyRef 용).
+# token 은 metrics 만 열 수 있는 전용 자격(스냅샷/export 불가). env MONITOR_METRICS_TOKEN 우선.
 metrics:
   enabled: true
+  # token: "metrics-scrape-token-CHANGE-ME"

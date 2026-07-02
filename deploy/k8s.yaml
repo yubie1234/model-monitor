@@ -81,6 +81,22 @@ data:
       }
     }
 ---
+# /metrics 스크레이프용 Bearer 토큰 Secret — 항상 생성해 둔다.
+# 키 필수 모드(user_view)가 아니면 /metrics 는 인증을 요구하지 않으므로 있어도 무해하고,
+# user_view 를 켜는 순간 아래 PodMonitor(authorization)가 그대로 동작한다.
+# 값은 예시 — 운영에서는 반드시 랜덤 문자열로 교체할 것.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: model-monitor-metrics-token
+  namespace: model-monitor
+  labels:
+    app: model-monitor
+    app.kubernetes.io/name: model-monitor
+type: Opaque
+stringData:
+  token: "model-monitor-metrics-example-token-CHANGE-ME"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -89,7 +105,7 @@ metadata:
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "0.5.6"
+    app.kubernetes.io/version: "0.5.8"
 spec:
   replicas: 1
   selector:
@@ -99,7 +115,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "0.5.6"
+        app.kubernetes.io/version: "0.5.8"
     spec:
       serviceAccountName: model-monitor
       containers:
@@ -123,6 +139,13 @@ spec:
             # Ingress 가 prefix 를 rewrite 로 떼고 앱에 전달하지만, 대시보드 자기 호출 URL·
             # /docs 링크가 prefix 를 포함하도록 앱에도 같은 값을 알려준다.
             - { name: MONITOR_ROOT_PATH, value: "/service/model-monitor" }
+            # 키 필수 모드(user_view)에서 Prometheus 가 admin 키 없이 /metrics 를
+            # 스크레이프하게 하는 전용 Bearer 토큰(위 model-monitor-metrics-token Secret).
+            # 아래 PodMonitor authorization 과 같은 Secret 을 참조한다.
+            # user_view 를 안 쓰면 토큰은 무시되므로 항상 주입해 둔다.
+            - name: MONITOR_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef: { name: model-monitor-metrics-token, key: token }
           ports:
             - { containerPort: 8088, name: http }
           readinessProbe:
@@ -189,3 +212,43 @@ spec:
 #   tls:
 #     - hosts: [<도메인>]          # TLS 는 특정 도메인 필요(any-host 와 별개)
 #       secretName: model-monitor-tls
+---
+# PodMonitor (kube-prometheus-stack) — Service 를 거치지 않고 Pod 를 직접
+# 스크레이프한다(Pod:8088/metrics). ServiceMonitor 예시는 prometheus-alerts.yaml 참고
+# (둘 중 하나만 활성화).
+#
+# 주의: monitoring.coreos.com CRD 라서 Prometheus Operator(kube-prometheus-stack)가
+#   설치돼 있어야 이 문서가 apply 된다 — 없으면 이 리소스만 실패하고 나머지는 적용됨.
+# 발견 조건: `release` 라벨이 클러스터 Prometheus 의 podMonitorSelector 와 맞아야
+#   스크레이프된다(kube-prometheus-stack 기본은 release=<헬름 릴리스명> — 실제 값으로
+#   교체할 것). 네임스페이스도 podMonitorNamespaceSelector 범위 안이어야 한다.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: model-monitor
+  namespace: model-monitor
+  labels:
+    release: kube-prometheus-stack     # ← Prometheus podMonitorSelector 에 맞게 교체
+spec:
+  selector:
+    matchLabels: { app: model-monitor }   # 위 Deployment 파드 라벨
+  podMetricsEndpoints:
+    - port: http            # 컨테이너 포트 이름(containerPort 8088, name: http)
+      path: /metrics        # MONITOR_ROOT_PATH 는 self-URL 힌트일 뿐, 실제 라우트는 /metrics
+      interval: 30s         # model-monitor refresh(5s)보다 길게 — 스크레이프는 캐시만 포맷해 가볍다
+      # job 라벨 고정: ModelMonitorDown 알럿(prometheus-alerts.yaml)이
+      # up{job="model-monitor"} 를 본다. PodMonitor 기본 job 라벨은 이 리소스 이름
+      # 기반이라, 고정하지 않으면 알럿이 안 맞는다.
+      relabelings:
+        - targetLabel: job
+          replacement: model-monitor
+      # 키 필수 모드(MONITOR_USER_VIEW=true)에서는 /metrics 인증이 필요하다.
+      # PodMonitor 는 임의 요청 헤더(X-LiteLLM-Key)를 못 넣지만, 표준 Bearer 인증은
+      # 지원한다. 위에서 상시 생성하는 model-monitor-metrics-token Secret 을 그대로
+      # 참조하므로 상시 활성으로 둔다 — user_view 미사용 시 /metrics 는 인증을
+      # 요구하지 않아 Bearer 헤더가 붙어도 무해하다.
+      authorization:
+        type: Bearer
+        credentials:
+          name: model-monitor-metrics-token   # 위 Secret
+          key: token
