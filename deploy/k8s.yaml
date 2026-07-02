@@ -81,6 +81,22 @@ data:
       }
     }
 ---
+# /metrics 스크레이프용 Bearer 토큰 Secret — 항상 생성해 둔다.
+# 키 필수 모드(user_view)가 아니면 /metrics 는 인증을 요구하지 않으므로 있어도 무해하고,
+# user_view 를 켜는 순간 PodMonitor(prometheus-alerts.yaml authorization)가 그대로 동작한다.
+# 값은 예시 — 운영에서는 반드시 랜덤 문자열로 교체할 것.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: model-monitor-metrics-token
+  namespace: model-monitor
+  labels:
+    app: model-monitor
+    app.kubernetes.io/name: model-monitor
+type: Opaque
+stringData:
+  token: "model-monitor-metrics-example-token-CHANGE-ME"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -124,12 +140,12 @@ spec:
             # /docs 링크가 prefix 를 포함하도록 앱에도 같은 값을 알려준다.
             - { name: MONITOR_ROOT_PATH, value: "/service/model-monitor" }
             # 키 필수 모드(user_view)에서 Prometheus 가 admin 키 없이 /metrics 를
-            # 스크레이프하게 하는 전용 Bearer 토큰. prometheus-alerts.yaml 의
-            # model-monitor-metrics-token Secret(PodMonitor authorization)과 같은 값.
-            # user_view 를 안 쓰면 불필요.
-            # - name: MONITOR_METRICS_TOKEN
-            #   valueFrom:
-            #     secretKeyRef: { name: model-monitor-metrics-token, key: token }
+            # 스크레이프하게 하는 전용 Bearer 토큰(위 model-monitor-metrics-token Secret).
+            # PodMonitor authorization(prometheus-alerts.yaml)과 같은 Secret 을 참조한다.
+            # user_view 를 안 쓰면 토큰은 무시되므로 항상 주입해 둔다.
+            - name: MONITOR_METRICS_TOKEN
+              valueFrom:
+                secretKeyRef: { name: model-monitor-metrics-token, key: token }
           ports:
             - { containerPort: 8088, name: http }
           readinessProbe:

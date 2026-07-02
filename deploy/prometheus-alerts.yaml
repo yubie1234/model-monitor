@@ -71,29 +71,22 @@ spec:
           replacement: model-monitor
       # 키 필수 모드(MONITOR_USER_VIEW=true)에서는 /metrics 인증이 필요하다.
       # PodMonitor 는 임의 요청 헤더(X-LiteLLM-Key)를 못 넣지만, 표준 Bearer 인증은
-      # 지원한다 — 모니터에 MONITOR_METRICS_TOKEN 을 설정하고 아래 주석을 활성화:
-      # (Secret 은 이 PodMonitor 와 같은 네임스페이스에 두고, 모니터 Deployment 의
-      #  MONITOR_METRICS_TOKEN 과 같은 값이어야 한다. 예시는 아래 1c 참고.)
-      # authorization:
-      #   type: Bearer
-      #   credentials:
-      #     name: model-monitor-metrics-token   # Secret 이름
-      #     key: token                          # Secret 키
+      # 지원한다. 토큰 Secret(model-monitor-metrics-token)은 k8s.yaml 에서 항상
+      # 생성되고 Deployment env MONITOR_METRICS_TOKEN 으로도 주입된다 — 그래서
+      # 아래 authorization 을 상시 활성으로 둔다. user_view 를 안 쓰면 /metrics 는
+      # 인증을 요구하지 않으므로 Bearer 헤더가 붙어도 무해하다.
+      authorization:
+        type: Bearer
+        credentials:
+          name: model-monitor-metrics-token   # Secret 이름 (k8s.yaml 에서 생성)
+          key: token                          # Secret 키
 
-# === 1c) 키 필수 모드용 metrics 토큰 Secret (선택) ==========================
-# MONITOR_USER_VIEW=true 일 때만 필요. 같은 값을 두 곳에 준다:
-#   1) 모니터 Deployment 의 env MONITOR_METRICS_TOKEN (k8s.yaml — secretKeyRef 권장)
+# === 1c) 키 필수 모드용 metrics 토큰 Secret ================================
+# Secret 정의는 k8s.yaml(core 매니페스트)로 이동 — 항상 생성된다(기본값은 예시
+# 문자열, 운영에서는 교체). 같은 Secret 을 두 곳이 참조한다:
+#   1) 모니터 Deployment 의 env MONITOR_METRICS_TOKEN (k8s.yaml secretKeyRef)
 #   2) 위 PodMonitor 의 authorization.credentials
 # LiteLLM admin 키가 아니라 metrics 조회 전용 토큰이므로 유출 파급이 작다.
-# ---
-# apiVersion: v1
-# kind: Secret
-# metadata:
-#   name: model-monitor-metrics-token
-#   namespace: model-monitor
-# type: Opaque
-# stringData:
-#   token: "CHANGE-ME-random-long-string"
 
 # === 2) 알림 룰 (PrometheusRule / rule_files) ==============================
 ---
