@@ -58,6 +58,6 @@ def metrics_ok(request: Request):
     """
     if admin_ok(request):
         return True
-    token = getattr(request.app.state, "metrics_token", "") or ""
+    token = getattr(request.app.state, "metrics_token", "")
     presented = bearer_token(request)
     return bool(token) and bool(presented) and _ct_eq(presented, token)
