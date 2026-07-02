@@ -140,7 +140,8 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   `authorization.credentials`(Secret 참조)로도 그대로 동작하며, 이 토큰으로는 metrics 만 열리고
   스냅샷/export 는 열리지 않아 admin 키를 Prometheus 에 배포할 필요가 없습니다.
   **② admin 키 헤더(`X-LiteLLM-Key`)** — 기존 방식(임의 헤더를 지원하는 스크레이퍼만 가능).
-  구성 예시는 [deploy/prometheus-alerts.yaml](deploy/prometheus-alerts.yaml) 참고.
+  활성 PodMonitor + 토큰 Secret 은 [deploy/k8s.yaml](deploy/k8s.yaml), scrape_config
+  예시는 [deploy/prometheus-alerts.yaml](deploy/prometheus-alerts.yaml) 참고.
 
 #### Grafana / Prometheus 연동
 
