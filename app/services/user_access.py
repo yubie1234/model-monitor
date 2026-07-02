@@ -7,6 +7,7 @@
 
 import copy
 import hashlib
+import secrets
 import threading
 
 from app.core.http import http_get_json
@@ -102,12 +103,36 @@ class AccessCache:
             self._d.pop(next(iter(self._d)), None)
 
 
+# 익명 backend 식별자용 프로세스 솔트. 솔트 없이 (ns,svc)를 해시하면 흔한 서비스
+# 이름 사전대입으로 역산될 수 있어 비-admin 노출에 부적합하다. 재기동마다 값이
+# 바뀌지만 backend_ref 는 스냅샷 내 그룹핑(그래프/⇄) 전용이라 무방하다.
+_REF_SALT = secrets.token_hex(8)
+
+
+def _backend_ref(d):
+    """(ns,svc) 기반 익명 백엔드 식별자(8자 hex). 식별 불가면 None.
+
+    per-user 뷰는 Service/api_base 를 숨기지만, '어떤 deployment 들이 같은
+    백엔드를 공유하는가' 토폴로지는 이 값으로 유지된다 — 이름 노출 없이
+    Model↔Backend 그래프와 공유(⇄) 표시를 그릴 수 있게 한다.
+    """
+    basis = "%s/%s" % (d.get("namespace") or "", d.get("service") or "")
+    if basis == "/":
+        basis = d.get("api_base") or ""
+    if not basis:
+        return None
+    return hashlib.sha256((_REF_SALT + basis).encode("utf-8")).hexdigest()[:8]
+
+
 def _redact_deployment_for_user(d):
     """per-user 뷰에서 내부 토폴로지(api_base/underlying/namespace/내부 URL)를 떼고
-    상태·종류·backend Pod 수만 남긴다(비-admin 에 클러스터 구조 비노출)."""
+    상태·종류·backend Pod 수만 남긴다(비-admin 에 클러스터 구조 비노출).
+    백엔드 식별은 익명 backend_ref 로만 제공한다."""
     return {
         "model_name": d.get("model_name"),
         "type": d.get("type", "-"),
+        "network_type": d.get("network_type", "-"),
+        "backend_type": d.get("backend_type", "-"),
         "status": d.get("status", "?"),
         "status_source": d.get("status_source"),
         "backends_ready": d.get("backends_ready"),
@@ -115,6 +140,7 @@ def _redact_deployment_for_user(d):
         "backend_source": d.get("backend_source"),
         "scale_to_zero": d.get("scale_to_zero"),
         "mode": d.get("mode"),
+        "backend_ref": _backend_ref(d),
     }
 
 

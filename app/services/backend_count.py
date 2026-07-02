@@ -228,6 +228,7 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     out = {"backends_ready": None, "backends_desired": None,
            "backend_source": "none", "mode": "Unknown",
            "scale_to_zero": False, "namespace": None, "service": None,
+           "network_type": "-",     # kserve | service | external | '-'(판정 불가)
            "k8s_error": None,
            "gpu_ready": None, "gpu_products": {}, "gpu_error": None}
     api_base = deployment.get("api_base")
@@ -240,6 +241,7 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     out["service"] = parsed["service"]
     if parsed["kind"] != "k8s-svc" or not parsed["service"]:
         out["backend_source"] = "external"
+        out["network_type"] = "external"
         return out
 
     if not client.enabled:
@@ -251,10 +253,21 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     activator_ns = settings.get("activator_namespace", "knative-serving")
     errors = []
 
-    info, _ = detect_mode_and_revision(client, ns, svc)
+    info, isvc_err = detect_mode_and_revision(client, ns, svc)
     out["mode"] = info["mode"]
     isvc, revision = info["isvc"], info["revision"]
     serverless = _is_serverless(info["mode"], revision)
+
+    # 네트워크 타입 — 문자열 추측이 아니라 k8s 사실로 판정한다.
+    # ISVC 조회 성공 = KServe 기반. 404 = ISVC 없음(단순 Service).
+    # 그 외 실패(RBAC/CRD 미설치/타임아웃)는 판정 불가('-')로 두고 원인을 남긴다
+    # — 잘못된 확신보다 미상이 낫다(개수의 '?' 정책과 동일).
+    if info["found"]:
+        out["network_type"] = "kserve"
+    elif isvc_err and "404" not in isvc_err:
+        errors.append("isvc: %s" % isvc_err)
+    else:
+        out["network_type"] = "service"
 
     def setres(r):
         out["backends_ready"] = r["ready"]
@@ -325,6 +338,11 @@ def resolve_backend_count(deployment, client, settings, cache=None):
             out["gpu_ready"] = g["gpu_ready"]
             out["gpu_products"] = g["gpu_products"]
             out["gpu_error"] = g["gpu_error"]
+            # Pod 컨테이너(이미지/커맨드) 기반 엔진 판정 — 이름 휴리스틱보다
+            # 정확하므로 있으면 litellm 쪽 backend_type 을 덮어쓴다.
+            if g.get("engine"):
+                out["backend_type"] = g["engine"]
+                out["backend_type_source"] = "pod"
         except Exception as e:  # noqa: BLE001
             out["gpu_error"] = "%s: %s" % (type(e).__name__, e)
 

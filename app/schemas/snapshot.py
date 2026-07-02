@@ -36,7 +36,11 @@ class Deployment(_Loose):
     underlying: Optional[str] = None
     api_base: Optional[str] = None
     id: Optional[str] = None
-    type: Optional[str] = None
+    type: Optional[str] = None            # (레거시) 혼합 분류 — 호환용 유지
+    network_type: Optional[str] = None    # kserve | service | external | '-'
+    backend_type: Optional[str] = None    # vllm | sglang | '-'
+    backend_type_source: Optional[str] = None   # pod(컨테이너 이미지) | name(휴리스틱)
+    backend_ref: Optional[str] = None     # per-user 뷰 전용: 익명 백엔드 식별자
     backends_ready: Optional[int] = None
     backends_desired: Optional[int] = None
     backend_source: Optional[str] = None
