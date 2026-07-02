@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     # --- Prometheus /metrics ---
     metrics: bool = Field(
         True, validation_alias=AliasChoices("MONITOR_METRICS"))
+    # 키 필수 모드에서 /metrics 스크레이프용 Bearer 토큰(admin 키 없이 인증).
+    # Prometheus scrape 의 authorization credentials / PodMonitor secretKeyRef 로 전달.
+    metrics_token: Optional[str] = Field(
+        None, validation_alias=AliasChoices("MONITOR_METRICS_TOKEN"))
 
     # --- 설정 파일 경로 (중첩 설정 출처) ---
     config_file: Optional[str] = Field(
@@ -208,6 +212,9 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
         "metrics": _pick(
             _env_set("MONITOR_METRICS"),
             settings.metrics, mt.get("enabled"), True),
+        "metrics_token": _pick(
+            _env_set("MONITOR_METRICS_TOKEN"),
+            settings.metrics_token, mt.get("token"), None),
     }
 
 

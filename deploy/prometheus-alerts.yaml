@@ -15,13 +15,14 @@
 #     scrape_interval: 30s          # model-monitor refresh interval 과 맞추거나 약간 길게
 #     static_configs:
 #       - targets: ["model-monitor:8088"]
-#     # MONITOR_USER_VIEW=true("키 필수 모드")로 띄운 경우, /metrics 도 admin 키 헤더가 필요하다.
-#     # 그때만 아래 헤더를 추가한다(평문 노출 방지 위해 TLS 뒤에서만).
-#     # authorization:
-#     #   credentials_file: /etc/prometheus/litellm-admin-key   # 또는
-#     # http_headers:
-#     #   X-LiteLLM-Key:
-#     #     values: ["sk-admin-..."]
+#     # MONITOR_USER_VIEW=true("키 필수 모드")로 띄운 경우, /metrics 는 인증이 필요하다.
+#     # LiteLLM admin 키를 Prometheus 에 배포하지 말고, 모니터에 MONITOR_METRICS_TOKEN
+#     # (metrics 조회만 가능한 전용 토큰)을 설정한 뒤 표준 Bearer 인증으로 스크레이프한다.
+#     # (평문 노출 방지 위해 TLS 뒤에서만.)
+#     # authorization:                                          # Authorization: Bearer <token>
+#     #   credentials_file: /etc/prometheus/model-monitor-metrics-token
+#     # (admin 키 헤더 X-LiteLLM-Key 도 여전히 유효하지만 권장하지 않음 — 유출 시
+#     #  metrics 만이 아니라 전체 스냅샷/export 가 열린다.)
 
 # k8s 에서 ServiceMonitor(kube-prometheus-stack)를 쓰면(PodMonitor 대신 Service 경유):
 # ---
@@ -68,9 +69,31 @@ spec:
       relabelings:
         - targetLabel: job
           replacement: model-monitor
-      # 참고: MONITOR_USER_VIEW=true 로 띄우면 /metrics 에 X-LiteLLM-Key(admin) 헤더가
-      # 필요한데 PodMonitor 는 임의 요청 헤더를 못 넣는다. 그 모드에서는 user-view 를
-      # 끄거나(이 배포 기본) 별도 스크레이프 방식을 써야 한다.
+      # 키 필수 모드(MONITOR_USER_VIEW=true)에서는 /metrics 인증이 필요하다.
+      # PodMonitor 는 임의 요청 헤더(X-LiteLLM-Key)를 못 넣지만, 표준 Bearer 인증은
+      # 지원한다 — 모니터에 MONITOR_METRICS_TOKEN 을 설정하고 아래 주석을 활성화:
+      # (Secret 은 이 PodMonitor 와 같은 네임스페이스에 두고, 모니터 Deployment 의
+      #  MONITOR_METRICS_TOKEN 과 같은 값이어야 한다. 예시는 아래 1c 참고.)
+      # authorization:
+      #   type: Bearer
+      #   credentials:
+      #     name: model-monitor-metrics-token   # Secret 이름
+      #     key: token                          # Secret 키
+
+# === 1c) 키 필수 모드용 metrics 토큰 Secret (선택) ==========================
+# MONITOR_USER_VIEW=true 일 때만 필요. 같은 값을 두 곳에 준다:
+#   1) 모니터 Deployment 의 env MONITOR_METRICS_TOKEN (k8s.yaml — secretKeyRef 권장)
+#   2) 위 PodMonitor 의 authorization.credentials
+# LiteLLM admin 키가 아니라 metrics 조회 전용 토큰이므로 유출 파급이 작다.
+# ---
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: model-monitor-metrics-token
+#   namespace: model-monitor
+# type: Opaque
+# stringData:
+#   token: "CHANGE-ME-random-long-string"
 
 # === 2) 알림 룰 (PrometheusRule / rule_files) ==============================
 ---

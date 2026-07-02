@@ -15,9 +15,15 @@ if TYPE_CHECKING:  # 타입 힌트 전용 — auth 로직 자체는 FastAPI 없�
 KEY_HEADER = "X-LiteLLM-Key"
 
 
+def _ct_eq(a, b):
+    """상수시간 비교 — str 그대로 비교하면 non-ASCII 헤더에 TypeError(→500)가
+    나므로 bytes 로 인코딩해 비교한다(틀린 키는 조용히 False)."""
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
 def is_admin_key(admin_key, key):
     """모니터 구동 admin 키와 동일하면 True (상수시간 비교)."""
-    return bool(admin_key) and bool(key) and hmac.compare_digest(key, admin_key)
+    return bool(admin_key) and bool(key) and _ct_eq(key, admin_key)
 
 
 def request_key(request: Request):
@@ -29,3 +35,29 @@ def admin_ok(request: Request):
     """export/잠긴 global 접근 허용 여부 — admin 키 헤더가 맞아야 True."""
     return is_admin_key(getattr(request.app.state, "admin_key", ""),
                         request_key(request))
+
+
+def bearer_token(request: Request):
+    """Authorization: Bearer <token> 값. Prometheus scrape 설정의 `authorization`
+    (PodMonitor 는 secretKeyRef)이 이 형태로 보낸다 — 임의 헤더가 안 되는
+    스크레이퍼도 표준 방식으로 인증할 수 있다."""
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth[:7].lower() == "bearer ":
+        return auth[7:].strip()
+    return ""
+
+
+def metrics_ok(request: Request):
+    """키 필수 모드에서 /metrics 스크레이프 허용 여부.
+
+    admin 키 헤더(X-LiteLLM-Key) **또는** metrics 전용 Bearer 토큰
+    (MONITOR_METRICS_TOKEN / metrics.token) 중 하나가 맞으면 True.
+    LiteLLM admin 키를 Prometheus 에 배포하지 않고도 스크레이프를 허용하기 위한
+    별도 자격이다(메트릭 조회만 가능, 스냅샷/export 는 열리지 않음).
+    토큰 미설정이면 Bearer 경로는 fail-closed(admin 키만 유효).
+    """
+    if admin_ok(request):
+        return True
+    token = getattr(request.app.state, "metrics_token", "")
+    presented = bearer_token(request)
+    return bool(token) and bool(presented) and _ct_eq(presented, token)
