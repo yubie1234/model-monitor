@@ -12,7 +12,7 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from app.auth import admin_ok, is_admin_key, request_key
+from app.auth import admin_ok, is_admin_key, metrics_ok, request_key
 from app.schemas.snapshot import Snapshot
 from app.services.prometheus import render_prometheus_metrics
 from app.services.user_access import collect_user_access, filter_snapshot_for_user
@@ -93,9 +93,12 @@ async def metrics(request: Request):
     st = request.app.state
     if not st.metrics_on:
         return PlainTextResponse("not found", status_code=404)
-    # 키 필수 모드면 다른 global export 처럼 admin 키 헤더가 있어야 노출.
-    if st.user_view_on and not admin_ok(request):
-        return PlainTextResponse("metrics 는 admin 키가 필요합니다.", status_code=403)
+    # 키 필수 모드면 admin 키 헤더 또는 metrics 전용 Bearer 토큰이 있어야 노출
+    # (MONITOR_METRICS_TOKEN — Prometheus authorization/PodMonitor secretKeyRef 용).
+    if st.user_view_on and not metrics_ok(request):
+        return PlainTextResponse(
+            "metrics 는 admin 키(X-LiteLLM-Key) 또는 metrics 토큰"
+            "(Authorization: Bearer)이 필요합니다.", status_code=403)
     snap = await st.store.get()
     return PlainTextResponse(
         render_prometheus_metrics(snap),

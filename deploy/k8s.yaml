@@ -89,7 +89,7 @@ metadata:
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "0.5.6"
+    app.kubernetes.io/version: "0.5.8"
 spec:
   replicas: 1
   selector:
@@ -99,7 +99,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "0.5.6"
+        app.kubernetes.io/version: "0.5.8"
     spec:
       serviceAccountName: model-monitor
       containers:
@@ -123,6 +123,13 @@ spec:
             # Ingress 가 prefix 를 rewrite 로 떼고 앱에 전달하지만, 대시보드 자기 호출 URL·
             # /docs 링크가 prefix 를 포함하도록 앱에도 같은 값을 알려준다.
             - { name: MONITOR_ROOT_PATH, value: "/service/model-monitor" }
+            # 키 필수 모드(user_view)에서 Prometheus 가 admin 키 없이 /metrics 를
+            # 스크레이프하게 하는 전용 Bearer 토큰. prometheus-alerts.yaml 의
+            # model-monitor-metrics-token Secret(PodMonitor authorization)과 같은 값.
+            # user_view 를 안 쓰면 불필요.
+            # - name: MONITOR_METRICS_TOKEN
+            #   valueFrom:
+            #     secretKeyRef: { name: model-monitor-metrics-token, key: token }
           ports:
             - { containerPort: 8088, name: http }
           readinessProbe:
