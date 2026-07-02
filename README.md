@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.8** — GPU 메트릭/Grafana 관측성 + 그래프↔필터 동기화 + 키 필수 모드 /metrics Bearer 토큰(MONITOR_METRICS_TOKEN)
+**버전: v0.5.9** — 키 필수 모드에서 키 지우기/검증 실패 시 라우팅 그래프 잔상이 남던 문제 수정
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
