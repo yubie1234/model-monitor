@@ -328,6 +328,19 @@ const UV_KEY = "llm_monitor_key";  // 키는 sessionStorage 에만(탭 닫으면
 const $ = (s)=>document.querySelector(s);
 let lastSnap = null;   // 필터 변경 시 재수집 없이 다시 렌더하려고 보관
 
+// 그래프에서 클릭으로 고정(pin)한 노드의 정체성 {kind,key}. wireGraph 지역 상태로만
+// 두면 5초 폴링 재렌더(innerHTML 교체)마다 풀린다 — 렌더 밖에 보관하고 재렌더 후
+// 복원한다. sessionStorage 라 브라우저 새로고침(F5)에도 유지(탭 닫으면 소멸).
+let graphPin = null;
+try{ graphPin = JSON.parse(sessionStorage.getItem("mm_graph_pin")||"null"); }
+catch(e){ graphPin = null; }
+function saveGraphPin(){
+  try{
+    if(graphPin) sessionStorage.setItem("mm_graph_pin", JSON.stringify(graphPin));
+    else sessionStorage.removeItem("mm_graph_pin");
+  }catch(e){}
+}
+
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
 
@@ -686,9 +699,20 @@ function wireGraph(svg){
     node.addEventListener("mouseenter",()=>{ if(!pinned) apply(node); });
     node.addEventListener("mouseleave",()=>{ if(!pinned) clear(); });
     node.addEventListener("click",(e)=>{ if(e&&e.stopPropagation)e.stopPropagation();
-      if(pinned===node){pinned=null;clear();} else {pinned=node;apply(node);} });
+      if(pinned===node){pinned=null;graphPin=null;saveGraphPin();clear();}
+      else {pinned=node;graphPin={kind:node.dataset.kind,key:node.dataset.key};
+            saveGraphPin();apply(node);} });
   });
-  svg.addEventListener("click",()=>{ if(pinned){pinned=null;clear();} });
+  svg.addEventListener("click",()=>{
+    if(pinned){pinned=null;graphPin=null;saveGraphPin();clear();} });
+
+  // 재렌더(5초 폴링/필터 변경/F5) 후 고정 복원: 같은 (kind,key) 노드가 아직 있으면
+  // 다시 pin + 배치 적용. 노드가 잠시 사라져도(필터/스냅샷 변화) graphPin 은 유지 —
+  // 명시적 해제(배경/재클릭) 전까지는 노드가 돌아오면 다시 고정된다.
+  if(graphPin){
+    const n=nodeOf(graphPin.kind, graphPin.key);
+    if(n){ pinned=n; apply(n); }
+  }
 }
 
 function render(snap){
