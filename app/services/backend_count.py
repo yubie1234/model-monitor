@@ -228,6 +228,8 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     out = {"backends_ready": None, "backends_desired": None,
            "backend_source": "none", "mode": "Unknown",
            "scale_to_zero": False, "namespace": None, "service": None,
+           "network_type": "-",     # kserve | service | external | '-'(판정 불가)
+           "network_type_error": None,   # '-' 일 때 ISVC 조회 실패 원인
            "k8s_error": None,
            "gpu_ready": None, "gpu_products": {}, "gpu_error": None}
     api_base = deployment.get("api_base")
@@ -240,6 +242,7 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     out["service"] = parsed["service"]
     if parsed["kind"] != "k8s-svc" or not parsed["service"]:
         out["backend_source"] = "external"
+        out["network_type"] = "external"
         return out
 
     if not client.enabled:
@@ -251,10 +254,28 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     activator_ns = settings.get("activator_namespace", "knative-serving")
     errors = []
 
-    info, _ = detect_mode_and_revision(client, ns, svc)
+    info, isvc_err = detect_mode_and_revision(client, ns, svc)
     out["mode"] = info["mode"]
     isvc, revision = info["isvc"], info["revision"]
     serverless = _is_serverless(info["mode"], revision)
+
+    # 네트워크 타입 — 문자열 추측이 아니라 k8s 사실로 판정한다.
+    # ISVC 조회 성공 = KServe 기반. HTTP 404 = ISVC 없음(단순 Service. CRD 미설치도
+    # 404 인데, KServe 가 없는 클러스터면 service 가 맞다). 그 외 실패(RBAC/타임아웃
+    # /프록시 오류)는 판정 불가('-')로 두고 network_type_error 에 원인을 남긴다 —
+    # 잘못된 확신보다 미상이 낫다(개수의 '?' 정책과 동일).
+    # 판정은 "HTTP 404" 접두사(K8sClient.get 의 HTTPError 포맷)로만 — 부분문자열
+    # 매칭은 'char 404' 같은 우연 일치로 오판한다.
+    # 한계: ISVC 이름 추측(-predictor 등 접미사 제거)이 빗나가는 네이밍이면 KServe
+    # 여도 404 → service 로 분류될 수 있다.
+    if info["found"]:
+        out["network_type"] = "kserve"
+    elif isvc_err and not isvc_err.startswith("HTTP 404"):
+        # 개수 수집이 성공하면 k8s_error 가 비므로, '-' 의 원인은 전용 필드에 보존.
+        out["network_type_error"] = "isvc: %s" % isvc_err
+        errors.append("isvc: %s" % isvc_err)
+    else:
+        out["network_type"] = "service"
 
     def setres(r):
         out["backends_ready"] = r["ready"]
@@ -325,6 +346,11 @@ def resolve_backend_count(deployment, client, settings, cache=None):
             out["gpu_ready"] = g["gpu_ready"]
             out["gpu_products"] = g["gpu_products"]
             out["gpu_error"] = g["gpu_error"]
+            # Pod 컨테이너(이미지/커맨드) 기반 엔진 판정 — 이름 휴리스틱보다
+            # 정확하므로 있으면 litellm 쪽 backend_type 을 덮어쓴다.
+            if g.get("engine"):
+                out["backend_type"] = g["engine"]
+                out["backend_type_source"] = "pod"
         except Exception as e:  # noqa: BLE001
             out["gpu_error"] = "%s: %s" % (type(e).__name__, e)
 

@@ -153,12 +153,14 @@ def summarize(snap):
         # (namespace, service) 유일 기준으로 한 번만 더한다 — 안 그러면
         # 공유 Service 의 물리 Pod 가 model_name 수만큼 이중 집계된다.
         # service 식별이 안 되면(external 등) api_base 로 폴백해 그래도 dedup.
+        # per-user 리댁션 뷰는 ns/svc/api_base 가 모두 없으므로 익명 backend_ref 로
+        # dedup 한다 — 없으면 모든 행이 같은 키로 붕괴해 첫 행만 집계되는 버그.
         seen_svc = set()
         seen_gpu = set()
         for d in ll.get("deployments") or []:
             key = (d.get("namespace"), d.get("service"))
             if key == (None, None):
-                key = ("", d.get("api_base"))
+                key = ("", d.get("backend_ref") or d.get("api_base"))
             if d.get("backends_ready") is not None and key not in seen_svc:
                 seen_svc.add(key)
                 s["backend_pods_ready"] += d["backends_ready"]

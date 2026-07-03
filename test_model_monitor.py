@@ -46,6 +46,7 @@ m = types.SimpleNamespace(
     _is_serverless=_bc._is_serverless,
     _strip_openai_suffix=_ll._strip_openai_suffix,
     _classify_backend=_ll._classify_backend,
+    _classify_engine=_ll._classify_engine,
     merge_deployments_with_health=_snap.merge_deployments_with_health,
     summarize=_snap.summarize,
     demo_snapshot=_demo.demo_snapshot,
@@ -53,9 +54,11 @@ m = types.SimpleNamespace(
     _short_gpu_product=_gpu._short_gpu_product,
     _pod_gpu=_gpu._pod_gpu,
     _pod_ready=_gpu._pod_ready,
+    _pod_engine=_gpu._pod_engine,
     collect_user_access=_ua.collect_user_access,
     AccessCache=_ua.AccessCache,
     filter_snapshot_for_user=_ua.filter_snapshot_for_user,
+    _backend_ref=_ua._backend_ref,
     render_prometheus_metrics=_prom.render_prometheus_metrics,
     is_admin_key=_auth.is_admin_key,
     request_key=_auth.request_key,
@@ -139,6 +142,15 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(m._classify_backend("KServe-X", "", ""), "kserve")
         self.assertEqual(m._classify_backend("X", "hosted_vllm/Y", ""), "vllm")
         self.assertEqual(m._classify_backend("plain", "openai/Z", ""), "-")
+
+    def test_classify_engine_ignores_infra_keywords(self):
+        # 엔진 분류는 인프라 키워드(kserve)를 보지 않는다 — 레거시 type 에서
+        # 'KServe-' 접두사가 엔진 정보를 가리던 문제가 재발하지 않게 고정.
+        self.assertEqual(m._classify_engine("KServe-gemma", "sglang-gemma", ""),
+                         "sglang")
+        self.assertEqual(m._classify_engine("KServe-X", "", ""), "-")
+        self.assertEqual(m._classify_engine("X", "hosted_vllm/Y", ""), "vllm")
+        self.assertEqual(m._classify_engine("plain", "openai/Z", ""), "-")
 
     def test_is_serverless(self):
         self.assertTrue(m._is_serverless("RawDeployment", "rev-001"))   # revision 있으면 True
@@ -272,7 +284,66 @@ class TestResolveBackendCount(unittest.TestCase):
         dep = {"api_base": "http://50.50.65.54:8000/v1"}
         out = m.resolve_backend_count(dep, client, SETTINGS)
         self.assertEqual(out["backend_source"], "external")
+        self.assertEqual(out["network_type"], "external")
         self.assertEqual(client.calls, [])           # k8s 호출 안 함
+
+    def test_network_type_from_isvc_lookup(self):
+        # 네트워크 타입은 문자열 추측이 아니라 ISVC 조회 결과로 판정한다.
+        client = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 2},
+                                "spec": {"replicas": 2}}]}, None)),
+        ], default_namespace="kserve")
+        out = m.resolve_backend_count(
+            {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"},
+            client, SETTINGS)
+        self.assertEqual(out["network_type"], "kserve")   # ISVC GET 성공
+        # ISVC 404(FakeClient 기본 응답) = KServe 아님 → 단순 Service
+        client2 = FakeClient([
+            ("endpointslices",
+             (True, {"items": [{"endpoints": [
+                 {"conditions": {"ready": True}, "addresses": ["1.1.1.1"]},
+             ]}]}, None)),
+        ], default_namespace="kind")
+        out2 = m.resolve_backend_count(
+            {"api_base": "http://embeddinggemma-300m.kind:18080/v1"},
+            client2, SETTINGS)
+        self.assertEqual(out2["network_type"], "service")
+
+    def test_network_type_unknown_on_isvc_lookup_error(self):
+        # 404 가 아닌 실패(RBAC/CRD/타임아웃)는 kserve/service 를 단정하지 않는다.
+        client = FakeClient([
+            ("inferenceservices", (False, None, "HTTP 403 Forbidden")),
+            ("endpointslices",
+             (True, {"items": [{"endpoints": [
+                 {"conditions": {"ready": True}, "addresses": ["1.1.1.1"]},
+             ]}]}, None)),
+        ], default_namespace="kind")
+        out = m.resolve_backend_count(
+            {"api_base": "http://svc-a.kind:8000/v1"}, client, SETTINGS)
+        self.assertEqual(out["network_type"], "-")
+        self.assertEqual(out["backends_ready"], 1)   # 개수 수집은 정상 진행
+        # 개수 수집이 성공해 k8s_error 가 비어도 '-' 의 원인은 전용 필드에 남는다
+        self.assertEqual(out["network_type_error"], "isvc: HTTP 403 Forbidden")
+
+    def test_network_type_404_must_be_prefix_not_substring(self):
+        # 'char 404' 같은 우연 일치가 'ISVC 없음(service)' 으로 오판되면 안 된다.
+        client = FakeClient([
+            ("inferenceservices",
+             (False, None,
+              "JSONDecodeError: Expecting value: line 1 column 405 (char 404)")),
+            ("endpointslices",
+             (True, {"items": [{"endpoints": [
+                 {"conditions": {"ready": True}, "addresses": ["1.1.1.1"]},
+             ]}]}, None)),
+        ], default_namespace="kind")
+        out = m.resolve_backend_count(
+            {"api_base": "http://svc-a.kind:8000/v1"}, client, SETTINGS)
+        self.assertEqual(out["network_type"], "-")   # 단정 금지
+        self.assertIn("JSONDecodeError", out["network_type_error"])
 
     def test_cache_avoids_duplicate_k8s_calls(self):
         client = FakeClient([
@@ -351,6 +422,83 @@ class TestGpu(unittest.TestCase):
         out = m.resolve_backend_count(dep, client, self.GPU_SETTINGS)
         self.assertEqual(out["gpu_ready"], 0)            # ready pod 없음 -> 0 (장애 아님)
         self.assertEqual(out["gpu_products"], {})
+
+    @staticmethod
+    def _pod_img(image, gpu=1, extra=None, command=None, args=None):
+        ctr = {"image": image}
+        if gpu:
+            ctr["resources"] = {"limits": {"nvidia.com/gpu": str(gpu)}}
+        if command:
+            ctr["command"] = command
+        if args:
+            ctr["args"] = args
+        return {"spec": {"nodeName": "n1", "containers": [ctr] + (extra or [])},
+                "status": {"phase": "Running",
+                           "conditions": [{"type": "Ready", "status": "True"}]}}
+
+    def test_pod_engine_from_image_prefers_gpu_container(self):
+        # GPU 를 점유한 컨테이너(서빙)를 우선 검사 — queue-proxy 사이드카 배제
+        pod = self._pod_img("registry.local/vllm/vllm-openai:v0.8", gpu=1,
+                            extra=[{"image": "knative/queue-proxy:1.0"}])
+        self.assertEqual(m._pod_engine(pod), "vllm")
+
+    def test_engine_mixed_when_two_engines_coexist(self):
+        # 엔진 교체 롤아웃 중 vllm/sglang Pod 공존 → Pod 순서 무관 'mixed' 고정
+        # (첫 Pod 하나로 정하면 목록 순서에 따라 폴링마다 값이 플랩한다).
+        client = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 2},
+                                "spec": {"replicas": 2}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [self._pod_img("vllm/vllm-openai:v0.8", gpu=1),
+                               self._pod_img("sglang/sglang:v0.4", gpu=1)]}, None)),
+            ("/nodes/n1", (True, {"metadata": {"labels": {}}}, None)),
+        ], default_namespace="kserve")
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        out = m.resolve_backend_count(dep, client, self.GPU_SETTINGS)
+        self.assertEqual(out["backend_type"], "mixed")
+        self.assertEqual(out["backend_type_source"], "pod")
+
+    def test_pod_engine_command_fallback_and_unknown(self):
+        # 리네임된 사설 레지스트리 이미지 → command/args 로 폴백 판별
+        pod = self._pod_img("registry.local/llm-server:1.0", gpu=1,
+                            command=["python", "-m", "sglang.launch_server"])
+        self.assertEqual(m._pod_engine(pod), "sglang")
+        self.assertIsNone(m._pod_engine(
+            self._pod_img("registry.local/other:1.0", gpu=1)))
+
+    def test_backend_type_overridden_by_pod_image(self):
+        # 이름 휴리스틱이 틀려도 Pod 이미지 판정이 이기고 source=pod 가 된다.
+        client = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 1},
+                                "spec": {"replicas": 1}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [self._pod_img("sglang/sglang:v0.4", gpu=2)]}, None)),
+            ("/nodes/n1", (True, {"metadata": {"labels": {}}}, None)),
+        ], default_namespace="kserve")
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1",
+               "backend_type": "vllm", "backend_type_source": "name"}
+        out = m.resolve_backend_count(dep, client, self.GPU_SETTINGS)
+        self.assertEqual(out["backend_type"], "sglang")
+        self.assertEqual(out["backend_type_source"], "pod")
+        # GPU 수집이 꺼져 있으면 out 은 backend_type 을 건드리지 않는다(휴리스틱 유지).
+        client2 = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 1},
+                                "spec": {"replicas": 1}}]}, None)),
+        ], default_namespace="kserve")
+        out2 = m.resolve_backend_count(dict(dep), client2, SETTINGS)
+        self.assertNotIn("backend_type", out2)
 
     def test_gpu_unknown_when_pods_forbidden(self):
         client = FakeClient([
@@ -563,6 +711,15 @@ class TestFilterSnapshotForUser(unittest.TestCase):
                 "deployments": [
                     {"model_name": "gpt-x", "api_base": "http://internal-a/v1",
                      "underlying": "vllm/x", "type": "vllm", "status": "UP",
+                     "network_type": "kserve", "backend_type": "vllm",
+                     "namespace": "ns-a", "service": "svc-a",
+                     "backends_ready": 2, "backends_desired": 2,
+                     "backend_source": "deployment"},
+                    # gpt-x 와 같은 백엔드(svc-a)를 공유 — backend_ref 토폴로지 검증용
+                    {"model_name": "gpt-x-router", "api_base": "http://internal-a/v1",
+                     "type": "vllm", "status": "UP",
+                     "network_type": "kserve", "backend_type": "vllm",
+                     "namespace": "ns-a", "service": "svc-a",
                      "backends_ready": 2, "backends_desired": 2,
                      "backend_source": "deployment"},
                     {"model_name": "secret-y", "api_base": "http://internal-b/v1",
@@ -604,6 +761,47 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         # 상태·Pod 수(키 무관, deployment 단위)는 그대로 유지
         self.assertEqual(d["status"], "UP")
         self.assertEqual(d["backends_ready"], 2)
+
+    def test_redaction_keeps_type_axes_and_anon_backend_ref(self):
+        out = m.filter_snapshot_for_user(
+            self._global(), {"accessible": ["gpt-x", "gpt-x-router"]},
+            hide_internal=True)
+        deps = out["litellm"]["deployments"]
+        d = deps[0]
+        # 2축 타입은 유지(내부 이름이 아니라 분류값이라 노출 무해)
+        self.assertEqual(d["network_type"], "kserve")
+        self.assertEqual(d["backend_type"], "vllm")
+        # ns/svc 는 여전히 숨기고, 익명 backend_ref 로만 백엔드를 식별
+        self.assertNotIn("namespace", d)
+        self.assertNotIn("service", d)
+        refs = {x["model_name"]: x["backend_ref"] for x in deps}
+        self.assertEqual(refs["gpt-x"], refs["gpt-x-router"])   # 같은 svc-a 공유
+        self.assertEqual(len(refs["gpt-x"]), 8)
+        self.assertNotIn("svc-a", refs["gpt-x"])                # 원문 이름 미노출
+
+    def test_per_user_summary_dedups_by_backend_ref(self):
+        # 리댁션 뷰는 ns/svc/api_base 가 없어 summarize dedup 키가 붕괴했었다 —
+        # backend_ref 로 dedup: 공유 백엔드(svc-a)는 1회만, 다른 백엔드는 합산.
+        out = m.filter_snapshot_for_user(
+            self._global(),
+            {"accessible": ["gpt-x", "gpt-x-router", "secret-y"]},
+            hide_internal=True)
+        s = out["summary"]
+        self.assertEqual(s["backend_pods_ready"], 2)    # svc-a(2) 1회 + secret-y(0)
+        self.assertEqual(s["backend_pods_desired"], 3)  # svc-a(2) 1회 + secret-y(1)
+
+    def test_backend_ref_seed_and_no_api_base_fallback(self):
+        # seed 가 다르면(사용자마다) 같은 백엔드의 ref 가 달라진다 — 사용자 간
+        # '내 뷰 JSON' 대조로 백엔드 공유 관계를 상관 분석하는 것 차단.
+        d = {"namespace": "ns-a", "service": "svc-a"}
+        self.assertEqual(m._backend_ref(d, "seed1"), m._backend_ref(d, "seed1"))
+        self.assertNotEqual(m._backend_ref(d, "seed1"), m._backend_ref(d, "seed2"))
+        # api_base 조차 없는 deployment 는 id/model_name 으로 서로 다른 ref —
+        # 하나의 'external' 로 뭉치면 그래프에 거짓 공유(⇄)가 생긴다.
+        a = m._backend_ref({"model_name": "openai-a", "id": "id-1"}, "s")
+        b = m._backend_ref({"model_name": "openai-b", "id": "id-2"}, "s")
+        self.assertIsNotNone(a)
+        self.assertNotEqual(a, b)
 
     def test_show_internal_keeps_api_base(self):
         out = m.filter_snapshot_for_user(

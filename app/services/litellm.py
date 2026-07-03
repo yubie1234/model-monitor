@@ -8,12 +8,32 @@ from app.core.http import http_get_json
 
 
 def _classify_backend(model_name, underlying, api_base):
-    """model_name 접두사/underlying model 로 백엔드 종류 추정 (표시용)."""
+    """(레거시) model_name 접두사/underlying model 로 백엔드 종류 추정 (표시용).
+
+    인프라(kserve)와 엔진(vllm/sglang)이 한 값에 섞여 첫 매칭이 나머지를 가리는
+    한계가 있다 — 신규 2축 분류(network_type/backend_type)를 쓰고, 이 값은
+    기존 API 소비자 호환용으로만 유지한다.
+    """
     blob = ("%s %s %s" % (model_name, underlying, api_base)).lower()
     if "sglang" in blob:
         return "sglang"
     if "kserve" in blob:
         return "kserve"
+    if "vllm" in blob:
+        return "vllm"
+    return "-"
+
+
+def _classify_engine(model_name, underlying, api_base):
+    """이름/모델 문자열로 서빙 엔진(vllm/sglang)만 추정 — 폴백용 휴리스틱.
+
+    k8s Pod 컨테이너(이미지/커맨드) 기반 판정(backend_count 경유)이 있으면
+    그쪽이 우선하고, 이 값은 Pod 를 못 보는 경우(GPU 수집 꺼짐/외부 백엔드/
+    scale-to-zero)의 폴백이다. 인프라 키워드(kserve)는 여기서 보지 않는다.
+    """
+    blob = ("%s %s %s" % (model_name, underlying, api_base)).lower()
+    if "sglang" in blob:
+        return "sglang"
     if "vllm" in blob:
         return "vllm"
     return "-"
@@ -83,6 +103,10 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
                 "api_base": api_base,
                 "id": mi.get("id"),
                 "type": _classify_backend(name, underlying, api_base or ""),
+                # 엔진(vllm/sglang) 이름 휴리스틱 — backend_count 가 Pod 이미지로
+                # 판정하면 그 값으로 덮어쓴다(backend_type_source="pod").
+                "backend_type": _classify_engine(name, underlying, api_base or ""),
+                "backend_type_source": "name",
             })
     elif err:
         result["errors"].append("model/info: %s" % err)

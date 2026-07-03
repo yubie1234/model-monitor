@@ -102,6 +102,11 @@
   .chip{font-family:var(--mono);font-size:11px;color:var(--muted);
     background:var(--surface2);border:1px solid var(--border);border-radius:5px;
     padding:1px 7px}
+  .chip+.chip{margin-left:4px}
+  /* TYPE 2축: 네트워크(kserve/service/external)와 엔진(vllm/sglang) 칩 색 구분 */
+  .chip.net{color:#6e8bff;border-color:rgba(110,139,255,.35);background:rgba(110,139,255,.08)}
+  .chip.eng{color:#b083f0;border-color:rgba(176,131,240,.35);background:rgba(176,131,240,.08)}
+  .chip.mixed{color:var(--warn);border-color:rgba(210,153,34,.35);background:rgba(210,153,34,.08)}
 
   /* BACKENDS 셀: ready/desired 미니바 + 수치 */
   .bk{display:flex;align-items:center;gap:9px}
@@ -233,6 +238,7 @@
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
     <a class="exp" id="exp-json" href="__BASE_PATH__/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
     <a class="exp" id="exp-html" href="__BASE_PATH__/snapshot.html" target="_blank" title="현재 상태를 정지된 self-contained 페이지로 열기 (저장해서 공유)">정지 페이지</a>
+    <a class="exp" id="exp-user-json" href="#" style="display:none" title="지금 보고 있는 내 키 기준 스냅샷(서버 응답 그대로)을 JSON 으로 다운로드 — 디버그/문의용">🐞 내 뷰 JSON</a>
     <div class="meta">
       <span><span class="dot live" id="livedot"></span><span id="updated">…</span></span>
     </div>
@@ -266,12 +272,20 @@
           <option value="DOWN">DOWN</option>
           <option value="?">?</option>
         </select>
-        <label for="f-type">type</label>
-        <select id="f-type">
+        <label for="f-net">net</label>
+        <select id="f-net" title="네트워크 타입: KServe 기반 배포 / 단순 Service(LB) / 클러스터 외부">
+          <option value="">all</option>
+          <option value="kserve">kserve</option>
+          <option value="service">service</option>
+          <option value="external">external</option>
+          <option value="-">-</option>
+        </select>
+        <label for="f-eng">engine</label>
+        <select id="f-eng" title="서빙 엔진: Pod 컨테이너 이미지(가능하면) 또는 이름으로 판별. mixed=한 백엔드 뒤에 두 엔진 공존(교체 롤아웃 중)">
           <option value="">all</option>
           <option value="vllm">vllm</option>
           <option value="sglang">sglang</option>
-          <option value="kserve">kserve</option>
+          <option value="mixed">mixed</option>
           <option value="-">-</option>
         </select>
         <span class="fcount" id="f-count"></span>
@@ -327,6 +341,22 @@ function uvActive(){ return USER_VIEW && !!uvKey(); }
 function setUvStatus(msg, cls){ const el=$("#uv-status");
   if(el){ el.textContent=msg||""; el.className="uv-status "+(cls||""); } }
 
+// 그래프 컬럼 숨김 + 이전 SVG/리스너 정리 — render(그래프 OFF)와 키 클리어/검증 실패
+// 화면 비우기에서 공통으로 쓴다(표만 지우고 그래프가 남는 잔상 방지).
+function hideGraph(){
+  const split=$("#topo-split"), gcol=$("#graph-col"), gwrap=$("#graphwrap");
+  if(gcol) gcol.style.display="none";   // 그래프 숨김 → 표가 전체 폭
+  if(split) split.classList.add("no-graph");
+  if(gwrap) gwrap.innerHTML="";
+}
+
+// export 버튼 3개(admin JSON/정지 페이지 + 내 뷰 JSON) 일괄 숨김 — 키 지우기/검증
+// 실패 화면에서 직전 뷰의 버튼이 남아 죽은 버튼(클릭 no-op)이 되는 것 방지.
+function hideExports(){
+  ["#exp-json","#exp-html","#exp-user-json"].forEach(sel=>{
+    const el=$(sel); if(el) el.style.display="none"; });
+}
+
 // 키 필수 모드 초기/클리어 상태: 목록 대신 "키 입력" 안내만 보인다(폴링·노출 없음).
 function showNeedKey(){
   lastSnap = null;
@@ -337,9 +367,13 @@ function showNeedKey(){
   const dt=$("#deployments");
   dt.querySelector("thead").innerHTML="";
   dt.querySelector("tbody").innerHTML='<tr><td class="empty">키 입력 대기 중</td></tr>';
+  $("#dep-err").innerHTML = "";
+  hideGraph();   // 직전 뷰(특히 admin 전체 뷰)의 라우팅 그래프가 남지 않게
+  hideExports(); // 직전 뷰의 export/내 뷰 JSON 버튼도 잔류 금지
   const gt=$("#groups");
   gt.querySelector("thead").innerHTML="";
   gt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';
+  const gc=$("#groups-count"); if(gc) gc.textContent="0";
   setUvStatus("", "");
 }
 
@@ -389,11 +423,39 @@ function card(label,val,cls,sub){
     +(sub?'<div class="sub">'+sub+'</div>':'')+'</div>';
 }
 
+// ── TYPE 2축 헬퍼: 네트워크(kserve/service/external)와 엔진(vllm/sglang) ──
+// 구버전 스냅샷(network_type/backend_type 없음)은 레거시 type 에서 최대한 유도.
+function netOf(d){
+  if(d.network_type) return d.network_type;
+  // 구버전/backend_count 미동작 폴백: backend_source 의 external 은 신뢰 가능
+  if(d.backend_source==="external") return "external";
+  return d.type==="kserve" ? "kserve" : "-";
+}
+function engOf(d){
+  if(d.backend_type) return d.backend_type;
+  const t=d.type; return (t==="vllm"||t==="sglang") ? t : "-";
+}
+function typeChips(net, eng){
+  let h="";
+  if(net && net!=="-") h+='<span class="chip '+(net==="mixed"?"mixed":"net")+'">'+esc(net)+'</span>';
+  if(eng && eng!=="-") h+='<span class="chip '+(eng==="mixed"?"mixed":"eng")+'">'+esc(eng)+'</span>';
+  return h || '<span class="chip">-</span>';
+}
+// 그룹의 자식들이 서로 다른 값이면 "mixed" 로 표기(첫 자식 값으로 뭉개지 않음)
+function uniqOr(vals, mixed){ const s=new Set(vals); return s.size===1?vals[0]:mixed; }
+
 // ── 모델 기준 그룹 뷰 헬퍼 ──────────────────────────────────────────────
 // 같은 백엔드(Service)를 여러 model_name 이 공유할 수 있으므로 (ns,svc) 로 식별.
+// per-user 뷰는 ns/svc 가 리댁션되지만 익명 backend_ref 로 같은 토폴로지를 유지한다.
 function svcKeyOf(d){
   if(d.namespace || d.service) return (d.namespace||"")+"/"+(d.service||"");
+  if(d.backend_ref) return "ref:"+d.backend_ref;
   return "api:"+(d.api_base||"external");
+}
+// 백엔드 표시 라벨: Service 이름 → api_base 호스트 → 익명 ref → external 순 폴백
+function svcLabelOf(d){
+  return d.service || backendHost(d.api_base)
+    || (d.backend_ref ? "backend·"+d.backend_ref : "external");
 }
 function trunc(s,n){s=String(s==null?"":s);return s.length>n?s.slice(0,n-1)+"…":s;}
 function backendHost(api){ if(!api) return "";
@@ -482,11 +544,12 @@ function groupedRows(merged, shared, showBk, showGpu){
     groups[d.model_name].push(d); });
   return order.map(name=>{
     const bes=groups[name];
-    const st=compositeStatus(bes), agg=sumBackends(bes), type=bes[0].type||"-";
+    const st=compositeStatus(bes), agg=sumBackends(bes);
+    const net=uniqOr(bes.map(netOf),"mixed"), eng=uniqOr(bes.map(engOf),"mixed");
     let html='<tr class="grp-row"><td>'+compositePill(st)+'</td>'
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
-      +'<td><span class="chip">'+esc(type)+'</span></td>';
+      +'<td>'+typeChips(net,eng)+'</td>';
     if(showBk){ html+='<td>'+aggCell(agg.r,agg.d)+'</td>';
       if(showGpu){const sg=sumGpu(bes); html+='<td>'+aggGpuCell(sg.g,sg.products)+'</td>';}
       html+='<td></td><td></td>'; }
@@ -494,7 +557,7 @@ function groupedRows(merged, shared, showBk, showGpu){
     bes.forEach(b=>{
       const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
       const others=sh?[...shared[k]].filter(x=>x!==name):[];
-      const svcLabel=b.service||backendHost(b.api_base)||"—";
+      const svcLabel=svcLabelOf(b);
       html+='<tr class="child-row"><td>'+statusPill(b.status||"?")+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
           +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
@@ -526,7 +589,7 @@ function buildGraph(deps){
   names.sort((a,b)=>a.toLowerCase().localeCompare(b.toLowerCase()) || a.localeCompare(b));
   const svcOrder=[], svc={};
   deps.forEach(d=>{ const k=svcKeyOf(d);
-    if(!svc[k]){ svc[k]={key:k,label:d.service||backendHost(d.api_base)||"external",
+    if(!svc[k]){ svc[k]={key:k,label:svcLabelOf(d),
       r:d.backends_ready,des:d.backends_desired,status:d.status,
       gpu:d.gpu_ready,gpu_products:d.gpu_products,
       ext:(d.backend_source==="external"),stz:d.scale_to_zero,models:new Set()}; svcOrder.push(k); }
@@ -696,15 +759,16 @@ function render(snap){
   const uHide = !!snap.user_view;   // per-user 뷰는 내부 컬럼(MODE/SRC/API_BASE) 숨김
   const showGpu = !!s.gpu_known && !uHide;   // GPU 컬럼도 내부정보 — user 뷰 숨김
   const dt = $("#deployments");
-  // status/type 필터는 표와 그래프에 똑같이 적용한다(그래프도 필터된 집합만 그림).
-  const fS = $("#f-status").value, fT = $("#f-type").value;
-  const filterDep = d => (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT);
+  // status/net/engine 필터는 표와 그래프에 똑같이 적용한다(그래프도 필터된 집합만 그림).
+  const fS = $("#f-status").value, fN = $("#f-net").value, fE = $("#f-eng").value;
+  const filterDep = d => (!fS || (d.status||"?")===fS)
+    && (!fN || netOf(d)===fN) && (!fE || engOf(d)===fE);
   let graphDeps = [];   // 그래프가 그릴 deployment(= 표와 동일한 필터 결과)
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
     const merged = all.filter(filterDep);
     graphDeps = merged;
-    $("#f-count").textContent = (fS||fT)
+    $("#f-count").textContent = (fS||fN||fE)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
     if(showBk) head += '<th>REPLICAS (ready/desired)</th>';
@@ -715,8 +779,8 @@ function render(snap){
     const ncol = 3 + (showBk?1:0) + (showBk&&showGpu?1:0)
       + (showBk&&!uHide?2:0) + (uHide?0:1);
     dt.querySelector("thead").innerHTML = head;
-    // per-user 뷰(uHide)는 내부 토폴로지(Service/api_base)를 숨기므로 그룹/그래프를
-    // 쓰지 않고 컬럼 축소된 평면 행을 그린다. 전체(admin) 뷰에서만 모델 그룹핑을 적용.
+    // per-user 뷰(uHide)는 내부 컬럼을 숨긴 평면 행으로 그린다(그룹핑은 admin 전용).
+    // 그래프는 익명 backend_ref 기반으로 per-user 뷰에서도 그린다(아래 showGraph).
     const grouped = $("#f-group").checked && !uHide;
     let body;
     if(!merged.length){
@@ -729,7 +793,7 @@ function render(snap){
       body = merged.map(d=>{
         let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
-          +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
+          +'<td>'+typeChips(netOf(d),engOf(d))+"</td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
         if(showBk && showGpu) row += "<td>"+gpuCell(d)+"</td>";
         if(showBk && !uHide) row +=
@@ -751,13 +815,14 @@ function render(snap){
     ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
 
   // Model ↔ Backend 그래프 — 표와 같은 필터(graphDeps)를 좌측 컬럼에 그린다(추가 수집 없음).
-  // per-user 뷰(uHide)는 내부 토폴로지(Service 이름)를 숨기므로 그래프 컬럼과 토글을 감춘다.
+  // per-user 뷰에서도 항상 그린다: Service 이름은 리댁션되지만 익명 backend_ref 로
+  // 노드/공유(⇄) 토폴로지가 유지된다(목록이 단순해도 그래프는 표시).
   // 그래프가 숨겨지면 split 에 no-graph 를 붙여 표가 컬럼 전체 폭을 차지하게 한다.
   const split = $("#topo-split"), gcol = $("#graph-col"), gwrap = $("#graphwrap");
   const glbl = $("#f-graph-lbl");
   const hasDeps = !!(ll && ll.deployments && ll.deployments.length);
-  if(glbl) glbl.style.display = uHide ? "none" : "";
-  const showGraph = !uHide && hasDeps && $("#f-graph").checked;
+  if(glbl) glbl.style.display = "";
+  const showGraph = hasDeps && $("#f-graph").checked;
   if(showGraph){
     gcol.style.display = "";
     split.classList.remove("no-graph");
@@ -767,9 +832,7 @@ function render(snap){
     const svg = gwrap.querySelector("svg");
     if(svg) wireGraph(svg);
   } else {
-    gcol.style.display = "none";     // 그래프 숨김 → 표가 전체 폭
-    split.classList.add("no-graph");
-    gwrap.innerHTML = "";            // 숨긴 동안 이전 SVG/리스너 정리
+    hideGraph();   // 그래프 숨김(표가 전체 폭) + 이전 SVG/리스너 정리
   }
 
   // groups — 기본 접힘 섹션. 접혀 있어도 개수는 summary 뱃지로 보이게 한다.
@@ -788,10 +851,12 @@ function render(snap){
   }
 
   // 키 필수 모드: export(JSON/정지페이지) 버튼은 admin 키로 본 전체 뷰일 때만 노출.
+  // 비-admin 키에는 대신 "내 뷰 JSON"(지금 렌더 중인 필터된 스냅샷 다운로드)을 노출.
   if(USER_VIEW){
     const show = snap.admin_view ? "" : "none";
-    const ej=$("#exp-json"), eh=$("#exp-html");
+    const ej=$("#exp-json"), eh=$("#exp-html"), uj=$("#exp-user-json");
     if(ej) ej.style.display=show; if(eh) eh.style.display=show;
+    if(uj) uj.style.display = snap.admin_view ? "none" : "";
   }
   if(snap.version) $("#ver").textContent = "v"+snap.version;
   $("#foot").textContent = "model_monitor v"+(snap.version||"?")
@@ -810,9 +875,13 @@ function showUvError(msg){
   dt.querySelector("thead").innerHTML="";
   dt.querySelector("tbody").innerHTML=
     '<tr><td class="empty">키 검증 실패 — 표시할 데이터 없음</td></tr>';
+  $("#dep-err").innerHTML = "";
+  hideGraph();   // fail-closed: 이전 뷰의 라우팅 그래프도 남기지 않는다
+  hideExports(); // 이전 뷰의 export/내 뷰 JSON 버튼도 잔류 금지
   const gt=$("#groups");
   gt.querySelector("thead").innerHTML="";
   gt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';
+  const gc=$("#groups-count"); if(gc) gc.textContent="0";
   setUvStatus("키 검증 실패", "bad");
 }
 
@@ -880,7 +949,8 @@ function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
 // 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
 $("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+$("#f-net").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+$("#f-eng").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-group").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-graph").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 
@@ -908,6 +978,17 @@ if(USER_VIEW){
     exportWithKey("/snapshot.json", false); });
   if(eh) eh.addEventListener("click", e=>{ e.preventDefault();
     exportWithKey("/snapshot.html", true); });
+  // 내 뷰 JSON: 서버 재요청 없이 지금 렌더 중인 per-user 스냅샷(lastSnap)을
+  // 그대로 파일로 저장 — /api/snapshot/user 응답과 동일해 디버그/문의에 첨부 가능.
+  const uj=$("#exp-user-json");
+  if(uj) uj.addEventListener("click", e=>{ e.preventDefault();
+    if(!lastSnap) return;
+    const b=new Blob([JSON.stringify(lastSnap,null,2)],{type:"application/json"});
+    const u=URL.createObjectURL(b), a=document.createElement("a");
+    a.href=u; a.download="model-monitor-user-snapshot.json";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(u), 15000);
+  });
 }
 tick(); loop();
 </script>

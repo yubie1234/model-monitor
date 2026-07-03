@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.8** — GPU 메트릭/Grafana 관측성 + 그래프↔필터 동기화 + 키 필수 모드 /metrics Bearer 토큰(MONITOR_METRICS_TOKEN)
+**버전: v0.5.9** — TYPE 2축 분리(network/engine) + per-user 라우팅 그래프·내 뷰 JSON + 그래프 잔상 수정
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -44,6 +44,19 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 > 한눈에 보여줍니다. 노드에 마우스를 올리면 **연결된 노드를 그 옆으로 끌어모으고 나머지는 숨겨**(v0.5.4)
 > 멀리 떨어져 있어도 무엇과 이어졌는지 바로 보입니다(간선도 모인 위치로 다시 그림). **노드를 클릭하면 그 배치를 고정(pin)해 얼려두어**, 끌어모은 노드 위로 마우스를 올려 값(이름·replicas·GPU tooltip)을 읽어도 배치가 흐트러지지 않습니다(v0.5.6 — 예전엔 hover 가 고정을 가로채 풀리는 것처럼 보였음). 헤드라인 **Replicas** 합계는 `(namespace, service)` 기준으로 **dedup** 하므로
 > 공유 백엔드가 모델 수만큼 이중 집계되지 않습니다. (UI 라벨은 `Replicas`/`REPLICAS` — k8s Pod=서빙 복제본.)
+
+> **TYPE 2축 분리 (v0.5.9)** — 기존 단일 TYPE(vllm/sglang/kserve 혼합, 첫 매칭이 나머지를
+> 가림)을 **네트워크 타입**과 **백엔드(엔진) 타입**으로 분리했습니다.
+> - `network_type` = `kserve`(KServe 기반 배포) / `service`(단순 k8s Service·LB) /
+>   `external`(클러스터 밖) / `-`(판정 불가) — 문자열 추측이 아니라 **ISVC 조회 성공 여부라는
+>   k8s 사실**로 판정합니다(RBAC 등으로 조회가 불확실하면 단정하지 않고 `-`).
+> - `backend_type` = `vllm` / `sglang` / `-` — **Pod 컨테이너의 image/command** 로 판별하고
+>   (GPU 수집이 이미 받아온 Pod 재활용, 추가 API 호출 0; `backend_type_source: "pod"`),
+>   Pod 를 못 보는 경우(GPU 수집 OFF/외부/scale-to-zero)는 이름 휴리스틱으로 폴백합니다
+>   (`backend_type_source: "name"`).
+> - 대시보드 TYPE 칸은 net/engine 칩 2개로, 필터도 `net`/`engine` 2개로 나뉩니다. 모델 그룹
+>   행에서 자식들의 값이 서로 다르면 `mixed` 로 표기합니다. 기존 `type` 필드는 API 호환용으로
+>   유지되지만 **deprecated** 입니다.
 
 > **GPU 개수 + 장치명 (v0.4.0)** — backend Pod 가 점유한 GPU 수(`resources.limits[nvidia.com/gpu]`
 > 합)와 장치 모델명을 함께 보여줍니다. 장치명은 Pod 가 뜬 **노드의 라벨 `nvidia.com/gpu.product`**
@@ -105,6 +118,13 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   - 일반 키 → 그 키의 `GET /v1/models`(접근 모델 집합)로 필터한 뷰 + "내 키" 카드(spend/budget/limit).
     내부 `api_base`/namespace 는 **숨김**.
   - admin 키(= 모니터 구동 시 쓴 키) → 내부 주소 포함 **전체 뷰** + export(JSON/정지 페이지) 버튼.
+- **라우팅 그래프 (v0.5.9)**: per-user 뷰에서도 Model↔Backend 그래프를 **항상** 그립니다.
+  Service 이름은 숨긴 채 **익명 식별자 `backend_ref`**(솔트 해시 8자)로 노드/공유(⇄) 토폴로지만
+  유지하므로 내부 구조가 노출되지 않습니다(목록이 단순해도 그래프 표시).
+- **내 뷰 JSON (v0.5.9, 디버그용)**: 일반 키로 조회 중일 때 상단의 **`🐞 내 뷰 JSON`** 버튼으로
+  지금 렌더 중인 per-user 스냅샷(서버 응답 그대로)을 파일로 저장할 수 있습니다 — 문의/디버그에
+  첨부. 브라우저 밖에서는 `curl -X POST -H "X-LiteLLM-Key: <내 키>" <base>/api/snapshot/user`
+  로 같은 JSON 을 받을 수 있습니다. (admin 전체 export 는 기존처럼 admin 키 전용.)
 - **접근 캐시**: 같은 키의 `/v1/models` 결과를 **짧은 TTL(기본 30s)** 캐시해 폴링 중복 호출을 제거
   (해시만 보관, 원문 키 비저장). 성공만 캐시 → 무효 키는 매번 재검증. 취소/만료 키는 최대 TTL 동안 stale.
   config `user_view.cache_ttl` 로 조절.
