@@ -281,10 +281,11 @@
           <option value="-">-</option>
         </select>
         <label for="f-eng">engine</label>
-        <select id="f-eng" title="서빙 엔진: Pod 컨테이너 이미지(가능하면) 또는 이름으로 판별">
+        <select id="f-eng" title="서빙 엔진: Pod 컨테이너 이미지(가능하면) 또는 이름으로 판별. mixed=한 백엔드 뒤에 두 엔진 공존(교체 롤아웃 중)">
           <option value="">all</option>
           <option value="vllm">vllm</option>
           <option value="sglang">sglang</option>
+          <option value="mixed">mixed</option>
           <option value="-">-</option>
         </select>
         <span class="fcount" id="f-count"></span>
@@ -349,6 +350,13 @@ function hideGraph(){
   if(gwrap) gwrap.innerHTML="";
 }
 
+// export 버튼 3개(admin JSON/정지 페이지 + 내 뷰 JSON) 일괄 숨김 — 키 지우기/검증
+// 실패 화면에서 직전 뷰의 버튼이 남아 죽은 버튼(클릭 no-op)이 되는 것 방지.
+function hideExports(){
+  ["#exp-json","#exp-html","#exp-user-json"].forEach(sel=>{
+    const el=$(sel); if(el) el.style.display="none"; });
+}
+
 // 키 필수 모드 초기/클리어 상태: 목록 대신 "키 입력" 안내만 보인다(폴링·노출 없음).
 function showNeedKey(){
   lastSnap = null;
@@ -361,6 +369,7 @@ function showNeedKey(){
   dt.querySelector("tbody").innerHTML='<tr><td class="empty">키 입력 대기 중</td></tr>';
   $("#dep-err").innerHTML = "";
   hideGraph();   // 직전 뷰(특히 admin 전체 뷰)의 라우팅 그래프가 남지 않게
+  hideExports(); // 직전 뷰의 export/내 뷰 JSON 버튼도 잔류 금지
   const gt=$("#groups");
   gt.querySelector("thead").innerHTML="";
   gt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';
@@ -418,6 +427,8 @@ function card(label,val,cls,sub){
 // 구버전 스냅샷(network_type/backend_type 없음)은 레거시 type 에서 최대한 유도.
 function netOf(d){
   if(d.network_type) return d.network_type;
+  // 구버전/backend_count 미동작 폴백: backend_source 의 external 은 신뢰 가능
+  if(d.backend_source==="external") return "external";
   return d.type==="kserve" ? "kserve" : "-";
 }
 function engOf(d){
@@ -866,6 +877,7 @@ function showUvError(msg){
     '<tr><td class="empty">키 검증 실패 — 표시할 데이터 없음</td></tr>';
   $("#dep-err").innerHTML = "";
   hideGraph();   // fail-closed: 이전 뷰의 라우팅 그래프도 남기지 않는다
+  hideExports(); // 이전 뷰의 export/내 뷰 JSON 버튼도 잔류 금지
   const gt=$("#groups");
   gt.querySelector("thead").innerHTML="";
   gt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';

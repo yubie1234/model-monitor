@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import time
 
@@ -68,8 +69,13 @@ async def api_snapshot_user(request: Request):
         return JSONResponse(
             {"error": "유효하지 않거나 만료된 키이거나 LiteLLM 조회에 실패했습니다.",
              "user_view": True}, status_code=401)
+    # backend_ref 솔트: 서버 비밀(admin_key)+사용자 키 유래 — 사용자마다 달라
+    # '내 뷰 JSON' 간 크로스 상관을 막고, 결정적이라 워커/재기동 간 안정적이다.
+    ref_seed = hashlib.sha256(
+        ("ref:%s:%s" % (st.admin_key, key)).encode("utf-8")).hexdigest()
     return JSONResponse(
-        filter_snapshot_for_user(snap, access, hide_internal=st.hide_internal))
+        filter_snapshot_for_user(snap, access, hide_internal=st.hide_internal,
+                                 ref_seed=ref_seed))
 
 
 @router.get("/snapshot.json", include_in_schema=False)

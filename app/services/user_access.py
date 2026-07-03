@@ -103,28 +103,37 @@ class AccessCache:
             self._d.pop(next(iter(self._d)), None)
 
 
-# 익명 backend 식별자용 프로세스 솔트. 솔트 없이 (ns,svc)를 해시하면 흔한 서비스
-# 이름 사전대입으로 역산될 수 있어 비-admin 노출에 부적합하다. 재기동마다 값이
-# 바뀌지만 backend_ref 는 스냅샷 내 그룹핑(그래프/⇄) 전용이라 무방하다.
+# 익명 backend 식별자용 프로세스 솔트(ref_seed 미제공 시 폴백). 솔트 없이 (ns,svc)를
+# 해시하면 흔한 서비스 이름 사전대입으로 역산될 수 있어 비-admin 노출에 부적합하다.
 _REF_SALT = secrets.token_hex(8)
 
 
-def _backend_ref(d):
-    """(ns,svc) 기반 익명 백엔드 식별자(8자 hex). 식별 불가면 None.
+def _backend_ref(d, seed=None):
+    """익명 백엔드 식별자(8자 hex). 식별 근거가 전혀 없으면 None.
 
     per-user 뷰는 Service/api_base 를 숨기지만, '어떤 deployment 들이 같은
     백엔드를 공유하는가' 토폴로지는 이 값으로 유지된다 — 이름 노출 없이
     Model↔Backend 그래프와 공유(⇄) 표시를 그릴 수 있게 한다.
+
+    기반: (ns,svc) → api_base → id → model_name 순 폴백. api_base 도 없는
+    deployment(openai 등)가 여러 개면 서로 다른 ref 를 받아야 한다 — 하나의
+    'external' 키로 뭉치면 그래프에 거짓 공유(⇄)가 생긴다.
+
+    seed(권장: 서버 비밀+사용자 키 유래, 호출측이 전달)를 주면 사용자마다 다른
+    ref 가 나와 두 사용자가 '내 뷰 JSON' 을 대조해 백엔드 공유 관계를 상관
+    분석하는 것을 막고, 값이 결정적이라 워커/재기동이 달라도 ref 가 안정적이다.
+    미제공 시 프로세스 솔트 폴백(프로세스 내 일관, 재기동 시 변경 — 표시 전용).
     """
     basis = "%s/%s" % (d.get("namespace") or "", d.get("service") or "")
     if basis == "/":
-        basis = d.get("api_base") or ""
+        basis = d.get("api_base") or d.get("id") or d.get("model_name") or ""
     if not basis:
         return None
-    return hashlib.sha256((_REF_SALT + basis).encode("utf-8")).hexdigest()[:8]
+    salt = seed if seed else _REF_SALT
+    return hashlib.sha256((salt + basis).encode("utf-8")).hexdigest()[:8]
 
 
-def _redact_deployment_for_user(d):
+def _redact_deployment_for_user(d, ref_seed=None):
     """per-user 뷰에서 내부 토폴로지(api_base/underlying/namespace/내부 URL)를 떼고
     상태·종류·backend Pod 수만 남긴다(비-admin 에 클러스터 구조 비노출).
     백엔드 식별은 익명 backend_ref 로만 제공한다."""
@@ -140,11 +149,12 @@ def _redact_deployment_for_user(d):
         "backend_source": d.get("backend_source"),
         "scale_to_zero": d.get("scale_to_zero"),
         "mode": d.get("mode"),
-        "backend_ref": _backend_ref(d),
+        "backend_ref": _backend_ref(d, ref_seed),
     }
 
 
-def filter_snapshot_for_user(global_snap, access, hide_internal=True):
+def filter_snapshot_for_user(global_snap, access, hide_internal=True,
+                             ref_seed=None):
     """global 스냅샷을 사용자가 접근 가능한 모델로 필터한 per-user 뷰를 만든다.
 
     핵심: 상태·Pod 수는 **deployment 단위라 키와 무관** → global 값을 그대로 join 하고,
@@ -165,7 +175,8 @@ def filter_snapshot_for_user(global_snap, access, hide_internal=True):
     if ll:
         deps = [d for d in (ll.get("deployments") or [])
                 if d.get("model_name") in accessible]
-        ll["deployments"] = ([_redact_deployment_for_user(d) for d in deps]
+        ll["deployments"] = ([_redact_deployment_for_user(d, ref_seed)
+                              for d in deps]
                              if hide_internal else deps)
         ll["groups"] = [g for g in (ll.get("groups") or [])
                         if g.get("model_group") in accessible]

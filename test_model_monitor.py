@@ -326,6 +326,24 @@ class TestResolveBackendCount(unittest.TestCase):
             {"api_base": "http://svc-a.kind:8000/v1"}, client, SETTINGS)
         self.assertEqual(out["network_type"], "-")
         self.assertEqual(out["backends_ready"], 1)   # 개수 수집은 정상 진행
+        # 개수 수집이 성공해 k8s_error 가 비어도 '-' 의 원인은 전용 필드에 남는다
+        self.assertEqual(out["network_type_error"], "isvc: HTTP 403 Forbidden")
+
+    def test_network_type_404_must_be_prefix_not_substring(self):
+        # 'char 404' 같은 우연 일치가 'ISVC 없음(service)' 으로 오판되면 안 된다.
+        client = FakeClient([
+            ("inferenceservices",
+             (False, None,
+              "JSONDecodeError: Expecting value: line 1 column 405 (char 404)")),
+            ("endpointslices",
+             (True, {"items": [{"endpoints": [
+                 {"conditions": {"ready": True}, "addresses": ["1.1.1.1"]},
+             ]}]}, None)),
+        ], default_namespace="kind")
+        out = m.resolve_backend_count(
+            {"api_base": "http://svc-a.kind:8000/v1"}, client, SETTINGS)
+        self.assertEqual(out["network_type"], "-")   # 단정 금지
+        self.assertIn("JSONDecodeError", out["network_type_error"])
 
     def test_cache_avoids_duplicate_k8s_calls(self):
         client = FakeClient([
@@ -423,6 +441,26 @@ class TestGpu(unittest.TestCase):
         pod = self._pod_img("registry.local/vllm/vllm-openai:v0.8", gpu=1,
                             extra=[{"image": "knative/queue-proxy:1.0"}])
         self.assertEqual(m._pod_engine(pod), "vllm")
+
+    def test_engine_mixed_when_two_engines_coexist(self):
+        # 엔진 교체 롤아웃 중 vllm/sglang Pod 공존 → Pod 순서 무관 'mixed' 고정
+        # (첫 Pod 하나로 정하면 목록 순서에 따라 폴링마다 값이 플랩한다).
+        client = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 2},
+                                "spec": {"replicas": 2}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [self._pod_img("vllm/vllm-openai:v0.8", gpu=1),
+                               self._pod_img("sglang/sglang:v0.4", gpu=1)]}, None)),
+            ("/nodes/n1", (True, {"metadata": {"labels": {}}}, None)),
+        ], default_namespace="kserve")
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        out = m.resolve_backend_count(dep, client, self.GPU_SETTINGS)
+        self.assertEqual(out["backend_type"], "mixed")
+        self.assertEqual(out["backend_type_source"], "pod")
 
     def test_pod_engine_command_fallback_and_unknown(self):
         # 리네임된 사설 레지스트리 이미지 → command/args 로 폴백 판별
@@ -740,6 +778,30 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         self.assertEqual(refs["gpt-x"], refs["gpt-x-router"])   # 같은 svc-a 공유
         self.assertEqual(len(refs["gpt-x"]), 8)
         self.assertNotIn("svc-a", refs["gpt-x"])                # 원문 이름 미노출
+
+    def test_per_user_summary_dedups_by_backend_ref(self):
+        # 리댁션 뷰는 ns/svc/api_base 가 없어 summarize dedup 키가 붕괴했었다 —
+        # backend_ref 로 dedup: 공유 백엔드(svc-a)는 1회만, 다른 백엔드는 합산.
+        out = m.filter_snapshot_for_user(
+            self._global(),
+            {"accessible": ["gpt-x", "gpt-x-router", "secret-y"]},
+            hide_internal=True)
+        s = out["summary"]
+        self.assertEqual(s["backend_pods_ready"], 2)    # svc-a(2) 1회 + secret-y(0)
+        self.assertEqual(s["backend_pods_desired"], 3)  # svc-a(2) 1회 + secret-y(1)
+
+    def test_backend_ref_seed_and_no_api_base_fallback(self):
+        # seed 가 다르면(사용자마다) 같은 백엔드의 ref 가 달라진다 — 사용자 간
+        # '내 뷰 JSON' 대조로 백엔드 공유 관계를 상관 분석하는 것 차단.
+        d = {"namespace": "ns-a", "service": "svc-a"}
+        self.assertEqual(m._backend_ref(d, "seed1"), m._backend_ref(d, "seed1"))
+        self.assertNotEqual(m._backend_ref(d, "seed1"), m._backend_ref(d, "seed2"))
+        # api_base 조차 없는 deployment 는 id/model_name 으로 서로 다른 ref —
+        # 하나의 'external' 로 뭉치면 그래프에 거짓 공유(⇄)가 생긴다.
+        a = m._backend_ref({"model_name": "openai-a", "id": "id-1"}, "s")
+        b = m._backend_ref({"model_name": "openai-b", "id": "id-2"}, "s")
+        self.assertIsNotNone(a)
+        self.assertNotEqual(a, b)
 
     def test_show_internal_keeps_api_base(self):
         out = m.filter_snapshot_for_user(

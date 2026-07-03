@@ -100,6 +100,8 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
        gpu_ready=None 은 조회 실패(?), 0 은 GPU 없음/scale-to-zero.
        engine 은 이미 받아온 Pod 컨테이너(image/command/args)에서 추가 API 호출
        없이 판별한다 — 미상/Pod 없음(scale-to-zero)이면 None(호출측 휴리스틱 폴백).
+       모든 ready Pod 를 보고 서로 다른 엔진이 공존하면(교체 롤아웃 중) "mixed" —
+       첫 Pod 하나로 정하면 Pod 목록 순서에 따라 값이 폴링마다 플랩한다.
     Pod 선택: KServe(ISVC found)면 serving.kserve.io/inferenceservice 라벨,
     아니면 Service 의 spec.selector 로 labelSelector 를 만든다.
     """
@@ -127,12 +129,14 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
     total = 0
     products = {}
     any_ready = False
+    engines = set()
     for pod in data.get("items") or []:
         if not _pod_ready(pod):
             continue
         any_ready = True
-        if out["engine"] is None:
-            out["engine"] = _pod_engine(pod)
+        eng = _pod_engine(pod)
+        if eng:
+            engines.add(eng)
         g = _pod_gpu(pod)
         if g <= 0:
             continue
@@ -142,4 +146,6 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
         products[prod] = products.get(prod, 0) + g
     out["gpu_ready"] = total if any_ready else 0
     out["gpu_products"] = products
+    if engines:
+        out["engine"] = engines.pop() if len(engines) == 1 else "mixed"
     return out
