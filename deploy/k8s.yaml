@@ -40,6 +40,9 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]             # 라벨 합산 + RawDeployment 보정
     verbs: ["get", "list"]                  # list: serving.kserve.io/inferenceservice 라벨 조회
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]            # StatefulSet 백엔드 desired 보강(selector->Pod ownerRef 로 발견)
+    verbs: ["get", "list"]
   - apiGroups: ["serving.kserve.io"]
     resources: ["inferenceservices"]       # deploymentMode / revision 감지
     verbs: ["get", "list"]
@@ -105,7 +108,7 @@ metadata:
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "0.5.10"
+    app.kubernetes.io/version: "0.5.11"
 spec:
   replicas: 1
   selector:
@@ -115,7 +118,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "0.5.10"
+        app.kubernetes.io/version: "0.5.11"
     spec:
       serviceAccountName: model-monitor
       containers:

@@ -3,13 +3,13 @@
 우선순위 체인:
   KServe ISVC -> Deployment 라벨 합산
   -> EndpointSlice(ready 주소 수) -> Knative PodAutoscaler actualScale
-  -> RawDeployment Deployment -> none
+  -> RawDeployment Deployment -> StatefulSet(selector->owner 로 desired 보강) -> none
 값을 모르면 '?' 로 두고 절대 지어내지 않는다. 실패는 k8s_error 로 기록한다.
 """
 
 import urllib.parse
 
-from app.services.gpu import collect_gpu_for_service
+from app.services.gpu import collect_gpu_for_service, service_pod_selector
 
 
 def parse_api_base(api_base, default_namespace="default", overrides=None):
@@ -212,6 +212,46 @@ def count_via_deployment(client, ns, svc):
             "source": "deployment"}, None
 
 
+def count_desired_via_selector(client, ns, svc):
+    """네이밍 독립적 desired 보강: Service selector -> Pod ownerReferences -> StatefulSet.
+
+    Service 와 StatefulSet/Pod 사이엔 정해진 네이밍 규칙이 없어 같은 이름으로 못
+    찾는다. 대신 k8s 의 실제 소유 관계를 따라간다:
+      Service.spec.selector 로 Pod 나열 -> Pod.ownerReferences 의 StatefulSet 수집
+      -> 각 StatefulSet.spec.replicas 합산(= desired).
+    StatefulSet 은 Pod 을 직접 소유하므로 한 홉이면 된다. 소유 StatefulSet 이
+    없거나 조회 실패면 (None, err) — desired 는 지어내지 않는다.
+    """
+    sel, serr = service_pod_selector(client, ns, svc)
+    if sel is None:
+        return None, serr
+    ok, data, err = client.get(
+        "/api/v1/namespaces/%s/pods?labelSelector=%s"
+        % (ns, urllib.parse.quote(sel, safe="=,")))
+    if not ok:
+        return None, "pods: %s" % err
+    sts_names = set()
+    for pod in data.get("items") or []:
+        for ref in ((pod.get("metadata") or {}).get("ownerReferences") or []):
+            if ref.get("kind") == "StatefulSet" and ref.get("name"):
+                sts_names.add(ref["name"])
+    if not sts_names:
+        return None, "소유 StatefulSet 없음"
+    desired = 0
+    found = False
+    for name in sorted(sts_names):
+        ok, sdata, _ = client.get(
+            "/apis/apps/v1/namespaces/%s/statefulsets/%s" % (ns, name))
+        if ok:
+            r = _int_or_none((sdata.get("spec") or {}).get("replicas"))
+            if r is not None:
+                desired += r
+                found = True
+    if not found:
+        return None, "statefulset spec.replicas 미상"
+    return {"desired": desired, "source": "statefulset"}, None
+
+
 def _int_or_none(v):
     try:
         return int(v)
@@ -329,6 +369,16 @@ def resolve_backend_count(deployment, client, settings, cache=None):
             if out["backends_ready"] is None:
                 out["backends_ready"] = dep["ready"]
                 out["backend_source"] = "deployment"
+        # Deployment 가 없으면(StatefulSet 으로 뜬 경우) desired 가 여전히 null 이다.
+        # 이름으로는 못 찾으므로(Service↔STS 네이밍 규칙 없음) selector -> Pod ->
+        # ownerReferences 로 소유 StatefulSet 을 찾아 desired 를 보강한다. 이게 없으면
+        # EndpointSlice ready 만 잡혀 집계에서 ready 합 > desired 합(=100% 초과)이 된다.
+        if out["backends_desired"] is None:
+            own, oerr = count_desired_via_selector(client, ns, svc)
+            if own is not None:
+                out["backends_desired"] = own.get("desired")
+            elif oerr:
+                errors.append("desired(selector): %s" % oerr)
 
     if out["backends_ready"] is None and errors:
         out["k8s_error"] = "; ".join(errors)

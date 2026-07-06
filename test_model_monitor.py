@@ -279,6 +279,51 @@ class TestResolveBackendCount(unittest.TestCase):
         self.assertEqual(out["backends_ready"], 2)   # ready=False 1개 제외
         self.assertEqual(out["backend_source"], "endpointslice")
 
+    def test_statefulset_fills_desired_via_selector(self):
+        # StatefulSet 으로 뜬 Service: EndpointSlice 는 ready 만 알고, 같은 이름
+        # Deployment 는 없다(404). Service↔STS 네이밍 규칙이 없으므로 selector 로
+        # Pod 을 찾아 ownerReferences 의 StatefulSet(이름이 svc 와 달라도 됨)에서
+        # spec.replicas 를 읽어 desired 를 채운다 -> 집계 100% 초과가 안 생긴다.
+        client = FakeClient([
+            ("endpointslices",
+             (True, {"items": [{"endpoints": [
+                 {"conditions": {"ready": True}, "addresses": ["1.1.1.1"]},
+             ]}]}, None)),
+            # deployments/<svc> 라우팅 없음 -> 기본 404 (Deployment 아님)
+            ("/services/",
+             (True, {"spec": {"selector": {"app": "emb"}}}, None)),
+            ("pods?labelSelector",
+             (True, {"items": [{"metadata": {"ownerReferences": [
+                 {"kind": "StatefulSet", "name": "emb-vllm-0svc"}]}}]}, None)),
+            ("statefulsets/emb-vllm-0svc",
+             (True, {"spec": {"replicas": 3}}, None)),
+        ], default_namespace="kind")
+        dep = {"api_base": "http://qwen3-embedding-8b.kind:8080/v1"}
+        out = m.resolve_backend_count(dep, client, SETTINGS)
+        # ready 는 EndpointSlice(실제 서빙 엔드포인트) 유지, desired 는 STS 에서 보강
+        self.assertEqual(out["backends_ready"], 1)
+        self.assertEqual(out["backends_desired"], 3)   # degraded 은폐 안 됨(1/3)
+        self.assertEqual(out["backend_source"], "endpointslice")
+
+    def test_bare_pod_leaves_desired_none(self):
+        # 소유 컨트롤러가 없는 bare Pod: selector 로 Pod 은 찾아도 ownerReferences 에
+        # StatefulSet 이 없으면 desired 를 지어내지 않고 None 으로 남긴다.
+        client = FakeClient([
+            ("endpointslices",
+             (True, {"items": [{"endpoints": [
+                 {"conditions": {"ready": True}, "addresses": ["1.1.1.1"]},
+             ]}]}, None)),
+            ("/services/",
+             (True, {"spec": {"selector": {"app": "lonely"}}}, None)),
+            ("pods?labelSelector",
+             (True, {"items": [{"metadata": {}}]}, None)),  # ownerReferences 없음
+        ], default_namespace="kind")
+        dep = {"api_base": "http://lonely-pod.kind:8080/v1"}
+        out = m.resolve_backend_count(dep, client, SETTINGS)
+        self.assertEqual(out["backends_ready"], 1)
+        self.assertIsNone(out["backends_desired"])
+        self.assertEqual(out["backend_source"], "endpointslice")
+
     def test_external_api_base_short_circuits(self):
         client = FakeClient([])
         dep = {"api_base": "http://50.50.65.54:8000/v1"}
