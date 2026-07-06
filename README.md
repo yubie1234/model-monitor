@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.10** — 라우팅 그래프 pin 이 자동 갱신/새로고침마다 풀리던 문제 수정
+**버전: v0.5.11** — StatefulSet 으로 뜬 backend 의 desired(목표 replica)를 selector→Pod ownerRef 로 보강 (Replicas 합계가 100% 를 넘던 문제 수정)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 

@@ -92,6 +92,22 @@ def _node_gpu_product(client, node_name, cache):
     return prod
 
 
+def service_pod_selector(client, ns, svc):
+    """Service 의 spec.selector -> Pod labelSelector 문자열. (sel, err).
+
+    Service 이름 자체가 아니라 selector(라벨)로 Pod 을 찾으므로, Service 와
+    StatefulSet/Deployment 사이의 네이밍 규칙에 의존하지 않는다.
+    """
+    ok, sdata, serr = client.get(
+        "/api/v1/namespaces/%s/services/%s" % (ns, svc))
+    if not ok:
+        return None, "service: %s" % serr
+    seldict = ((sdata.get("spec") or {}).get("selector")) or {}
+    if not seldict:
+        return None, "service 에 selector 없음"
+    return ",".join("%s=%s" % (k, v) for k, v in sorted(seldict.items())), None
+
+
 def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
     """(ns,svc) 뒤 ready Pod 들의 GPU 수 합 + 장치별 집계 + 서빙 엔진 판별.
 
@@ -110,16 +126,10 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
     if found:
         sel = "serving.kserve.io/inferenceservice=%s" % isvc
     else:
-        ok, sdata, serr = client.get(
-            "/api/v1/namespaces/%s/services/%s" % (ns, svc))
-        if not ok:
-            out["gpu_error"] = "service: %s" % serr
+        sel, serr = service_pod_selector(client, ns, svc)
+        if sel is None:
+            out["gpu_error"] = serr
             return out
-        seldict = ((sdata.get("spec") or {}).get("selector")) or {}
-        if not seldict:
-            out["gpu_error"] = "service 에 selector 없음"
-            return out
-        sel = ",".join("%s=%s" % (k, v) for k, v in sorted(seldict.items()))
     ok, data, err = client.get(
         "/api/v1/namespaces/%s/pods?labelSelector=%s"
         % (ns, urllib.parse.quote(sel, safe="=,")))
