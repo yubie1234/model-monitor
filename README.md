@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.13** — 그래프 노드 호버 시 강조 행이 표 스크롤 영역 밖이면 표를 자동 스크롤해 보이게(페이지·그래프는 고정)
+**버전: v0.5.14** — 배포 네임스페이스를 `model-monitor` → `dashboard` 로 변경(deploy/k8s.yaml)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -239,7 +239,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
    ```bash
    # 먼저 deploy/k8s.yaml 의 ConfigMap 에서 LiteLLM url·api_key·namespace 를 실제 값으로 교체
    kubectl apply -f deploy/k8s.yaml
-   kubectl -n model-monitor port-forward svc/model-monitor 8088:80   # 브라우저로 확인
+   kubectl -n dashboard port-forward svc/model-monitor 8088:80   # 브라우저로 확인
    ```
 
 ### Path prefix 뒤로 노출 (`example.com/service/model-monitor`)

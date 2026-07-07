@@ -10,13 +10,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: model-monitor
+  name: dashboard
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: model-monitor
-  namespace: model-monitor
+  namespace: dashboard
 ---
 # LB 뒤 backend Pod 개수 조회에 필요한 최소 권한.
 # 핵심은 endpointslices(1순위). 나머지는 모드 감지/보정용.
@@ -64,13 +64,13 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: model-monitor
-    namespace: model-monitor
+    namespace: dashboard
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: model-monitor-config
-  namespace: model-monitor
+  namespace: dashboard
 data:
   config.json: |
     {
@@ -92,7 +92,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: model-monitor-metrics-token
-  namespace: model-monitor
+  namespace: dashboard
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
@@ -104,11 +104,11 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: model-monitor
-  namespace: model-monitor
+  namespace: dashboard
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "0.5.13"
+    app.kubernetes.io/version: "0.5.14"
 spec:
   replicas: 1
   selector:
@@ -118,7 +118,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "0.5.13"
+        app.kubernetes.io/version: "0.5.14"
     spec:
       serviceAccountName: model-monitor
       containers:
@@ -170,7 +170,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: model-monitor
-  namespace: model-monitor
+  namespace: dashboard
 spec:
   selector: { app: model-monitor }
   ports:
@@ -191,7 +191,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: model-monitor
-  namespace: model-monitor
+  namespace: dashboard
   annotations:
     # 캡처 그룹 $2(= prefix 뒤 나머지 경로)로 rewrite -> 앱은 루트(/...) 로 받는다.
     nginx.ingress.kubernetes.io/rewrite-target: /$2
@@ -229,7 +229,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
   name: model-monitor
-  namespace: model-monitor
+  namespace: dashboard
   labels:
     release: kube-prometheus-stack     # ← Prometheus podMonitorSelector 에 맞게 교체
 spec:
