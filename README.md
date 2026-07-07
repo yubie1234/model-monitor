@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.13** — 그래프 노드 호버 시 강조 행이 표 스크롤 영역 밖이면 표를 자동 스크롤해 보이게(페이지·그래프는 고정)
+**버전: v1.0.0** — 정식 릴리스. 대시보드 UI에서 개발용 설명 문구 정리(실사용자 대상), 배포 네임스페이스 `dashboard`
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
