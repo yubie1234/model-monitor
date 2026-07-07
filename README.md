@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.5.11** — StatefulSet 으로 뜬 backend 의 desired(목표 replica)를 selector→Pod ownerRef 로 보강 (Replicas 합계가 100% 를 넘던 문제 수정)
+**버전: v0.5.12** — 그래프 노드↔Deployments 목록 연동: 노드에 호버하면 대응 행 강조, 클릭(pin)하면 그 항목만 목록에 표시(📌 칩·Esc·빈 배경 클릭으로 해제)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
