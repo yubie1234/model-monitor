@@ -239,7 +239,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
    ```bash
    # 먼저 deploy/k8s.yaml 의 ConfigMap 에서 LiteLLM url·api_key·namespace 를 실제 값으로 교체
    kubectl apply -f deploy/k8s.yaml
-   kubectl -n model-monitor port-forward svc/model-monitor 8088:80   # 브라우저로 확인
+   kubectl -n dashboard port-forward svc/model-monitor 8088:80   # 브라우저로 확인
    ```
 
 ### Path prefix 뒤로 노출 (`example.com/service/model-monitor`)
