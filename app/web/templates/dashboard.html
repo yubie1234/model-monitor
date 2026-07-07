@@ -243,9 +243,7 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Model Monitor <span class="ver" id="ver"></span>
-      <span class="dim">· 떠 있는 모델 &amp; LB 뒤 backend</span></h1>
-    <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
+    <h1>Model Monitor <span class="ver" id="ver"></span></h1>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
     <a class="exp" id="exp-json" href="__BASE_PATH__/snapshot.json" title="현재 상태를 raw JSON 파일로 다운로드 (공유용)">💾 JSON</a>
@@ -273,7 +271,6 @@
   <!-- 그래프(토폴로지)와 Deployments 표를 한 섹션에서 좌우로 — 하나의 필터가 둘을 함께 제어 -->
   <section id="topo-sec">
     <div class="sec-title">Model ↔ Backend
-      <span class="src">model_name → api_base(Service) 라우팅 · ⇄ 공유 백엔드 · /health · k8s replicas · GPU</span>
       <span class="filters">
         <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
@@ -321,13 +318,12 @@
   <section id="groups-sec">
     <details class="collapsible">
       <summary class="sec-title"><span class="chev" aria-hidden="true">▸</span>Model Groups
-        <span class="src">/model_group/info</span>
         <span class="grp-count" id="groups-count"></span></summary>
       <div class="tablewrap"><table id="groups"><thead></thead><tbody></tbody></table></div>
     </details>
   </section>
 
-  <footer id="foot">model_monitor · 표준 라이브러리만 사용 · 데이터 출처는 LiteLLM + Kubernetes API</footer>
+  <footer id="foot">model_monitor</footer>
 </div>
 
 <script>
@@ -967,8 +963,7 @@ function render(snap){
     if(uj) uj.style.display = snap.admin_view ? "none" : "";
   }
   if(snap.version) $("#ver").textContent = "v"+snap.version;
-  $("#foot").textContent = "model_monitor v"+(snap.version||"?")
-    +" · 표준 라이브러리만 사용 · 데이터 출처는 LiteLLM + Kubernetes API";
+  $("#foot").textContent = "model_monitor v"+(snap.version||"?");
   $("#updated").textContent = (snap.ts||"") + (snap.demo?"  (demo)":"");
 }
 
