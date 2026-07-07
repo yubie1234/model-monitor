@@ -682,6 +682,12 @@ function highlightRows(kind, key){
   const sel = kind==="m" ? '[data-model="'+key+'"]'
                          : '[data-svc="'+key+'"],#deployments tbody tr[data-svcs~="'+key+'"]';
   document.querySelectorAll("#deployments tbody tr"+sel).forEach(tr=>tr.classList.add("hl"));
+  // 강조 행이 표 스크롤 영역(.tablewrap) 밖이면 그 컨테이너만 스크롤해 보이게 한다.
+  // scrollTop 을 직접 조정 → 페이지/그래프는 움직이지 않음. 이미 보이면 no-op(불필요한 흔들림 방지).
+  const first=document.querySelector("#deployments tbody tr.hl"), wrap=first&&first.closest(".tablewrap");
+  if(wrap){ const r=first.getBoundingClientRect(), w=wrap.getBoundingClientRect();
+    if(r.top<w.top) wrap.scrollTop+=r.top-w.top-8;
+    else if(r.bottom>w.bottom) wrap.scrollTop+=r.bottom-w.bottom+8; }
 }
 function clearRowHighlight(){
   document.querySelectorAll("#deployments tbody tr.hl").forEach(tr=>tr.classList.remove("hl"));
