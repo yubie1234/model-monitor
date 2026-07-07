@@ -92,6 +92,18 @@
   td.api{font-family:var(--mono);font-size:12px;color:var(--muted);max-width:340px;
     overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   td.name{font-weight:550}
+  /* 그래프 노드에 호버하면 표에서 대응하는 행을 하이라이트 (id 특이도로 grp/child 배경 위에 얹음) */
+  #deployments tbody tr.hl>td{background:rgba(110,139,255,.16)}
+  #deployments tbody tr.hl>td:first-child{box-shadow:inset 3px 0 0 var(--accent)}
+  /* 노드 클릭(pin) 시 표를 그 노드로 좁혔음을 알리는 칩 — 클릭하면 해제 */
+  #pin-badge{margin-left:6px}
+  .pinchip{font-family:var(--mono);font-size:10px;color:var(--accent);cursor:pointer;
+    background:rgba(110,139,255,.12);border:1px solid rgba(110,139,255,.35);
+    border-radius:20px;padding:1px 8px;text-transform:none;letter-spacing:0;white-space:nowrap;
+    line-height:1.5;vertical-align:middle}
+  .pinchip b{color:var(--muted);font-weight:700;margin-left:3px}
+  .pinchip:hover b{color:var(--down)}
+  .pinchip:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
   .pill{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);
     font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px;
@@ -297,7 +309,7 @@
         <div class="graphwrap" id="graphwrap"></div>
       </div>
       <div class="topo-table" id="table-col">
-        <p class="lbl-sm">Deployments</p>
+        <p class="lbl-sm" id="dep-label">Deployments <span id="pin-badge"></span></p>
         <div class="tablewrap"><table id="deployments">
           <thead></thead><tbody></tbody>
         </table></div>
@@ -340,6 +352,10 @@ function saveGraphPin(){
     else sessionStorage.removeItem("mm_graph_pin");
   }catch(e){}
 }
+// 현재 마우스가 올라가 있는 노드 {kind,key}(임시, 저장 안 함). 재렌더(5초 폴링)로 SVG·표가
+// 새로 그려지면 mouseleave 없이 노드가 떨어져 나가 하이라이트가 사라지므로, pin 복원과
+// 똑같이 재렌더 후 hover 도 다시 적용한다(pin 이 있으면 pin 우선 — hover 는 무시).
+let graphHover = null;
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -377,6 +393,7 @@ function showNeedKey(){
     + '내 모델 목록이 보입니다. (admin 키를 넣으면 전체 뷰)</div>';
   $("#cards").innerHTML = "";
   $("#f-count").textContent = "";
+  updatePinBadge(false,"");   // 표를 비우는 화면 — pin 칩도 잔류 금지
   const dt=$("#deployments");
   dt.querySelector("thead").innerHTML="";
   dt.querySelector("tbody").innerHTML='<tr><td class="empty">키 입력 대기 중</td></tr>';
@@ -559,7 +576,10 @@ function groupedRows(merged, shared, showBk, showGpu){
     const bes=groups[name];
     const st=compositeStatus(bes), agg=sumBackends(bes);
     const net=uniqOr(bes.map(netOf),"mixed"), eng=uniqOr(bes.map(engOf),"mixed");
-    let html='<tr class="grp-row"><td>'+compositePill(st)+'</td>'
+    // data-svcs: 이 그룹이 품은 backend 들의 키(공백 구분) — backend 노드 호버 시 자식행뿐
+    // 아니라 부모 그룹행도 함께 하이라이트되게(model 노드 호버가 부모+자식을 밝히는 것과 대칭).
+    const svcs=bes.map(b=>attrId(svcKeyOf(b))).join(" ");
+    let html='<tr class="grp-row" data-model="'+attrId(name)+'" data-svcs="'+svcs+'"><td>'+compositePill(st)+'</td>'
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
       +'<td>'+typeChips(net,eng)+'</td>';
@@ -571,7 +591,7 @@ function groupedRows(merged, shared, showBk, showGpu){
       const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
       const others=sh?[...shared[k]].filter(x=>x!==name):[];
       const svcLabel=svcLabelOf(b);
-      html+='<tr class="child-row"><td>'+statusPill(b.status||"?")+'</td>'
+      html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?")+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
           +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
       if(showBk){ html+='<td>'+backendCell(b)+'</td>';
@@ -593,7 +613,11 @@ function beNodeCls(o){
   if(o.des!=null && o.r<o.des) return "warn";
   return "up";
 }
-function attrId(s){return String(s).replace(/[^a-zA-Z0-9_-]/g,"_");}
+// data-key/data-model/data-svc 및 CSS 속성선택자에 안전하게 쓰는 노드 식별자.
+// encodeURIComponent 는 단사(injective)라 서로 다른 이름이 같은 키로 뭉개지지 않고
+// ('gpt.4' vs 'gpt_4' 등 pin/하이라이트가 엉뚱한 행에 걸리는 충돌 방지),
+// 출력에 " 나 \ 가 없어 큰따옴표 속성값/선택자에 그대로 넣어도 안전하다.
+function attrId(s){return encodeURIComponent(String(s));}
 function buildGraph(deps){
   if(!deps || !deps.length) return "";
   const names=[], seenN={};
@@ -642,6 +666,34 @@ function buildGraph(deps){
     +'<text class="glabel" x="'+colL+'" y="20">Models</text>'
     +'<text class="glabel" x="'+colR+'" y="20">Backends (Service)</text>'
     +edges+mnodes+snodes+'</svg>';
+}
+// ── 그래프 ↔ Deployments 표 연동 ──────────────────────────────────────────
+// 노드의 data-key(attrId) 와 행의 data-model / data-svc(attrId) 가 같은 규칙이라 그대로 매칭.
+function depMatchesPin(d, pin){
+  if(!pin) return true;
+  return pin.kind==="m" ? attrId(d.model_name)===pin.key
+                        : attrId(svcKeyOf(d))===pin.key;
+}
+// 노드 호버: 대응 행에 .hl 부여(그래프 focus 와 짝). 그룹 뷰에선 model 노드가 부모+자식,
+// backend 노드가 그 backend 자식행(공유면 여러 모델의 자식)에 붙는다.
+function highlightRows(kind, key){
+  clearRowHighlight();
+  // backend 노드는 자식행(data-svc)뿐 아니라 그 backend 를 품은 그룹행(data-svcs~=key)도 밝힘
+  const sel = kind==="m" ? '[data-model="'+key+'"]'
+                         : '[data-svc="'+key+'"],#deployments tbody tr[data-svcs~="'+key+'"]';
+  document.querySelectorAll("#deployments tbody tr"+sel).forEach(tr=>tr.classList.add("hl"));
+}
+function clearRowHighlight(){
+  document.querySelectorAll("#deployments tbody tr.hl").forEach(tr=>tr.classList.remove("hl"));
+}
+// 표 라벨의 📌 칩: pin 으로 목록을 좁혔음을 표시(비면 지움). 칩 클릭 해제는 아래 리스너.
+function updatePinBadge(active, label){
+  const pb=$("#pin-badge"); if(!pb) return;
+  // 실제 <button> 이라 키보드(Tab→Enter/Space)로도 해제 가능. 클릭은 #dep-label 위임이 받음.
+  pb.innerHTML = active
+    ? '<button type="button" class="pinchip" aria-label="목록 좁힘 해제: '+esc(label)+'"'
+      +' title="이 노드로 목록을 좁힘 — 클릭(또는 Esc)해 해제">📌 '+esc(trunc(label,22))+' <b>✕</b></button>'
+    : "";
 }
 function wireGraph(svg){
   if(!svg) return;
@@ -695,16 +747,21 @@ function wireGraph(svg){
   // 끌어모은 노드 위로 마우스를 올려 값(<title> tooltip)을 읽어도 배치가 흐트러지지 않는다.
   // (고정 중엔 hover 를 무시 — 예전엔 hover 가 포커스를 가로채 "풀리는" 것처럼 보였다.)
   // 다른 노드로 옮기려면 그 노드를 클릭(재고정), 빈 배경/고정 노드 재클릭으로 해제.
+  // 클릭(pin)은 graphPin 만 갱신하고 render(lastSnap) 로 다시 그린다 — 표를 그 노드로
+  // 좁히고(아래 render), 그래프 focus 는 재렌더 후 복원 로직이 다시 건다(5초 폴링과 동일 경로).
+  const setPin=(p)=>{ graphPin=p; saveGraphPin(); if(typeof lastSnap!=="undefined"&&lastSnap) render(lastSnap); };
   nodes.forEach(node=>{
-    node.addEventListener("mouseenter",()=>{ if(!pinned) apply(node); });
-    node.addEventListener("mouseleave",()=>{ if(!pinned) clear(); });
+    node.addEventListener("mouseenter",()=>{ if(!pinned){
+      graphHover={kind:node.dataset.kind,key:node.dataset.key};
+      apply(node); highlightRows(node.dataset.kind,node.dataset.key); } });
+    node.addEventListener("mouseleave",()=>{ if(!pinned){
+      graphHover=null; clear(); clearRowHighlight(); } });
     node.addEventListener("click",(e)=>{ if(e&&e.stopPropagation)e.stopPropagation();
-      if(pinned===node){pinned=null;graphPin=null;saveGraphPin();clear();}
-      else {pinned=node;graphPin={kind:node.dataset.kind,key:node.dataset.key};
-            saveGraphPin();apply(node);} });
+      const me={kind:node.dataset.kind,key:node.dataset.key};
+      const same=graphPin&&graphPin.kind===me.kind&&graphPin.key===me.key;
+      setPin(same?null:me); });   // 같은 노드 재클릭 → 해제, 다른 노드 → 재고정
   });
-  svg.addEventListener("click",()=>{
-    if(pinned){pinned=null;graphPin=null;saveGraphPin();clear();} });
+  svg.addEventListener("click",()=>{ if(graphPin) setPin(null); });   // 빈 배경 클릭 → 해제
 
   // 재렌더(5초 폴링/필터 변경/F5) 후 고정 복원: 같은 (kind,key) 노드가 아직 있으면
   // 다시 pin + 배치 적용. 노드가 잠시 사라져도(필터/스냅샷 변화) graphPin 은 유지 —
@@ -712,6 +769,11 @@ function wireGraph(svg){
   if(graphPin){
     const n=nodeOf(graphPin.kind, graphPin.key);
     if(n){ pinned=n; apply(n); }
+  } else if(graphHover){
+    // pin 이 없을 때만 hover 복원(pin 우선). 노드가 사라졌으면 hover 상태 폐기.
+    const hn=nodeOf(graphHover.kind, graphHover.key);
+    if(hn){ apply(hn); highlightRows(graphHover.kind, graphHover.key); }
+    else graphHover=null;
   }
 }
 
@@ -791,7 +853,17 @@ function render(snap){
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
     const merged = all.filter(filterDep);
-    graphDeps = merged;
+    graphDeps = merged;   // 그래프는 (status/net/eng) 필터 결과 전체를 그린다 — pin 으로 좁히지 않음
+    // 그래프 노드 클릭(pin) 시: 표만 그 노드로 좁힌다(그래프는 유지 → 다른 노드로 이동 가능).
+    // 핀이 현재 필터 결과에 실제 존재할 때만 좁히고, 없으면(필터로 빠졌거나 스냅샷에서 사라짐)
+    // 표를 비우지 않고 전체를 보여준다 — wireGraph 의 pin 복원 태도와 동일.
+    let tableDeps = merged, pinActive = false, pinLabel = "";
+    if(graphPin){
+      const hit = merged.filter(d=>depMatchesPin(d, graphPin));
+      if(hit.length){ tableDeps = hit; pinActive = true;
+        pinLabel = graphPin.kind==="m" ? hit[0].model_name : svcLabelOf(hit[0]); }
+    }
+    updatePinBadge(pinActive, pinLabel);
     $("#f-count").textContent = (fS||fN||fE)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
@@ -805,17 +877,22 @@ function render(snap){
     dt.querySelector("thead").innerHTML = head;
     // per-user 뷰(uHide)는 내부 컬럼을 숨긴 평면 행으로 그린다(그룹핑은 admin 전용).
     // 그래프는 익명 backend_ref 기반으로 per-user 뷰에서도 그린다(아래 showGraph).
-    const grouped = $("#f-group").checked && !uHide;
+    // backend 노드를 pin 하면 그 Service 하나만 남기는데, 그룹 뷰로 그리면 각 모델 그룹의
+    // 헤더 집계(nbk·Σ replicas·상태)가 "그 backend 하나"만으로 계산돼 실제 규모를 왜곡한다.
+    // → backend pin 일 때는 평면 행으로 그려 행별 실측값(status/replicas/GPU)만 정직하게 보인다.
+    const grouped = $("#f-group").checked && !uHide
+      && !(pinActive && graphPin.kind==="b");
     let body;
-    if(!merged.length){
+    if(!tableDeps.length){   // pinActive 면 hit.length>0 이라 여기 안 옴 — merged 가 빈 경우만
       body = '<tr><td class="empty" colspan="'+ncol+'">필터 결과 없음</td></tr>';
     } else if(grouped){
       // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
       // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
-      body = groupedRows(merged, sharedMap(all), showBk, showGpu);
+      body = groupedRows(tableDeps, sharedMap(all), showBk, showGpu);
     } else {
-      body = merged.map(d=>{
-        let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
+      body = tableDeps.map(d=>{
+        let row = '<tr data-model="'+attrId(d.model_name)+'" data-svc="'+attrId(svcKeyOf(d))+'"><td>'
+          +statusPill(d.status||"?")+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
           +'<td>'+typeChips(netOf(d),engOf(d))+"</td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
@@ -832,6 +909,7 @@ function render(snap){
     dt.querySelector("tbody").innerHTML = body;
   } else {
     $("#f-count").textContent="";
+    updatePinBadge(false,"");   // deployment 없음 — 이전 뷰의 pin 칩 잔류 금지
     dt.querySelector("thead").innerHTML="";
     dt.querySelector("tbody").innerHTML='<tr><td class="empty">deployment 없음 (LiteLLM /model/info 응답 비어있음 또는 미연결)</td></tr>';
   }
@@ -895,6 +973,7 @@ function showUvError(msg){
     + ' — 키를 확인하세요. (전체 뷰로 폴백하지 않습니다)</div>';
   $("#cards").innerHTML = "";
   $("#f-count").textContent = "";
+  updatePinBadge(false,"");   // 표를 비우는 화면 — pin 칩도 잔류 금지
   const dt=$("#deployments");
   dt.querySelector("thead").innerHTML="";
   dt.querySelector("tbody").innerHTML=
@@ -976,7 +1055,18 @@ $("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); }
 $("#f-net").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-eng").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-group").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-graph").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+// 그래프를 끄면(pin 조작 수단이 사라지므로) 표를 좁힌 pin 도 함께 해제한다.
+$("#f-graph").addEventListener("change", ()=>{
+  if(!$("#f-graph").checked && graphPin){ graphPin=null; saveGraphPin(); }
+  if(lastSnap) render(lastSnap); });
+// 📌 pin 칩 클릭 → pin 해제(표 전체 복원). 칩은 매 렌더마다 새로 그려지므로 위임으로 1회만.
+$("#dep-label").addEventListener("click", (e)=>{
+  if(e.target.closest("#pin-badge") && graphPin){
+    graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
+// Esc: pin 해제 — 그래프 노드가 키보드 접근이 안 되므로 좁힘을 되돌릴 탈출구를 항상 제공.
+document.addEventListener("keydown", (e)=>{
+  if(e.key==="Escape" && graphPin){
+    graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
 
 // 키 필수 모드: 키 입력 바 노출 + 조회/지우기/Enter, export 는 admin 키 헤더로.
 if(USER_VIEW){
