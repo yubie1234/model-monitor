@@ -70,12 +70,18 @@
   .grp-count{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--faint);
     background:var(--surface2);border:1px solid var(--border);border-radius:20px;padding:0 8px}
   @media (prefers-reduced-motion:no-preference){.chev{transition:transform .15s ease}}
-  .filters{display:flex;align-items:center;gap:7px;margin-left:auto;
+  .filters{display:flex;align-items:center;gap:7px;margin-left:auto;flex-wrap:wrap;
     text-transform:none;letter-spacing:0}
   .filters label{font-size:10px;color:var(--faint)}
   .filters select{font-family:var(--sans);font-size:12px;color:var(--text);
     background:var(--surface2);border:1px solid var(--border);border-radius:6px;
     padding:3px 7px;cursor:pointer}
+  /* model_name 검색창 — 표와 그래프에 함께 적용되는 필터(status/net/eng 와 동급) */
+  .filters input.search{font-family:var(--sans);font-size:12px;color:var(--text);
+    background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+    padding:3px 9px;min-width:150px;max-width:230px}
+  .filters input.search:focus{outline:none;border-color:var(--accent)}
+  .filters input.search::placeholder{color:var(--faint)}
   .filters .fcount{font-family:var(--mono);font-size:11px;color:var(--faint);
     min-width:54px;text-align:right}
 
@@ -272,11 +278,16 @@
   <section id="topo-sec">
     <div class="sec-title">Model ↔ Backend
       <span class="filters">
+        <input type="search" id="f-search" class="search" autocomplete="off" spellcheck="false"
+               aria-label="model_name 검색"
+               placeholder="🔍 모델 검색  ( / )"
+               title="model_name 으로 필터 — 표·그래프에 함께 적용. 단축키 &quot;/&quot;, 지우기 Esc">
         <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
-        <select id="f-status">
+        <select id="f-status" title="상태로 필터. '이상만(≠UP)'은 정상 확인 안 된 것(DOWN·?)을 한 번에 — 장애 트리아지용">
           <option value="">all</option>
+          <option value="!UP">이상만 (≠UP)</option>
           <option value="UP">UP</option>
           <option value="DOWN">DOWN</option>
           <option value="?">?</option>
@@ -849,8 +860,13 @@ function render(snap){
   const dt = $("#deployments");
   // status/net/engine 필터는 표와 그래프에 똑같이 적용한다(그래프도 필터된 집합만 그림).
   const fS = $("#f-status").value, fN = $("#f-net").value, fE = $("#f-eng").value;
-  const filterDep = d => (!fS || (d.status||"?")===fS)
-    && (!fN || netOf(d)===fN) && (!fE || engOf(d)===fE);
+  // model_name 검색: 대소문자 무시 부분일치. 표·그래프에 status/net/eng 와 함께 적용된다.
+  const fQ = ($("#f-search").value||"").trim().toLowerCase();
+  // status 필터: '!UP'(이상만)은 UP 이 아닌 것(DOWN·?) 전부, 그 외엔 정확히 일치.
+  const stOk = d => !fS || (fS==="!UP" ? (d.status||"?")!=="UP" : (d.status||"?")===fS);
+  const filterDep = d => stOk(d)
+    && (!fN || netOf(d)===fN) && (!fE || engOf(d)===fE)
+    && (!fQ || String(d.model_name||"").toLowerCase().includes(fQ));
   let graphDeps = [];   // 그래프가 그릴 deployment(= 표와 동일한 필터 결과)
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
@@ -866,7 +882,7 @@ function render(snap){
         pinLabel = graphPin.kind==="m" ? hit[0].model_name : svcLabelOf(hit[0]); }
     }
     updatePinBadge(pinActive, pinLabel);
-    $("#f-count").textContent = (fS||fN||fE)
+    $("#f-count").textContent = (fS||fN||fE||fQ)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
     if(showBk) head += '<th>REPLICAS (ready/desired)</th>';
@@ -886,7 +902,8 @@ function render(snap){
       && !(pinActive && graphPin.kind==="b");
     let body;
     if(!tableDeps.length){   // pinActive 면 hit.length>0 이라 여기 안 옴 — merged 가 빈 경우만
-      body = '<tr><td class="empty" colspan="'+ncol+'">필터 결과 없음</td></tr>';
+      const emptyMsg = fQ ? '“'+esc(fQ)+'” 검색 결과 없음' : '필터 결과 없음';
+      body = '<tr><td class="empty" colspan="'+ncol+'">'+emptyMsg+'</td></tr>';
     } else if(grouped){
       // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
       // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
@@ -1052,6 +1069,8 @@ function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
 // 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
+// 검색은 타이핑마다(input) 즉시 반영 — 재수집 없이 표·그래프를 함께 좁힌다.
+$("#f-search").addEventListener("input", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-net").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
 $("#f-eng").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
@@ -1064,10 +1083,20 @@ $("#f-graph").addEventListener("change", ()=>{
 $("#dep-label").addEventListener("click", (e)=>{
   if(e.target.closest("#pin-badge") && graphPin){
     graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
-// Esc: pin 해제 — 그래프 노드가 키보드 접근이 안 되므로 좁힘을 되돌릴 탈출구를 항상 제공.
+// "/" 로 검색창 포커스 — 모델이 많을 때 마우스 없이 바로 탐색(입력/선택 중이면 무시).
 document.addEventListener("keydown", (e)=>{
-  if(e.key==="Escape" && graphPin){
-    graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
+  if(e.key!=="/" || e.ctrlKey || e.metaKey || e.altKey) return;
+  const t=document.activeElement, tag=t&&t.tagName;
+  if(tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT"||(t&&t.isContentEditable)) return;
+  const sb=$("#f-search"); if(sb){ e.preventDefault(); sb.focus(); sb.select(); }
+});
+// Esc: 검색어가 있으면 먼저 그것을 지우고(표·그래프 복원), 없으면 pin 해제.
+// (그래프 노드가 키보드 접근이 안 되므로 좁힘을 되돌릴 탈출구를 항상 제공.)
+document.addEventListener("keydown", (e)=>{
+  if(e.key!=="Escape") return;
+  const sb=$("#f-search");
+  if(sb && sb.value){ sb.value=""; if(lastSnap) render(lastSnap); return; }
+  if(graphPin){ graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
 
 // 키 필수 모드: 키 입력 바 노출 + 조회/지우기/Enter, export 는 admin 키 헤더로.
 if(USER_VIEW){
