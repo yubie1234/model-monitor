@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v1.0.1** — 대시보드에 **model_name 검색**(표·그래프 동시 필터, 단축키 `/`) 추가. admin·per-user 뷰 공통
+**버전: v1.0.2** — **선택적 health check**(`MONITOR_SELECTIVE_HEALTH`): scale-to-zero 를 깨우지 않고 안전한 백엔드만 `/health?model=` 개별 체크
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
