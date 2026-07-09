@@ -13,8 +13,10 @@ import asyncio
 from app import __version__
 from app.services.demo import demo_snapshot
 from app.services.litellm import (
+    _strip_openai_suffix,
+    aggregate_selective_health,
     fetch_health,
-    fetch_health_for_models,
+    fetch_health_for_model,
     select_health_check_models,
 )
 from app.services.snapshot import (
@@ -79,6 +81,16 @@ class Refresher:
             if h is not None:
                 # 비동기로 받아둔 /health 를 주입하고 status/summary 재계산
                 snap["litellm"]["health"] = h
+                # 선택적 health 의 조회 실패/경고는 대시보드가 읽는 litellm.errors
+                # 로 노출한다(health dict 안에만 두면 아무 렌더러도 안 읽어서
+                # 체계적 실패가 조용히 '?' 폴백으로 묻힌다). 홍수 방지 3건 캡.
+                herrs = h.get("errors") or []
+                if herrs:
+                    dst = snap["litellm"].setdefault("errors", [])
+                    dst.extend(herrs[:3])
+                    if len(herrs) > 3:
+                        dst.append("selective health: 외 %d건 실패"
+                                   % (len(herrs) - 3))
                 snap["litellm"]["deployments"] = merge_deployments_with_health(
                     snap["litellm"])
                 snap["summary"] = summarize(snap)
@@ -95,14 +107,24 @@ class Refresher:
             except Exception as e:  # noqa: BLE001
                 await self.store.set_error("%s: %s" % (type(e).__name__, e))
 
-    async def _health_loop(self):
-        # 느린 /health 를 천천히(>=30s) 따로 수집. 도착하면 다음 collect 에 반영됨.
-        url = self.settings.get("litellm_url")
-        key = self.settings.get("api_key")
-        ht = self.settings.get("health_timeout", 90.0)
+    # 선택적 health 동시 조회 수 — main.py 의 수집 스레드 예산(_COLLECT_THREADS=8)
+    # 을 공유하므로 절반만 쓴다(빌드/유저뷰 조회와 경합 방지). 자체 스레드풀 금지.
+    _SELECTIVE_PARALLEL = 4
+    # 모델 1개 조회 타임아웃 상한 — health_timeout(기본 90s)은 "전 백엔드 동시
+    # ping" 기준이라 개별 1콜엔 과하다. 그대로 쓰면 걸린 백엔드 몇 개에 한 회전이
+    # 분 단위로 늘어져 상태가 낡는다.
+    _SELECTIVE_CALL_TIMEOUT = 30.0
+
+    async def _health_loop(self, fetch_once):
+        """느린 health 수집 공통 루프(>=30s 주기) — 전량/선택 모드가 공유한다.
+
+        fetch_once() 가 dict 를 주면 _health 교체, None 이면 유지 — 실패 라운드가
+        마지막 정상 결과를 빈 결과로 덮어쓰지 않는다(전량 fetch_health 는 실패 시
+        None, 선택 aggregate 는 전 모델 실패 시 None 을 주는 공통 계약).
+        """
         while True:
             try:
-                h = await asyncio.to_thread(fetch_health, url, key, ht)
+                h = await fetch_once()
                 if h is not None:
                     async with self._health_lock:
                         self._health = h
@@ -112,31 +134,57 @@ class Refresher:
                 pass
             await asyncio.sleep(max(30.0, self.interval))
 
-    async def _selective_health_loop(self):
-        # 전량 /health(모든 백엔드 ping → scale-to-zero 를 깨움) 대신, 최신 스냅샷의
-        # k8s 판정으로 '찔러도 안전한 모델'만 골라 /health?model= 개별 조회한다.
-        # 결과는 _health 슬롯에 그대로 넣어 기존 주입 경로(collect_once)를 재사용 —
-        # 체크한 모델만 UP/DOWN(health), 나머지는 지금처럼 k8s 폴백(→ '?').
+    async def _fetch_full_health(self):
+        """전량 /health 1회 (LiteLLM 이 모든 백엔드를 실제 ping — 느림)."""
+        return await asyncio.to_thread(
+            fetch_health, self.settings.get("litellm_url"),
+            self.settings.get("api_key"),
+            self.settings.get("health_timeout", 90.0))
+
+    async def _fetch_selective_health(self):
+        """선택적 health 1회: 안전 판정된 모델만 /health?model= 병렬 조회.
+
+        전량 /health(모든 백엔드 ping → scale-to-zero 를 깨움) 대신, 최신 스냅샷의
+        k8s 판정으로 '찔러도 안전한 모델'만 개별 조회한다. 결과는 기존 /health
+        모양이라 collect_once 의 동일 주입 경로를 탄다 — 체크한 모델만
+        UP/DOWN(health), 나머지는 지금처럼 k8s 폴백(→ '?').
+        """
         url = self.settings.get("litellm_url")
         key = self.settings.get("api_key")
-        ht = self.settings.get("health_timeout", 90.0)
-        while True:
-            try:
-                snap = await self.store.get()
-                deps = (((snap or {}).get("litellm") or {})
-                        .get("deployments")) or []
-                if deps:   # 첫 스냅샷 loading 중이면 이번 회차는 건너뜀
-                    names = select_health_check_models(deps)
-                    h = await asyncio.to_thread(
-                        fetch_health_for_models, url, key, names, ht)
-                    if h is not None:
-                        async with self._health_lock:
-                            self._health = h
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001
-                pass
-            await asyncio.sleep(max(30.0, self.interval))
+        ht = min(self.settings.get("health_timeout", 90.0),
+                 self._SELECTIVE_CALL_TIMEOUT)
+        snap = await self.store.get()
+        deps = ((snap.get("litellm") or {}).get("deployments")) or []
+        if not deps:
+            return None   # 첫 스냅샷 수집 전 — 아무것도 바꾸지 않음
+        names = select_health_check_models(deps)
+        if not names:
+            # 체크 대상 없음 → 빈 집계를 주입해 "아무것도 체크 안 함"을 정직하게
+            # 반영(전부 k8s 폴백). k8s 판정 필드 자체가 없으면 backend_count
+            # 비활성/권한 없음 — 조용한 무력화가 되지 않게 경고를 남긴다.
+            h = aggregate_selective_health([])
+            if not any("network_type" in d for d in deps):
+                h["errors"].append(
+                    "selective health: deployment 에 k8s 판정(network_type)이 "
+                    "없어 체크 대상을 못 고름 — backend_count 비활성/권한 확인")
+            return h
+        # ?model= 응답 검증용: 모델별 허용 api_base(접미어 제거) 집합
+        allowed = {}
+        for d in deps:
+            n = d.get("model_name")
+            if n in names and d.get("api_base"):
+                allowed.setdefault(n, set()).add(
+                    _strip_openai_suffix(d["api_base"]))
+        sem = asyncio.Semaphore(self._SELECTIVE_PARALLEL)
+
+        async def one(name):
+            async with sem:
+                ok, data, err = await asyncio.to_thread(
+                    fetch_health_for_model, url, key, name, ht)
+                return (name, ok, data, err)
+
+        results = await asyncio.gather(*(one(n) for n in names))
+        return aggregate_selective_health(list(results), allowed)
 
     async def start(self):
         """첫 스냅샷을 동기로 1회 채운 뒤(즉시 화면에 데이터), 백그라운드 루프 가동."""
@@ -151,10 +199,11 @@ class Refresher:
         # 둘 다 켜져 있으면 전량이 이미 모든 모델을 커버하므로 선택적 루프는 안 띄운다.
         if not self.demo and self.settings.get("litellm_url"):
             if self.settings.get("health", True):
-                self._tasks.append(asyncio.create_task(self._health_loop()))
+                self._tasks.append(asyncio.create_task(
+                    self._health_loop(self._fetch_full_health)))
             elif self.settings.get("selective_health"):
-                self._tasks.append(
-                    asyncio.create_task(self._selective_health_loop()))
+                self._tasks.append(asyncio.create_task(
+                    self._health_loop(self._fetch_selective_health)))
 
     async def stop(self):
         for t in self._tasks:
