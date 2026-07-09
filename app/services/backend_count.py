@@ -270,6 +270,10 @@ def resolve_backend_count(deployment, client, settings, cache=None):
            "scale_to_zero": False, "namespace": None, "service": None,
            "network_type": "-",     # kserve | service | external | '-'(판정 불가)
            "network_type_error": None,   # '-' 일 때 ISVC 조회 실패 원인
+           # Knative 판정(mode 문자열 또는 revision 존재)·activator-only 증거를
+           # 명시 필드로 내보낸다 — 선택적 health check(_deployment_health_safe)가
+           # 문자열 재추론 없이 단일 판정을 쓰게(두 정의가 드리프트하지 않게).
+           "serverless": False, "activator_only": False,
            "k8s_error": None,
            "gpu_ready": None, "gpu_products": {}, "gpu_error": None}
     api_base = deployment.get("api_base")
@@ -298,6 +302,7 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     out["mode"] = info["mode"]
     isvc, revision = info["isvc"], info["revision"]
     serverless = _is_serverless(info["mode"], revision)
+    out["serverless"] = serverless
 
     # 네트워크 타입 — 문자열 추측이 아니라 k8s 사실로 판정한다.
     # ISVC 조회 성공 = KServe 기반. HTTP 404 = ISVC 없음(단순 Service. CRD 미설치도
@@ -351,6 +356,10 @@ def resolve_backend_count(deployment, client, settings, cache=None):
             out["backends_ready"] = es["ready"]
             out["backend_source"] = "endpointslice"
         elif es is not None and es.get("activator_only"):
+            # scale-to-zero 된 Knative Service 의 결정적 증거 — 에러 문자열로만
+            # 남기지 않고 명시 필드로 내보낸다(능동 health check 가 이걸 보고
+            # 절대 ping 하지 않게. ping 은 activator 를 거쳐 백엔드를 깨운다).
+            out["activator_only"] = True
             errors.append("endpointslice: activator only (serverless?)")
         elif es is None and err and "404" in err:
             eps, eerr = count_via_endpoints(client, ns, svc)

@@ -4,6 +4,8 @@
 /health 는 모든 백엔드를 실제 ping 하므로 느리다(수십 초).
 """
 
+import urllib.parse
+
 from app.core.http import http_get_json
 
 
@@ -54,6 +56,158 @@ def fetch_health(url, api_key, timeout):
     return data if (ok and isinstance(data, dict)) else None
 
 
+# ── 선택적 health check (scale-to-zero 를 깨우지 않는 부분 /health) ──────────
+# 전량 /health 는 LiteLLM 이 모든 백엔드를 실제 ping 해서, Knative Serverless
+# (scale-to-zero) 백엔드를 깨우거나 scale-down 을 계속 막는다. 그래서 운영에선
+# MONITOR_HEALTH=false 로 꺼 두는데, 그러면 non-KServe 백엔드의 능동 체크까지
+# 같이 사라진다. 여기서는 k8s 판정(backend_count 가 붙인 mode/scale_to_zero/
+# network_type)으로 "찔러도 안전한 모델"만 골라 /health?model=<name> 으로
+# 개별 조회한다 — ping 은 LiteLLM 이 자기 자격증명으로 대신하므로 모니터가
+# 백엔드 키를 알 필요가 없다.
+
+def _deployment_health_safe(d):
+    """이 deployment 를 능동 health check 해도 안전한가 (fail-safe).
+
+    원칙: '안전이 양성으로 확인된 것만' True. 판정 불가('-'/None)·external·
+    Knative 흔적은 전부 False — 최악의 실패가 "체크 안 해서 ?"이지
+    "idle 백엔드를 깨움"이 되지 않게 한다.
+
+    Knative 판정은 backend_count 가 내보낸 명시 필드(serverless: _is_serverless
+    의 mode+revision 판정, activator_only: EndpointSlice 증거)를 1차로 쓴다 —
+    여기서 문자열을 재추론하면 두 정의가 드리프트한다(mode 검사는 구 스냅샷
+    호환 겸 이중 안전망).
+
+    model_info.active_health_check 수동 override:
+      false → 항상 제외.  true → 판정불가/external 도 체크 허용. 단, k8s 가
+      양성으로 위험(Knative/scale-to-zero/activator)을 확인한 경우는 override
+      보다 우선한다(잘못 단 마커가 idle 백엔드를 깨우지 않게).
+    """
+    ahc = d.get("active_health_check")
+    if ahc is False:
+        return False
+    # ── 양성 위험 신호 — override(true)로도 못 뒤집는다 ──────────────────
+    if d.get("scale_to_zero") or d.get("serverless") or d.get("activator_only"):
+        return False
+    mode = str(d.get("mode") or "").lower()
+    if ("serverless" in mode) or ("knative" in mode):
+        return False
+    # knative-pa / knative-revision 둘 다 Knative 경유 카운트 = 위험
+    if str(d.get("backend_source") or "").startswith("knative"):
+        return False
+    if ahc is True:
+        return True
+    # ── 양성 안전 신호 ──────────────────────────────────────────────────
+    nt = d.get("network_type")
+    if nt == "kserve":
+        # KServe 는 RawDeployment 로 확인된 경우만(activator 없음)
+        return mode == "rawdeployment"
+    if nt == "service":
+        # 'service' 분류는 ISVC 조회 404 에서 나오므로 그 자체는 양성 신호가
+        # 아니다(네이밍이 빗나간 KServe Serverless·순수 Knative Service 도 404
+        # → service). 실제 Pod 가 비-Knative 경로로 카운트된 경우만 안전 확정 —
+        # scale-to-zero 상태면 activator-only 라 카운트가 안 잡혀 여기서 걸러진다.
+        return (d.get("backends_ready") is not None
+                and d.get("backend_source") in ("endpointslice", "endpoints",
+                                                "deployment"))
+    return False   # external / '-' / 미상
+
+
+def select_health_check_models(deployments):
+    """능동 health check 대상 model_name 목록 (정렬·중복 제거).
+
+    /health?model=<name> 은 그 이름의 **모든** deployment 를 ping 하므로,
+    같은 model_name 에 안전/위험 백엔드가 섞여 있으면(예: RawDeployment +
+    Serverless 이중화) 이름 전체를 제외한다 — 하나라도 위험하면 체크 안 함.
+    """
+    by_name = {}
+    for d in deployments or []:
+        name = d.get("model_name")
+        # "?" 는 /model/info 에 model_name 이 없을 때의 표시용 플레이스홀더 —
+        # 실제 모델이 아니므로 /health?model=%3F 같은 무의미 조회를 만들지 않는다.
+        if not name or name == "?":
+            continue
+        by_name.setdefault(name, []).append(d)
+    return sorted(name for name, ds in by_name.items()
+                  if all(_deployment_health_safe(d) for d in ds))
+
+
+def fetch_health_for_model(url, api_key, name, timeout):
+    """/health?model=<name> 1회 조회 -> (ok, data, err).
+
+    병렬화는 호출측(Refresher)이 asyncio 로 한다 — 여기서 자체 스레드풀을 만들면
+    main.py 가 의도적으로 캡한 수집 스레드 예산(_COLLECT_THREADS) 밖의 스레드가
+    생긴다. 이 함수는 블로킹 1콜만 담당한다.
+    """
+    q = urllib.parse.quote(name, safe="")
+    return http_get_json(url.rstrip("/") + "/health?model=" + q, api_key, timeout)
+
+
+def aggregate_selective_health(results, allowed_bases=None):
+    """모델별 /health?model= 응답들을 전체 /health 모양으로 합친다 (순수 함수).
+
+    results: [(name, ok, data, err), ...] — fetch_health_for_model 결과 나열.
+    allowed_bases: {model_name: {base api_base(/v1 등 접미어 제거), ...}} — 주면
+      각 응답을 그 모델의 api_base 로 필터한다. LiteLLM 이 ?model= 을 지원하지
+      않으면(구버전/쿼리를 떼는 프록시) 응답에 전체 백엔드가 섞여 오는데, 그대로
+      집계하면 체크에서 제외한 모델(Serverless 등)의 상태까지 오염된다 — 필터로
+      차단하고 감지 사실을 errors 로 남긴다(ping 자체는 서버측이라 못 막지만
+      잘못된 상태 주입은 막는다).
+
+    반환: 기존 /health 호환 dict(healthy/unhealthy_endpoints ...). 단, 조회
+      대상이 있었는데 **전부 실패**하면 None — 마지막 정상 결과를 빈 결과로
+      덮어쓰지 않기 위해(전량 경로 fetch_health 의 실패 시 None 과 같은 계약).
+      체크에서 빠진 모델은 어느 목록에도 없으므로 k8s 폴백(→ '?')으로 흐른다.
+    """
+    names = sorted({r[0] for r in results})
+    out = {"healthy_endpoints": [], "unhealthy_endpoints": [],
+           "healthy_count": 0, "unhealthy_count": 0,
+           "selective": True, "checked_models": names, "errors": []}
+    healthy_raw, unhealthy_raw = [], []
+    any_ok = False
+    foreign = 0
+    for name, ok, data, err in results:
+        if ok and isinstance(data, dict):
+            any_ok = True
+            for key, bucket in (("healthy_endpoints", healthy_raw),
+                                ("unhealthy_endpoints", unhealthy_raw)):
+                for ep in data.get(key) or []:
+                    if allowed_bases is not None:
+                        base = _strip_openai_suffix(str(ep.get("api_base") or ""))
+                        if base not in (allowed_bases.get(name) or ()):
+                            foreign += 1
+                            continue
+                    bucket.append(ep)
+        elif err:
+            out["errors"].append("health?model=%s: %s" % (name, err))
+    if names and not any_ok:
+        return None   # 전 모델 조회 실패 — 주입 생략(last-good 유지)
+    if foreign:
+        out["errors"].append(
+            "health?model= 응답에 요청 모델 밖 endpoint %d건 — LiteLLM 이 model "
+            "파라미터를 지원하는지 확인 필요(해당 endpoint 는 무시함)" % foreign)
+    # (model, api_base) 로 dedup — 공유 backend 는 여러 모델 응답에 중복돼 온다.
+    # 같은 endpoint 가 healthy/unhealthy 양쪽에 오면(두 병렬 호출 사이 flap)
+    # DOWN 우선: merge 는 healthy 를 먼저 보므로 모순 항목은 unhealthy 에만 남긴다.
+    def _sig(ep):
+        return (str(ep.get("model")), str(ep.get("api_base")))
+    seen_u = set()
+    for ep in unhealthy_raw:
+        s = _sig(ep)
+        if s not in seen_u:
+            seen_u.add(s)
+            out["unhealthy_endpoints"].append(ep)
+    seen_h = set()
+    for ep in healthy_raw:
+        s = _sig(ep)
+        if s in seen_u or s in seen_h:
+            continue
+        seen_h.add(s)
+        out["healthy_endpoints"].append(ep)
+    out["healthy_count"] = len(out["healthy_endpoints"])
+    out["unhealthy_count"] = len(out["unhealthy_endpoints"])
+    return out
+
+
 def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True):
     """LiteLLM 게이트웨이에서 모델 그룹 + deployment(api_base) + health 수집.
 
@@ -97,7 +251,7 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
             name = d.get("model_name", "?")
             underlying = lp.get("model", "")
             api_base = lp.get("api_base")
-            result["deployments"].append({
+            dep = {
                 "model_name": name,
                 "underlying": underlying,
                 "api_base": api_base,
@@ -107,7 +261,23 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
                 # 판정하면 그 값으로 덮어쓴다(backend_type_source="pod").
                 "backend_type": _classify_engine(name, underlying, api_base or ""),
                 "backend_type_source": "name",
-            })
+            }
+            # 선택적 health check 수동 override — LiteLLM config 의
+            # model_info.active_health_check (true=판정불가여도 체크 허용,
+            # false=항상 제외). 없으면 k8s 판정(select_health_check_models)만 쓴다.
+            # bool() 강제 변환 금지: YAML 에 "false"(따옴표 문자열)로 쓰는 흔한
+            # 실수가 bool("false")==True 로 뒤집혀 opt-out 이 opt-in 이 된다.
+            # bool 과 명시적 true/false 문자열만 인정, 그 외 값은 무시(fail-safe).
+            ahc = mi.get("active_health_check")
+            if isinstance(ahc, bool):
+                dep["active_health_check"] = ahc
+            elif isinstance(ahc, str):
+                low = ahc.strip().lower()
+                if low in ("true", "1", "yes", "on"):
+                    dep["active_health_check"] = True
+                elif low in ("false", "0", "no", "off"):
+                    dep["active_health_check"] = False
+            result["deployments"].append(dep)
     elif err:
         result["errors"].append("model/info: %s" % err)
 

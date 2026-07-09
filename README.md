@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v1.0.1** — 대시보드에 **model_name 검색**(표·그래프 동시 필터, 단축키 `/`) 추가. admin·per-user 뷰 공통
+**버전: v1.0.2** — **선택적 health check**(`MONITOR_SELECTIVE_HEALTH`): scale-to-zero 를 깨우지 않고 안전한 백엔드만 `/health?model=` 개별 체크
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -207,6 +207,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_DEMO` | 샘플 데이터 모드 (false) |
 | `MONITOR_TIMEOUT` | HTTP 타임아웃 초 (10) |
 | `MONITOR_HEALTH` / `MONITOR_HEALTH_TIMEOUT` | `/health` 사용 / 타임아웃 초 (true / 90) |
+| `MONITOR_SELECTIVE_HEALTH` | 선택적 health check (false) — `MONITOR_HEALTH=false`일 때, k8s 판정으로 안전한 모델만 `/health?model=` 개별 조회. Knative(Serverless/revision/activator 증거)·scale-to-zero·판정불가·external 은 체크하지 않아 idle 백엔드를 깨우지 않음. KServe RawDeployment·Pod 카운트가 확인된 일반 Service 는 UP/DOWN 판정. LiteLLM `model_info.active_health_check: true/false` 로 모델별 수동 override(true=판정불가여도 체크, false=항상 제외; 단 Knative 로 확인되면 true 도 무시. bool 또는 "true"/"false" 문자열만 인정) |
 | `MONITOR_PROBE_BACKENDS` | 백엔드 직접 probe (false) |
 | `MONITOR_BACKEND_COUNT` | LB 뒤 backend Pod 개수 수집 (true) |
 | `MONITOR_GPU_INFO` | GPU 개수/장치명 수집 (true; Pod·Node 읽기 권한 필요) |

@@ -68,6 +68,11 @@ m = types.SimpleNamespace(
     SnapshotStore=_state.SnapshotStore,
     Refresher=_state.Refresher,
     build_collector_settings=_build_cs,
+    _deployment_health_safe=_ll._deployment_health_safe,
+    select_health_check_models=_ll.select_health_check_models,
+    fetch_health_for_model=_ll.fetch_health_for_model,
+    aggregate_selective_health=_ll.aggregate_selective_health,
+    collect_litellm=_ll.collect_litellm,
 )
 
 
@@ -184,6 +189,303 @@ class TestMergeWithHealth(unittest.TestCase):
         self.assertEqual(merged["E"]["status"], "?")
 
 
+def _safe_service(**over):
+    """안전 판정을 통과하는 일반 Service deployment 최소 dict (테스트 헬퍼)."""
+    d = {"model_name": "a", "network_type": "service", "mode": "Unknown",
+         "backend_source": "endpointslice", "backends_ready": 2}
+    d.update(over)
+    return d
+
+
+class TestSelectHealthCheckModels(unittest.TestCase):
+    """선택적 health check 대상 선별 — fail-safe 가 생명.
+
+    잘못 포함하면 scale-to-zero(Knative Serverless) 백엔드를 깨우므로,
+    '안전이 양성으로 확인된 것만' 통과해야 한다. 여기 케이스들이 그 계약."""
+
+    def test_raw_deployment_kserve_included(self):
+        # KServe 라도 RawDeployment(activator 없음)로 확인되면 체크 대상
+        d = {"model_name": "a", "network_type": "kserve",
+             "mode": "RawDeployment", "backend_source": "deployment",
+             "backends_ready": 1}
+        self.assertTrue(m._deployment_health_safe(d))
+
+    def test_raw_deployment_mode_case_insensitive(self):
+        # mode 는 클러스터 값을 그대로 echo — 대소문자가 달라도 안전 판정 유지
+        d = {"model_name": "a", "network_type": "kserve",
+             "mode": "rawDeployment"}
+        self.assertTrue(m._deployment_health_safe(d))
+
+    def test_plain_service_with_count_evidence_included(self):
+        self.assertTrue(m._deployment_health_safe(_safe_service()))
+        self.assertTrue(m._deployment_health_safe(
+            _safe_service(backend_source="endpoints")))
+        self.assertTrue(m._deployment_health_safe(
+            _safe_service(backend_source="deployment")))
+
+    def test_service_without_count_evidence_excluded(self):
+        # 회귀: 'service' 분류는 ISVC 404 에서 나온다(네이밍 빗나간 KServe
+        # Serverless·순수 Knative Service 포함). scale-to-zero 상태면 카운트가
+        # 안 잡히므로(backends_ready=None/source=none) 반드시 제외 — 이걸
+        # 통과시키면 idle 백엔드를 깨운다.
+        self.assertFalse(m._deployment_health_safe(
+            {"model_name": "a", "network_type": "service",
+             "mode": "Unknown", "backend_source": "none"}))
+        self.assertFalse(m._deployment_health_safe(
+            _safe_service(backends_ready=None)))
+
+    def test_serverless_mode_excluded(self):
+        # Serverless = ping 이 activator 를 깨움/scale-down 저지 → 절대 제외
+        d = {"model_name": "a", "network_type": "kserve", "mode": "Serverless"}
+        self.assertFalse(m._deployment_health_safe(d))
+
+    def test_serverless_flag_excluded_even_with_marker(self):
+        # 회귀: mode 가 Unknown 이어도 revision 기반 Knative 판정(serverless
+        # 필드)이 있으면 마커 true 로도 못 뒤집는다.
+        d = _safe_service(serverless=True, active_health_check=True)
+        self.assertFalse(m._deployment_health_safe(d))
+
+    def test_activator_only_excluded_even_with_marker(self):
+        # 회귀: EndpointSlice 가 activator-only(=scale-to-zero 증거)면 제외.
+        d = _safe_service(activator_only=True, active_health_check=True)
+        self.assertFalse(m._deployment_health_safe(d))
+
+    def test_scale_to_zero_excluded(self):
+        self.assertFalse(m._deployment_health_safe(
+            _safe_service(scale_to_zero=True)))
+
+    def test_knative_sources_excluded(self):
+        # 회귀: knative-pa 뿐 아니라 knative-revision 도 Knative 경유 = 위험.
+        for src in ("knative-pa", "knative-revision"):
+            d = {"model_name": "a", "network_type": "kserve",
+                 "mode": "RawDeployment", "backend_source": src,
+                 "backends_ready": 1, "active_health_check": True}
+            self.assertFalse(m._deployment_health_safe(d), src)
+
+    def test_undetermined_and_external_excluded(self):
+        # 판정 불가('-'/없음)와 external 은 안전 확인이 안 됐으므로 제외(fail-safe)
+        self.assertFalse(m._deployment_health_safe(
+            {"model_name": "a", "network_type": "-"}))
+        self.assertFalse(m._deployment_health_safe({"model_name": "a"}))
+        self.assertFalse(m._deployment_health_safe(
+            {"model_name": "a", "network_type": "external",
+             "backend_source": "external"}))
+
+    def test_kserve_unknown_mode_excluded(self):
+        # KServe 인데 mode 판정 실패(Unknown) → Serverless 일 수 있으니 제외
+        d = {"model_name": "a", "network_type": "kserve", "mode": "Unknown"}
+        self.assertFalse(m._deployment_health_safe(d))
+
+    def test_marker_false_always_excluded(self):
+        self.assertFalse(m._deployment_health_safe(
+            _safe_service(active_health_check=False)))
+
+    def test_marker_true_rescues_undetermined(self):
+        # override true → 판정불가/external 도 체크 허용
+        self.assertTrue(m._deployment_health_safe(
+            {"model_name": "a", "network_type": "-",
+             "active_health_check": True}))
+        self.assertTrue(m._deployment_health_safe(
+            {"model_name": "a", "network_type": "external",
+             "active_health_check": True}))
+
+    def test_marker_true_cannot_override_positive_danger(self):
+        # 양성 위험(Serverless/scale-to-zero)은 마커로도 못 뒤집는다
+        self.assertFalse(m._deployment_health_safe(
+            {"model_name": "a", "mode": "Serverless",
+             "active_health_check": True}))
+        self.assertFalse(m._deployment_health_safe(
+            _safe_service(scale_to_zero=True, active_health_check=True)))
+
+    def test_mixed_name_excluded_entirely(self):
+        # /health?model=<name> 은 그 이름의 모든 deployment 를 ping 하므로,
+        # 같은 이름에 안전+위험 백엔드가 섞이면 이름 전체를 제외해야 한다.
+        deps = [
+            {"model_name": "mixed", "network_type": "kserve",
+             "mode": "RawDeployment"},
+            {"model_name": "mixed", "network_type": "kserve",
+             "mode": "Serverless"},
+            _safe_service(model_name="safe"),
+        ]
+        self.assertEqual(m.select_health_check_models(deps), ["safe"])
+
+    def test_placeholder_name_skipped(self):
+        # 회귀: model_name 없는 항목은 "?" 플레이스홀더가 되는데, 이를 체크하면
+        # /health?model=%3F 무의미 조회가 매 주기 나간다 — 제외해야 한다.
+        deps = [_safe_service(model_name="?"), _safe_service(model_name="ok")]
+        self.assertEqual(m.select_health_check_models(deps), ["ok"])
+
+    def test_dedup_and_sort(self):
+        deps = [
+            _safe_service(model_name="b"),
+            _safe_service(model_name="b"),
+            {"model_name": "a", "network_type": "kserve",
+             "mode": "RawDeployment"},
+        ]
+        self.assertEqual(m.select_health_check_models(deps), ["a", "b"])
+
+
+class TestFetchHealthForModel(unittest.TestCase):
+    """/health?model= 1회 조회 — URL 인코딩과 인자 전달만 책임진다."""
+
+    def test_url_encodes_model_name(self):
+        calls = []
+        def fake(url, key=None, timeout=10):
+            calls.append(url)
+            return True, {"healthy_endpoints": [], "unhealthy_endpoints": []}, None
+        orig = _ll.http_get_json
+        _ll.http_get_json = fake
+        self.addCleanup(lambda: setattr(_ll, "http_get_json", orig))
+        ok, data, err = m.fetch_health_for_model("http://llm/", "sk", "a b/c", 10)
+        self.assertTrue(ok)
+        self.assertEqual(calls, ["http://llm/health?model=a%20b%2Fc"])
+
+
+class TestAggregateSelectiveHealth(unittest.TestCase):
+    """/health?model= 응답 집계 — 기존 /health 모양과 호환이어야 merge 재사용."""
+
+    def test_aggregates_and_merge_compat(self):
+        results = [
+            ("a", True, {"healthy_endpoints": [
+                {"model": "m/a", "api_base": "http://a/v1"}],
+                "unhealthy_endpoints": []}, None),
+            ("b", True, {"healthy_endpoints": [],
+                         "unhealthy_endpoints": [
+                             {"model": "m/b", "api_base": "http://b/v1"}]}, None),
+        ]
+        h = m.aggregate_selective_health(results)
+        self.assertEqual(h["healthy_count"], 1)
+        self.assertEqual(h["unhealthy_count"], 1)
+        self.assertTrue(h["selective"])
+        self.assertEqual(h["checked_models"], ["a", "b"])
+        # merge_deployments_with_health 에 그대로 주입 가능해야 한다
+        merged = m.merge_deployments_with_health({
+            "health": h,
+            "deployments": [
+                {"model_name": "a", "api_base": "http://a/v1"},
+                {"model_name": "b", "api_base": "http://b/v1"},
+                {"model_name": "skipped", "api_base": "http://c/v1"},
+            ]})
+        st = {d["model_name"]: d["status"] for d in merged}
+        self.assertEqual(st, {"a": "UP", "b": "DOWN", "skipped": "?"})
+
+    def test_one_failure_does_not_block_others(self):
+        results = [
+            ("bad", False, None, "HTTP 500 boom"),
+            ("ok", True, {"healthy_endpoints": [
+                {"model": "m/ok", "api_base": "http://ok/v1"}],
+                "unhealthy_endpoints": []}, None),
+        ]
+        h = m.aggregate_selective_health(results)
+        self.assertEqual(h["healthy_count"], 1)
+        self.assertEqual(len(h["errors"]), 1)
+        self.assertIn("health?model=bad", h["errors"][0])
+
+    def test_all_failed_returns_none_keeps_last_good(self):
+        # 회귀: 전 모델 조회 실패 라운드가 빈 dict 를 반환하면 직전 정상 health
+        # 를 덮어써 DOWN 이던 모델이 k8s 폴백으로 UP 으로 뒤집힌다 — None 을
+        # 반환해 주입을 생략(fetch_health 의 실패 시 None 과 동일 계약)해야 한다.
+        results = [("a", False, None, "connection error"),
+                   ("b", False, None, "HTTP 502")]
+        self.assertIsNone(m.aggregate_selective_health(results))
+
+    def test_empty_results_returns_empty_dict(self):
+        # 체크 대상이 없던 라운드(전부 Serverless 등)는 실패가 아니라 "아무것도
+        # 체크 안 함" — 빈 집계를 반환해 전부 k8s 폴백으로 정직하게 흐른다.
+        h = m.aggregate_selective_health([])
+        self.assertIsNotNone(h)
+        self.assertEqual(h["healthy_count"], 0)
+        self.assertEqual(h["checked_models"], [])
+
+    def test_dedups_shared_backend_endpoints(self):
+        ep = {"model": "m/shared", "api_base": "http://s/v1"}
+        results = [
+            ("a", True, {"healthy_endpoints": [dict(ep)],
+                         "unhealthy_endpoints": []}, None),
+            ("b", True, {"healthy_endpoints": [dict(ep)],
+                         "unhealthy_endpoints": []}, None),
+        ]
+        h = m.aggregate_selective_health(results)
+        self.assertEqual(h["healthy_count"], 1)
+
+    def test_contradiction_down_wins(self):
+        # 회귀: 같은 endpoint 가 한 응답에선 healthy, 다른 응답에선 unhealthy
+        # (두 병렬 호출 사이 flap)면 — merge 가 healthy 를 먼저 보므로 —
+        # healthy 쪽을 버려 DOWN 이 이겨야 한다(이중 집계도 금지).
+        ep = {"model": "m/shared", "api_base": "http://s/v1"}
+        results = [
+            ("a", True, {"healthy_endpoints": [dict(ep)],
+                         "unhealthy_endpoints": []}, None),
+            ("b", True, {"healthy_endpoints": [],
+                         "unhealthy_endpoints": [dict(ep)]}, None),
+        ]
+        h = m.aggregate_selective_health(results)
+        self.assertEqual(h["healthy_count"], 0)
+        self.assertEqual(h["unhealthy_count"], 1)
+        merged = m.merge_deployments_with_health({
+            "health": h,
+            "deployments": [{"model_name": "a", "api_base": "http://s/v1"}]})
+        self.assertEqual(merged[0]["status"], "DOWN")
+
+    def test_foreign_endpoints_filtered_and_flagged(self):
+        # 회귀: LiteLLM 이 ?model= 을 무시하면(구버전/프록시) 전체 백엔드가 섞여
+        # 온다 — 요청 모델의 api_base 밖 endpoint 는 버리고 경고를 남겨야
+        # 체크 제외 모델(Serverless)의 상태 오염을 막는다.
+        results = [("a", True, {
+            "healthy_endpoints": [
+                {"model": "m/a", "api_base": "http://a/v1"},
+                {"model": "m/other", "api_base": "http://serverless/v1"}],
+            "unhealthy_endpoints": []}, None)]
+        h = m.aggregate_selective_health(
+            results, allowed_bases={"a": {"http://a"}})
+        self.assertEqual(h["healthy_count"], 1)
+        self.assertEqual(h["healthy_endpoints"][0]["api_base"], "http://a/v1")
+        self.assertTrue(any("모델 밖 endpoint" in e for e in h["errors"]))
+
+
+class TestActiveHealthCheckMarker(unittest.TestCase):
+    """model_info.active_health_check 파싱 — bool() 강제 변환 금지.
+
+    회귀: YAML 에 "false"(따옴표 문자열)로 쓰는 흔한 실수가 bool("false")==True
+    로 뒤집히면 운영자의 opt-out 이 opt-in 이 되어 제외하려던 모델을 ping 한다."""
+
+    _SENTINEL = object()   # "키 자체가 없음" 표시
+
+    def _collect(self, ahc_value):
+        def fake(url, key=None, timeout=10):
+            if "/model/info" in url:
+                mi = {"id": "x"}
+                if ahc_value is not self._SENTINEL:
+                    mi["active_health_check"] = ahc_value
+                return True, {"data": [{
+                    "model_name": "mm",
+                    "litellm_params": {"model": "m", "api_base": "http://a/v1"},
+                    "model_info": mi}]}, None
+            return False, None, "skip"
+        orig = _ll.http_get_json
+        _ll.http_get_json = fake
+        try:
+            r = m.collect_litellm("http://llm", "sk", 5, with_health=False)
+        finally:
+            _ll.http_get_json = orig
+        return r["deployments"][0]
+
+    def test_bool_passthrough(self):
+        self.assertIs(self._collect(True).get("active_health_check"), True)
+        self.assertIs(self._collect(False).get("active_health_check"), False)
+
+    def test_string_false_is_not_true(self):
+        self.assertIs(self._collect("false").get("active_health_check"), False)
+        self.assertIs(self._collect("no").get("active_health_check"), False)
+        self.assertIs(self._collect("True").get("active_health_check"), True)
+
+    def test_unknown_values_ignored(self):
+        # 인식 불가 값/타입은 마커 없음과 동일(fail-safe: opt-in 으로 안 둔갑)
+        self.assertNotIn("active_health_check", self._collect("maybe"))
+        self.assertNotIn("active_health_check", self._collect(1))
+        self.assertNotIn("active_health_check", self._collect(self._SENTINEL))
+
+
 class TestSummarize(unittest.TestCase):
     def test_cards_match_table_when_health_times_out(self):
         # 회귀 테스트: /health 타임아웃(health=None)이라도 카드 healthy 수가
@@ -278,6 +580,46 @@ class TestResolveBackendCount(unittest.TestCase):
         out = m.resolve_backend_count(dep, client, SETTINGS)
         self.assertEqual(out["backends_ready"], 2)   # ready=False 1개 제외
         self.assertEqual(out["backend_source"], "endpointslice")
+
+    def test_serverless_flag_exported_via_revision(self):
+        # 회귀: deploymentMode 가 없어도(모드 "Unknown") revision 이 있으면
+        # Knative-backed — serverless=True 를 명시 필드로 내보내야
+        # 능동 health check 가 마커(true)로도 이 백엔드를 ping 하지 못한다.
+        client = FakeClient([
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"components": {"predictor": {
+                 "latestReadyRevision": "qwen36-35b-predictor-00001"}}}}, None)),
+            ("labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 1},
+                                "spec": {"replicas": 1}}]}, None)),
+        ], default_namespace="kserve")
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        out = m.resolve_backend_count(dep, client, SETTINGS)
+        self.assertTrue(out["serverless"])
+        self.assertEqual(out["mode"], "Unknown")
+        self.assertEqual(out["backends_ready"], 1)   # 떠 있어도(0 아님) 위험
+        self.assertFalse(m._deployment_health_safe(
+            dict(out, model_name="x", active_health_check=True)))
+
+    def test_activator_only_exported(self):
+        # 회귀: EndpointSlice 가 activator 뿐(=scale-to-zero 된 Knative Service)
+        # 이면 activator_only=True 를 명시 필드로 내보내야 — ISVC 404 로
+        # network_type 이 "service" 여도 능동 health check 가 절대 ping 안 한다.
+        client = FakeClient([
+            ("endpointslices",
+             (True, {"items": [{"endpoints": [
+                 {"conditions": {"ready": True}, "addresses": ["1.1.1.1"],
+                  "targetRef": {"namespace": "knative-serving",
+                                "name": "activator-abc"}},
+             ]}]}, None)),
+        ], default_namespace="serving")
+        dep = {"api_base": "http://pure-knative.serving.svc:80/v1"}
+        out = m.resolve_backend_count(dep, client, SETTINGS)
+        self.assertTrue(out["activator_only"])
+        self.assertEqual(out["network_type"], "service")   # ISVC 404
+        self.assertIsNone(out["backends_ready"])
+        self.assertFalse(m._deployment_health_safe(
+            dict(out, model_name="x", active_health_check=True)))
 
     def test_statefulset_fills_desired_via_selector(self):
         # StatefulSet 으로 뜬 Service: EndpointSlice 는 ready 만 알고, 같은 이름
@@ -1210,7 +1552,7 @@ def _settings_ns(**over):
     base = dict(
         host="0.0.0.0", port=8088, interval=5.0, demo=False,
         litellm_url=None, api_key=None, timeout=10.0, health=True,
-        health_timeout=90.0, probe_backends=False,
+        health_timeout=90.0, selective_health=False, probe_backends=False,
         backend_count=True, gpu_info=True,
         k8s_api_server=None, k8s_token_file="/t/token", k8s_ca_file="/t/ca",
         k8s_insecure=False, k8s_timeout=5.0,
@@ -1281,6 +1623,27 @@ class TestBuildCollectorSettings(unittest.TestCase):
             os.unlink(path)
         self.assertEqual(c["litellm_url"], "http://env-llm:4000")  # env 우선
         self.assertFalse(c["backend_count"])                       # env 우선
+
+    def test_selective_health_default_env_file(self):
+        # 기본 false / env 우선 / 파일(litellm.selective_health) 반영
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(
+                m.build_collector_settings(_settings_ns())["selective_health"])
+        with mock.patch.dict(os.environ,
+                             {"MONITOR_SELECTIVE_HEALTH": "true"}, clear=True):
+            c = m.build_collector_settings(_settings_ns(selective_health=True))
+        self.assertTrue(c["selective_health"])
+        cfg = {"litellm": {"selective_health": True}}
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                c = m.build_collector_settings(_settings_ns(config_file=path))
+        finally:
+            os.unlink(path)
+        self.assertTrue(c["selective_health"])   # 파일값 반영
 
     def test_metrics_token_env_beats_file(self):
         cfg = {"metrics": {"enabled": True, "token": "file-tok"}}
