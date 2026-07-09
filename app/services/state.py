@@ -12,7 +12,11 @@ import asyncio
 
 from app import __version__
 from app.services.demo import demo_snapshot
-from app.services.litellm import fetch_health
+from app.services.litellm import (
+    fetch_health,
+    fetch_health_for_models,
+    select_health_check_models,
+)
 from app.services.snapshot import (
     build_snapshot,
     merge_deployments_with_health,
@@ -108,6 +112,32 @@ class Refresher:
                 pass
             await asyncio.sleep(max(30.0, self.interval))
 
+    async def _selective_health_loop(self):
+        # 전량 /health(모든 백엔드 ping → scale-to-zero 를 깨움) 대신, 최신 스냅샷의
+        # k8s 판정으로 '찔러도 안전한 모델'만 골라 /health?model= 개별 조회한다.
+        # 결과는 _health 슬롯에 그대로 넣어 기존 주입 경로(collect_once)를 재사용 —
+        # 체크한 모델만 UP/DOWN(health), 나머지는 지금처럼 k8s 폴백(→ '?').
+        url = self.settings.get("litellm_url")
+        key = self.settings.get("api_key")
+        ht = self.settings.get("health_timeout", 90.0)
+        while True:
+            try:
+                snap = await self.store.get()
+                deps = (((snap or {}).get("litellm") or {})
+                        .get("deployments")) or []
+                if deps:   # 첫 스냅샷 loading 중이면 이번 회차는 건너뜀
+                    names = select_health_check_models(deps)
+                    h = await asyncio.to_thread(
+                        fetch_health_for_models, url, key, names, ht)
+                    if h is not None:
+                        async with self._health_lock:
+                            self._health = h
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(max(30.0, self.interval))
+
     async def start(self):
         """첫 스냅샷을 동기로 1회 채운 뒤(즉시 화면에 데이터), 백그라운드 루프 가동."""
         try:
@@ -116,10 +146,15 @@ class Refresher:
             await self.store.set_error("%s: %s" % (type(e).__name__, e))
 
         self._tasks.append(asyncio.create_task(self._refresh_loop()))
-        # health 수집은 데모가 아니고 health 가 켜져 있으며 litellm_url 이 있을 때만
-        if (not self.demo and self.settings.get("health", True)
-                and self.settings.get("litellm_url")):
-            self._tasks.append(asyncio.create_task(self._health_loop()))
+        # health 수집은 데모가 아니고 litellm_url 이 있을 때만.
+        # 우선순위: 전량 /health(MONITOR_HEALTH=true) > 선택적(MONITOR_SELECTIVE_HEALTH=true).
+        # 둘 다 켜져 있으면 전량이 이미 모든 모델을 커버하므로 선택적 루프는 안 띄운다.
+        if not self.demo and self.settings.get("litellm_url"):
+            if self.settings.get("health", True):
+                self._tasks.append(asyncio.create_task(self._health_loop()))
+            elif self.settings.get("selective_health"):
+                self._tasks.append(
+                    asyncio.create_task(self._selective_health_loop()))
 
     async def stop(self):
         for t in self._tasks:

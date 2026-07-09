@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     health: bool = Field(True, validation_alias=AliasChoices("MONITOR_HEALTH"))
     health_timeout: float = Field(
         90.0, validation_alias=AliasChoices("MONITOR_HEALTH_TIMEOUT"))
+    # 선택적 health: 전량 /health 가 꺼져 있을 때(health=false), k8s 판정으로
+    # 안전한 모델만 /health?model= 개별 체크 (scale-to-zero 는 깨우지 않음)
+    selective_health: bool = Field(
+        False, validation_alias=AliasChoices("MONITOR_SELECTIVE_HEALTH"))
 
     # --- 백엔드 직접 probe ---
     probe_backends: bool = Field(
@@ -180,6 +184,9 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
         "health_timeout": float(_pick(
             _env_set("MONITOR_HEALTH_TIMEOUT"),
             settings.health_timeout, litellm.get("health_timeout"), 90.0)),
+        "selective_health": _pick(
+            _env_set("MONITOR_SELECTIVE_HEALTH"),
+            settings.selective_health, litellm.get("selective_health"), False),
         # --- k8s backend 개수 / GPU ---
         "backend_count": backend_count,
         "gpu_info": gpu_info,
