@@ -28,10 +28,19 @@ def http_get_json(url, api_key=None, timeout=10):
     except urllib.error.HTTPError as e:
         body = ""
         try:
-            body = e.read().decode("utf-8", "replace")[:200]
+            body = e.read().decode("utf-8", "replace")
         except Exception:
             pass
-        return False, None, "HTTP %s %s %s" % (e.code, e.reason, body)
+        # 에러 본문이 JSON 이면 파싱해서 data 로 함께 돌려준다(ok=False 는 유지;
+        # 호출측은 ok 를 먼저 보므로 기존 동작과 호환). LiteLLM /health 는 대상이
+        # unhealthy 면 HTTP 503 에 정상 health payload 를 실어 보내는데, 본문을
+        # 버리면 유효한 상태 정보를 통째로 잃는다.
+        parsed = None
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            pass
+        return False, parsed, "HTTP %s %s %s" % (e.code, e.reason, body[:200])
     except urllib.error.URLError as e:
         return False, None, "connection error: %s" % e.reason
     except Exception as e:  # noqa: BLE001

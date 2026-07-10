@@ -50,10 +50,23 @@ def _strip_openai_suffix(api_base):
     return base
 
 
+def _is_health_payload(data):
+    """dict 가 LiteLLM /health 응답 모양인가 (healthy/unhealthy_endpoints 보유)."""
+    return isinstance(data, dict) and (
+        "healthy_endpoints" in data or "unhealthy_endpoints" in data)
+
+
 def fetch_health(url, api_key, timeout):
-    """LiteLLM /health 만 단독 조회 (느려서 비동기로 돌릴 때 사용). dict|None."""
+    """LiteLLM /health 만 단독 조회 (느려서 비동기로 돌릴 때 사용). dict|None.
+
+    LiteLLM 은 unhealthy 백엔드가 있으면 HTTP 200 이 아니라 **503 에 동일한
+    health payload** 를 실어 보낸다 — 상태코드만 보고 버리면 '전부 DOWN' 같은
+    가장 중요한 순간의 상태 정보를 잃으므로, 본문이 health 모양이면 수용한다.
+    """
     ok, data, err = http_get_json(url.rstrip("/") + "/health", api_key, timeout)
-    return data if (ok and isinstance(data, dict)) else None
+    if ok and isinstance(data, dict):
+        return data
+    return data if _is_health_payload(data) else None
 
 
 # ── 선택적 health check (scale-to-zero 를 깨우지 않는 부분 /health) ──────────
@@ -137,9 +150,18 @@ def fetch_health_for_model(url, api_key, name, timeout):
     병렬화는 호출측(Refresher)이 asyncio 로 한다 — 여기서 자체 스레드풀을 만들면
     main.py 가 의도적으로 캡한 수집 스레드 예산(_COLLECT_THREADS) 밖의 스레드가
     생긴다. 이 함수는 블로킹 1콜만 담당한다.
+
+    LiteLLM 은 대상 모델이 unhealthy 면 HTTP **503 에 동일한 health payload**
+    (healthy/unhealthy_endpoints)를 실어 보낸다 — 이걸 실패로 처리하면 정작
+    DOWN 백엔드의 상태가 매번 '조회 실패'로 버려진다. 본문이 health 모양이면
+    성공으로 정규화한다.
     """
     q = urllib.parse.quote(name, safe="")
-    return http_get_json(url.rstrip("/") + "/health?model=" + q, api_key, timeout)
+    ok, data, err = http_get_json(
+        url.rstrip("/") + "/health?model=" + q, api_key, timeout)
+    if not ok and _is_health_payload(data):
+        return True, data, None
+    return ok, data, err
 
 
 def aggregate_selective_health(results, allowed_bases=None):

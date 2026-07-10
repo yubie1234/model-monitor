@@ -70,6 +70,7 @@ m = types.SimpleNamespace(
     build_collector_settings=_build_cs,
     _deployment_health_safe=_ll._deployment_health_safe,
     select_health_check_models=_ll.select_health_check_models,
+    fetch_health=_ll.fetch_health,
     fetch_health_for_model=_ll.fetch_health_for_model,
     aggregate_selective_health=_ll.aggregate_selective_health,
     collect_litellm=_ll.collect_litellm,
@@ -339,6 +340,77 @@ class TestFetchHealthForModel(unittest.TestCase):
         ok, data, err = m.fetch_health_for_model("http://llm/", "sk", "a b/c", 10)
         self.assertTrue(ok)
         self.assertEqual(calls, ["http://llm/health?model=a%20b%2Fc"])
+
+
+class TestHealth503Payload(unittest.TestCase):
+    """LiteLLM /health 는 unhealthy 백엔드가 있으면 HTTP 200 이 아니라 **503 에
+    동일한 health payload** 를 실어 보낸다 — 상태코드만 보고 본문을 버리면
+    정작 DOWN 백엔드의 상태 정보를 매번 '조회 실패'로 잃는다(실운영 회귀)."""
+
+    _BODY = {"healthy_endpoints": [],
+             "unhealthy_endpoints": [{"model": "m/x", "api_base": "http://x/v1"}]}
+
+    def _patch_urlopen(self, code=503, body=None, raw=None):
+        import io
+        import urllib.error
+        import urllib.request
+        payload = raw if raw is not None else json.dumps(body).encode()
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, code, "Service Unavailable", None,
+                io.BytesIO(payload))
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", orig))
+
+    def test_http_get_json_parses_json_error_body(self):
+        from app.core.http import http_get_json
+        self._patch_urlopen(body=self._BODY)
+        ok, data, err = http_get_json("http://llm/health")
+        self.assertFalse(ok)                 # ok 계약은 그대로(호출자 호환)
+        self.assertEqual(data, self._BODY)   # 본문은 버리지 않고 파싱해 전달
+        self.assertIn("HTTP 503", err)
+
+    def test_http_get_json_non_json_error_body(self):
+        from app.core.http import http_get_json
+        self._patch_urlopen(raw=b"<html>ingress oops</html>")
+        ok, data, err = http_get_json("http://llm/health")
+        self.assertFalse(ok)
+        self.assertIsNone(data)              # 프록시 HTML 등은 그대로 실패
+
+    def test_fetch_health_accepts_503_payload(self):
+        # 전량 /health: 모든 백엔드가 unhealthy 인 가장 중요한 순간에 LiteLLM 이
+        # 503 을 주는데, 이걸 None 처리하면 health 가 영원히 갱신 안 된다.
+        self._patch_urlopen(body=self._BODY)
+        self.assertEqual(m.fetch_health("http://llm", "sk", 5), self._BODY)
+
+    def test_fetch_health_for_model_normalizes_503(self):
+        self._patch_urlopen(body=self._BODY)
+        ok, data, err = m.fetch_health_for_model("http://llm", "sk", "x", 5)
+        self.assertTrue(ok)
+        self.assertEqual(data, self._BODY)
+        self.assertIsNone(err)
+
+    def test_health_shaped_only_other_json_stays_failure(self):
+        # JSON 이어도 health 모양이 아니면(진짜 에러 응답) 실패 유지
+        self._patch_urlopen(raw=b'{"error": "boom"}')
+        ok, data, err = m.fetch_health_for_model("http://llm", "sk", "x", 5)
+        self.assertFalse(ok)
+        self.assertIn("HTTP 503", err)
+        self.assertIsNone(m.fetch_health("http://llm", "sk", 5))
+
+    def test_end_to_end_503_becomes_down_status(self):
+        # 503 로 온 unhealthy 가 aggregate → merge 를 거쳐 DOWN 으로 반영
+        self._patch_urlopen(body=self._BODY)
+        ok, data, err = m.fetch_health_for_model("http://llm", "sk", "x", 5)
+        h = m.aggregate_selective_health([("x", ok, data, err)])
+        self.assertEqual(h["unhealthy_count"], 1)
+        self.assertEqual(h["errors"], [])    # 더는 에러로 기록되지 않는다
+        merged = m.merge_deployments_with_health({
+            "health": h,
+            "deployments": [{"model_name": "x", "api_base": "http://x/v1"}]})
+        self.assertEqual(merged[0]["status"], "DOWN")
+        self.assertEqual(merged[0]["status_source"], "health")
 
 
 class TestAggregateSelectiveHealth(unittest.TestCase):
