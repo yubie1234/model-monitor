@@ -108,7 +108,7 @@ metadata:
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "1.0.3"
+    app.kubernetes.io/version: "1.0.4"
 spec:
   replicas: 1
   selector:
@@ -118,7 +118,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "1.0.3"
+        app.kubernetes.io/version: "1.0.4"
     spec:
       serviceAccountName: model-monitor
       containers:
@@ -138,10 +138,12 @@ spec:
             # actualScale)로 판정 — scale-to-zero 는 idle('?'), ready>0 은 UP.
             # 백엔드가 전부 상시 기동(non-serverless)이고 /health 상태가 필요하면 "true".
             - { name: MONITOR_HEALTH, value: "false" }
-            # 선택적 health: 전량 /health 대신, k8s 판정(ISVC deploymentMode 등)으로
-            # "찔러도 안전한" 모델만 /health?model=<name> 개별 조회한다.
-            #   - Knative Serverless/scale-to-zero/판정불가/external → 체크 안 함(기존 '?')
-            #   - KServe RawDeployment·일반 Service → LiteLLM 이 대신 ping → UP/DOWN
+            # 선택적 health: 전량 /health 대신 안전한 모델만 /health?model= 개별 조회.
+            # KServe 판별은 svc 네이밍 규약('-predictor' — 운영 보장, 변경 시 코드 업데이트):
+            #   - KServe(-predictor/ISVC 확인)는 k8s 가 RawDeployment 로 양성 확인한
+            #     경우만 체크 — Serverless/scale-to-zero 는 절대 깨우지 않음
+            #   - 그 외(일반 Service·external IP 포함)는 LiteLLM 이 대신 ping → UP/DOWN
+            #   - 위험 sibling(같은 underlying/api_base)이 있는 이름은 함께 제외
             # MONITOR_HEALTH=true 면 전량이 우선이라 이 값은 무시된다.
             - { name: MONITOR_SELECTIVE_HEALTH, value: "true" }
             # path prefix 뒤 노출(아래 Ingress 와 동일 prefix). 루트로 쓰려면 이 줄 제거.

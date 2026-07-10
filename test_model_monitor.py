@@ -224,16 +224,42 @@ class TestSelectHealthCheckModels(unittest.TestCase):
         self.assertTrue(m._deployment_health_safe(
             _safe_service(backend_source="deployment")))
 
-    def test_service_without_count_evidence_excluded(self):
-        # 회귀: 'service' 분류는 ISVC 404 에서 나온다(네이밍 빗나간 KServe
-        # Serverless·순수 Knative Service 포함). scale-to-zero 상태면 카운트가
-        # 안 잡히므로(backends_ready=None/source=none) 반드시 제외 — 이걸
-        # 통과시키면 idle 백엔드를 깨운다.
-        self.assertFalse(m._deployment_health_safe(
-            {"model_name": "a", "network_type": "service",
+    def test_non_predictor_service_included_without_count_evidence(self):
+        # 운영 스펙: KServe 판별은 이름 규약(-predictor). 이름이 아니면 카운트
+        # 증거가 없어도(비 KServe 확정) LiteLLM 으로 체크한다.
+        self.assertTrue(m._deployment_health_safe(
+            {"model_name": "a", "network_type": "service", "service": "plain-svc",
              "mode": "Unknown", "backend_source": "none"}))
-        self.assertFalse(m._deployment_health_safe(
+        self.assertTrue(m._deployment_health_safe(
             _safe_service(backends_ready=None)))
+
+    def test_predictor_name_is_kserve_excluded_unless_raw(self):
+        # 운영 규약: KServe svc 는 항상 -predictor. 이름이 걸리면 KServe 로
+        # 간주 — RawDeployment 로 k8s 가 양성 확인한 경우만 체크(그 외 제외).
+        base = {"model_name": "a", "network_type": "service",
+                "service": "foo-predictor", "backend_source": "endpointslice",
+                "backends_ready": 2}
+        self.assertFalse(m._deployment_health_safe(dict(base, mode="Unknown")))
+        self.assertTrue(m._deployment_health_safe(
+            dict(base, mode="RawDeployment")))
+
+    def test_predictor_name_from_api_base_without_k8s(self):
+        # k8s 조회가 전혀 안 돼도(service/network_type 필드 없음) api_base
+        # 호스트 첫 라벨의 이름 규약으로 KServe 를 걸러낸다.
+        d = {"model_name": "a",
+             "api_base": "http://qwen-predictor.default.svc.cluster.local/v1"}
+        self.assertFalse(m._deployment_health_safe(d))
+        d2 = {"model_name": "a", "api_base": "http://plain-vllm.kind:18080/v1"}
+        self.assertTrue(m._deployment_health_safe(d2))
+
+    def test_misnamed_isvc_guess_404_still_excluded_by_name(self):
+        # 실운영 회귀: predictor 이름인데 ISVC 이름 추측이 404 → 'service' 로
+        # 분류되던 KServe(Serverless 가능) — 이름 규약이 잡아서 제외해야 한다.
+        d = {"model_name": "KServe-x", "network_type": "service",
+             "service": "qwen36-27b-fp8-predictor",
+             "backend_source": "endpointslice", "backends_ready": 0,
+             "mode": "Unknown"}
+        self.assertFalse(m._deployment_health_safe(d))
 
     def test_serverless_mode_excluded(self):
         # Serverless = ping 이 activator 를 깨움/scale-down 저지 → 절대 제외
@@ -263,14 +289,17 @@ class TestSelectHealthCheckModels(unittest.TestCase):
                  "backends_ready": 1, "active_health_check": True}
             self.assertFalse(m._deployment_health_safe(d), src)
 
-    def test_undetermined_and_external_excluded(self):
-        # 판정 불가('-'/없음)와 external 은 안전 확인이 안 됐으므로 제외(fail-safe)
-        self.assertFalse(m._deployment_health_safe(
-            {"model_name": "a", "network_type": "-"}))
-        self.assertFalse(m._deployment_health_safe({"model_name": "a"}))
-        self.assertFalse(m._deployment_health_safe(
-            {"model_name": "a", "network_type": "external",
-             "backend_source": "external"}))
+    def test_external_and_undetermined_included_when_not_kserve(self):
+        # 운영 스펙 회귀(GLM-5.2-FP8): api_base 가 노드 IP(NodePort)라 external
+        # 로 분류되던 비 KServe backend — 이름 규약에 안 걸리므로 체크 대상.
+        # ping 은 LiteLLM 이 대신하므로 모니터가 직접 닿는 게 아니다.
+        self.assertTrue(m._deployment_health_safe(
+            {"model_name": "GLM-5.2-FP8",
+             "api_base": "http://50.50.65.49:30000/v1",
+             "network_type": "external", "backend_source": "external"}))
+        # 판정불가('-')도 이름이 비 KServe 면 체크
+        self.assertTrue(m._deployment_health_safe(
+            {"model_name": "a", "network_type": "-", "service": "plain"}))
 
     def test_kserve_unknown_mode_excluded(self):
         # KServe 인데 mode 판정 실패(Unknown) → Serverless 일 수 있으니 제외
@@ -309,6 +338,35 @@ class TestSelectHealthCheckModels(unittest.TestCase):
             _safe_service(model_name="safe"),
         ]
         self.assertEqual(m.select_health_check_models(deps), ["safe"])
+
+    def test_shared_underlying_with_unsafe_sibling_excluded(self):
+        # 실운영 회귀: LiteLLM /health?model= 은 model_name 보다 넓게 매칭될 수
+        # 있다(같은 underlying 의 타 모델 predictor endpoint 가 응답에 포함됨).
+        # 안전한 이름이라도 위험 sibling 과 underlying 을 공유하면 그 ping 이
+        # sibling(Serverless)을 깨울 수 있으므로 제외해야 한다.
+        deps = [
+            _safe_service(model_name="plain", underlying="hosted_vllm/m1",
+                          api_base="http://plain.kind/v1", service="plain"),
+            {"model_name": "kserve-sib", "underlying": "hosted_vllm/m1",
+             "api_base": "http://m1-predictor.default.svc/v1",
+             "service": "m1-predictor", "mode": "Serverless"},
+            _safe_service(model_name="indep", underlying="hosted_vllm/m2",
+                          api_base="http://indep.kind/v1", service="indep"),
+        ]
+        self.assertEqual(m.select_health_check_models(deps), ["indep"])
+
+    def test_underlying_provider_prefix_normalized(self):
+        # 실데이터 회귀: 같은 모델인데 provider 접두사 유무가 섞임
+        # ("openai/Qwen3-Next-..." vs "Qwen3-Next-...") — 접두사를 떼고
+        # 비교해야 교차 ping 이 막힌다.
+        deps = [
+            _safe_service(model_name="plain", underlying="openai/m1",
+                          api_base="http://plain.kind/v1", service="plain"),
+            {"model_name": "kserve-sib", "underlying": "m1",
+             "api_base": "http://m1-predictor.default.svc/v1",
+             "service": "m1-predictor", "mode": "Serverless"},
+        ]
+        self.assertEqual(m.select_health_check_models(deps), [])
 
     def test_placeholder_name_skipped(self):
         # 회귀: model_name 없는 항목은 "?" 플레이스홀더가 되는데, 이를 체크하면
@@ -500,8 +558,8 @@ class TestAggregateSelectiveHealth(unittest.TestCase):
         self.assertEqual(merged[0]["status"], "DOWN")
 
     def test_foreign_endpoints_filtered_and_flagged(self):
-        # 회귀: LiteLLM 이 ?model= 을 무시하면(구버전/프록시) 전체 백엔드가 섞여
-        # 온다 — 요청 모델의 api_base 밖 endpoint 는 버리고 경고를 남겨야
+        # 회귀: 체크 대상 어디에도 안 속하는 endpoint(=체크에서 제외한 backend
+        # 가 ping 된 정황)는 버리고, 어떤 쿼리·어떤 base 인지 경고를 남긴다 —
         # 체크 제외 모델(Serverless)의 상태 오염을 막는다.
         results = [("a", True, {
             "healthy_endpoints": [
@@ -512,7 +570,23 @@ class TestAggregateSelectiveHealth(unittest.TestCase):
             results, allowed_bases={"a": {"http://a"}})
         self.assertEqual(h["healthy_count"], 1)
         self.assertEqual(h["healthy_endpoints"][0]["api_base"], "http://a/v1")
-        self.assertTrue(any("모델 밖 endpoint" in e for e in h["errors"]))
+        self.assertTrue(any("체크 대상 밖 endpoint" in e
+                            and "health?model=a" in e
+                            and "http://serverless" in e for e in h["errors"]))
+
+    def test_cross_sibling_endpoint_accepted_via_union(self):
+        # LiteLLM ?model= 매칭이 이름보다 넓어 sibling(다른 **체크** 모델)의
+        # endpoint 가 섞여 올 수 있다 — 체크 대상 합집합 안이면 수용해야
+        # 정보 손실·거짓 경고가 없다(merge 는 api_base 기준이라 정확한 행에 붙음).
+        results = [("a", True, {
+            "healthy_endpoints": [
+                {"model": "m/a", "api_base": "http://a/v1"},
+                {"model": "m/b", "api_base": "http://b/v1"}],   # 체크 모델 b 의 것
+            "unhealthy_endpoints": []}, None)]
+        h = m.aggregate_selective_health(
+            results, allowed_bases={"a": {"http://a"}, "b": {"http://b"}})
+        self.assertEqual(h["healthy_count"], 2)   # 둘 다 수용
+        self.assertEqual(h["errors"], [])          # 거짓 경고 없음
 
 
 class TestActiveHealthCheckMarker(unittest.TestCase):
