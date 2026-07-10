@@ -558,8 +558,8 @@ class TestAggregateSelectiveHealth(unittest.TestCase):
         self.assertEqual(merged[0]["status"], "DOWN")
 
     def test_foreign_endpoints_filtered_and_flagged(self):
-        # 회귀: LiteLLM 이 ?model= 을 무시하면(구버전/프록시) 전체 백엔드가 섞여
-        # 온다 — 요청 모델의 api_base 밖 endpoint 는 버리고 경고를 남겨야
+        # 회귀: 체크 대상 어디에도 안 속하는 endpoint(=체크에서 제외한 backend
+        # 가 ping 된 정황)는 버리고, 어떤 쿼리·어떤 base 인지 경고를 남긴다 —
         # 체크 제외 모델(Serverless)의 상태 오염을 막는다.
         results = [("a", True, {
             "healthy_endpoints": [
@@ -570,7 +570,23 @@ class TestAggregateSelectiveHealth(unittest.TestCase):
             results, allowed_bases={"a": {"http://a"}})
         self.assertEqual(h["healthy_count"], 1)
         self.assertEqual(h["healthy_endpoints"][0]["api_base"], "http://a/v1")
-        self.assertTrue(any("모델 밖 endpoint" in e for e in h["errors"]))
+        self.assertTrue(any("체크 대상 밖 endpoint" in e
+                            and "health?model=a" in e
+                            and "http://serverless" in e for e in h["errors"]))
+
+    def test_cross_sibling_endpoint_accepted_via_union(self):
+        # LiteLLM ?model= 매칭이 이름보다 넓어 sibling(다른 **체크** 모델)의
+        # endpoint 가 섞여 올 수 있다 — 체크 대상 합집합 안이면 수용해야
+        # 정보 손실·거짓 경고가 없다(merge 는 api_base 기준이라 정확한 행에 붙음).
+        results = [("a", True, {
+            "healthy_endpoints": [
+                {"model": "m/a", "api_base": "http://a/v1"},
+                {"model": "m/b", "api_base": "http://b/v1"}],   # 체크 모델 b 의 것
+            "unhealthy_endpoints": []}, None)]
+        h = m.aggregate_selective_health(
+            results, allowed_bases={"a": {"http://a"}, "b": {"http://b"}})
+        self.assertEqual(h["healthy_count"], 2)   # 둘 다 수용
+        self.assertEqual(h["errors"], [])          # 거짓 경고 없음
 
 
 class TestActiveHealthCheckMarker(unittest.TestCase):

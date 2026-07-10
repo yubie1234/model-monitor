@@ -234,9 +234,18 @@ def aggregate_selective_health(results, allowed_bases=None):
     out = {"healthy_endpoints": [], "unhealthy_endpoints": [],
            "healthy_count": 0, "unhealthy_count": 0,
            "selective": True, "checked_models": names, "errors": []}
+    # 체크 대상 전체의 base 합집합 — LiteLLM 의 ?model= 매칭이 이름보다 넓어
+    # sibling(다른 체크 모델)의 endpoint 가 섞여 올 수 있는데, 그것까지 버리면
+    # 정보 손실이다. merge 는 api_base 기준이라 어느 쿼리로 왔든 정확한 행에
+    # 붙으므로, 합집합 안이면 수용하고 **합집합 밖**(=체크에서 제외한 backend
+    # 가 ping 된 정황)만 차단·경고한다.
+    union = set()
+    if allowed_bases is not None:
+        for bases in allowed_bases.values():
+            union |= set(bases)
     healthy_raw, unhealthy_raw = [], []
     any_ok = False
-    foreign = 0
+    foreign = []   # (요청 모델, 밖의 base)
     for name, ok, data, err in results:
         if ok and isinstance(data, dict):
             any_ok = True
@@ -245,18 +254,20 @@ def aggregate_selective_health(results, allowed_bases=None):
                 for ep in data.get(key) or []:
                     if allowed_bases is not None:
                         base = _strip_openai_suffix(str(ep.get("api_base") or ""))
-                        if base not in (allowed_bases.get(name) or ()):
-                            foreign += 1
+                        if base not in union:
+                            foreign.append((name, base))
                             continue
                     bucket.append(ep)
         elif err:
             out["errors"].append("health?model=%s: %s" % (name, err))
     if names and not any_ok:
         return None   # 전 모델 조회 실패 — 주입 생략(last-good 유지)
-    if foreign:
+    for name, base in foreign[:3]:
         out["errors"].append(
-            "health?model= 응답에 요청 모델 밖 endpoint %d건 — LiteLLM 이 model "
-            "파라미터를 지원하는지 확인 필요(해당 endpoint 는 무시함)" % foreign)
+            "health?model=%s 응답에 체크 대상 밖 endpoint(%s) — 체크에서 제외한 "
+            "backend(Serverless 등)가 ping 된 정황. 상태 반영은 차단함" % (name, base))
+    if len(foreign) > 3:
+        out["errors"].append("체크 대상 밖 endpoint 외 %d건" % (len(foreign) - 3))
     # (model, api_base) 로 dedup — 공유 backend 는 여러 모델 응답에 중복돼 온다.
     # 같은 endpoint 가 healthy/unhealthy 양쪽에 오면(두 병렬 호출 사이 flap)
     # DOWN 우선: merge 는 healthy 를 먼저 보므로 모순 항목은 unhealthy 에만 남긴다.
