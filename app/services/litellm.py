@@ -78,22 +78,51 @@ def fetch_health(url, api_key, timeout):
 # 개별 조회한다 — ping 은 LiteLLM 이 자기 자격증명으로 대신하므로 모니터가
 # 백엔드 키를 알 필요가 없다.
 
+# KServe 판별용 Service 이름 접미사 — **운영 규약**: KServe 로 서빙되는 svc 는
+# 항상 '-predictor' 이름을 가진다(운영자 보장, 규약이 바뀌면 여기를 업데이트).
+# transformer/explainer 는 KServe 부속 컴포넌트의 동일 계열 네이밍.
+_KSERVE_NAME_SUFFIXES = ("-predictor", "-transformer", "-explainer")
+
+
+def _service_name_of(d):
+    """deployment 의 서비스 이름 — backend_count 결과(service) 우선, 없으면
+    api_base 호스트의 첫 라벨. k8s 조회가 전혀 안 되는 환경(권한 없음/비활성)
+    에서도 이름 규약 판별이 가능하게 한다. IP 주소면 의미 없는 라벨('50' 등)이
+    나오지만 접미사 매칭에 걸리지 않아 무해하다."""
+    svc = d.get("service")
+    if svc:
+        return str(svc)
+    host = str(d.get("api_base") or "")
+    host = host.split("//")[-1].split("/", 1)[0].split(":", 1)[0]
+    return host.split(".", 1)[0] if host else ""
+
+
+def _looks_kserve(d):
+    """KServe 로 서빙되는 backend 인가 — 이름 규약(-predictor 등) 또는
+    ISVC 실조회 성공(network_type=kserve) 중 하나라도 참이면 True."""
+    return (_service_name_of(d).endswith(_KSERVE_NAME_SUFFIXES)
+            or d.get("network_type") == "kserve")
+
+
 def _deployment_health_safe(d):
-    """이 deployment 를 능동 health check 해도 안전한가 (fail-safe).
+    """이 deployment 를 능동 health check 해도 안전한가.
 
-    원칙: '안전이 양성으로 확인된 것만' True. 판정 불가('-'/None)·external·
-    Knative 흔적은 전부 False — 최악의 실패가 "체크 안 해서 ?"이지
-    "idle 백엔드를 깨움"이 되지 않게 한다.
+    운영 스펙: "KServe 를 제외한 나머지를 LiteLLM /health?model= 로 체크".
+    KServe 판별은 서비스 네이밍 규약(-predictor)이 1차 — k8s 없이도 판별되고,
+    ISVC 이름 추측이 빗나가 404 로 'service' 분류된 KServe 도 이름으로 잡힌다.
 
-    Knative 판정은 backend_count 가 내보낸 명시 필드(serverless: _is_serverless
-    의 mode+revision 판정, activator_only: EndpointSlice 증거)를 1차로 쓴다 —
-    여기서 문자열을 재추론하면 두 정의가 드리프트한다(mode 검사는 구 스냅샷
-    호환 겸 이중 안전망).
-
-    model_info.active_health_check 수동 override:
-      false → 항상 제외.  true → 판정불가/external 도 체크 허용. 단, k8s 가
-      양성으로 위험(Knative/scale-to-zero/activator)을 확인한 경우는 override
-      보다 우선한다(잘못 단 마커가 idle 백엔드를 깨우지 않게).
+    판별 순서:
+      1) 마커 false → 제외
+      2) Knative 양성 위험(scale_to_zero / serverless(revision 포함 판정) /
+         activator_only / mode 문자열 / knative-* 카운트 소스) → 제외
+         — 마커 true 로도 못 뒤집는다(잘못 단 마커가 idle 백엔드를 깨우지 않게)
+      3) 마커 true → 체크
+      4) KServe(이름 규약 또는 ISVC 확인) → k8s 가 **RawDeployment 로 양성
+         확인**한 경우만 체크(activator 없어 ping 안전). Serverless 이거나
+         mode 확인 불가(RBAC 실패 등)면 제외(fail-safe — 깨울 수 있는 쪽으로
+         안 넘어감)
+      5) 나머지(비 KServe: 일반 Service·external IP·판정불가) → 체크
+         — ping 은 LiteLLM 이 대신하므로 모니터가 백엔드에 직접 닿지 않는다
     """
     ahc = d.get("active_health_check")
     if ahc is False:
@@ -109,20 +138,11 @@ def _deployment_health_safe(d):
         return False
     if ahc is True:
         return True
-    # ── 양성 안전 신호 ──────────────────────────────────────────────────
-    nt = d.get("network_type")
-    if nt == "kserve":
-        # KServe 는 RawDeployment 로 확인된 경우만(activator 없음)
+    if _looks_kserve(d):
+        # KServe → RawDeployment 양성 확인 시에만 체크 (이름만으론 Raw/
+        # Serverless 를 구분할 수 없으므로 k8s ISVC mode 조회가 그 역할)
         return mode == "rawdeployment"
-    if nt == "service":
-        # 'service' 분류는 ISVC 조회 404 에서 나오므로 그 자체는 양성 신호가
-        # 아니다(네이밍이 빗나간 KServe Serverless·순수 Knative Service 도 404
-        # → service). 실제 Pod 가 비-Knative 경로로 카운트된 경우만 안전 확정 —
-        # scale-to-zero 상태면 activator-only 라 카운트가 안 잡혀 여기서 걸러진다.
-        return (d.get("backends_ready") is not None
-                and d.get("backend_source") in ("endpointslice", "endpoints",
-                                                "deployment"))
-    return False   # external / '-' / 미상
+    return True   # 비 KServe → 체크 (일반 Service·external 포함)
 
 
 def select_health_check_models(deployments):
@@ -131,8 +151,21 @@ def select_health_check_models(deployments):
     /health?model=<name> 은 그 이름의 **모든** deployment 를 ping 하므로,
     같은 model_name 에 안전/위험 백엔드가 섞여 있으면(예: RawDeployment +
     Serverless 이중화) 이름 전체를 제외한다 — 하나라도 위험하면 체크 안 함.
+
+    나아가 실운영 관측상 LiteLLM 의 ?model= 매칭은 model_name 보다 넓을 수
+    있다(같은 underlying 모델의 **다른 이름** deployment 의 endpoint 가 응답에
+    포함됨). 안전한 이름이라도 위험한 sibling 과 underlying 또는 api_base 를
+    공유하면 그 ping 이 sibling(Serverless)까지 깨울 수 있으므로 함께 제외한다.
     """
+    # underlying 은 같은 모델이라도 provider 접두사 유무가 섞인다(실데이터:
+    # "openai/Qwen3-Next-..." vs "Qwen3-Next-..."). 접두사를 떼고 비교해야
+    # 관측된 교차 ping(접두사 다른 sibling 의 predictor 가 응답에 등장)을 막는다.
+    def _norm_underlying(u):
+        u = str(u or "")
+        return u.split("/", 1)[1] if "/" in u else u
+
     by_name = {}
+    unsafe_underlying, unsafe_base = set(), set()
     for d in deployments or []:
         name = d.get("model_name")
         # "?" 는 /model/info 에 model_name 이 없을 때의 표시용 플레이스홀더 —
@@ -140,8 +173,25 @@ def select_health_check_models(deployments):
         if not name or name == "?":
             continue
         by_name.setdefault(name, []).append(d)
-    return sorted(name for name, ds in by_name.items()
-                  if all(_deployment_health_safe(d) for d in ds))
+        if not _deployment_health_safe(d):
+            if d.get("underlying"):
+                unsafe_underlying.add(_norm_underlying(d["underlying"]))
+            if d.get("api_base"):
+                unsafe_base.add(_strip_openai_suffix(d["api_base"]))
+
+    def _name_ok(ds):
+        for d in ds:
+            if not _deployment_health_safe(d):
+                return False
+            if (d.get("underlying")
+                    and _norm_underlying(d["underlying"]) in unsafe_underlying):
+                return False   # 위험 sibling 과 같은 underlying — ping 전파 위험
+            if (d.get("api_base")
+                    and _strip_openai_suffix(d["api_base"]) in unsafe_base):
+                return False   # 위험 sibling 과 같은 backend 공유
+        return True
+
+    return sorted(n for n, ds in by_name.items() if _name_ok(ds))
 
 
 def fetch_health_for_model(url, api_key, name, timeout):
