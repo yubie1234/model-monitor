@@ -189,6 +189,76 @@ class TestMergeWithHealth(unittest.TestCase):
         self.assertEqual(merged["D"]["status"], "?")
         self.assertEqual(merged["E"]["status"], "?")
 
+    def test_down_reason_from_health_error(self):
+        # /health unhealthy endpoint 의 error 를 소수 카테고리로 정규화하고
+        # 첫 줄만 status_detail 로 실어야 한다(스택트레이스 제거).
+        ll = {
+            "health": {
+                "healthy_endpoints": [],
+                "unhealthy_endpoints": [
+                    {"api_base": "http://b/v1", "exception_status": "500",
+                     "error": "litellm.InternalServerError: OpenAIException - "
+                              "Connection error.\nstack trace: Traceback ..."},
+                ],
+            },
+            "deployments": [{"model_name": "B", "api_base": "http://b/v1"}],
+        }
+        b = m.merge_deployments_with_health(ll)[0]
+        self.assertEqual(b["status"], "DOWN")
+        self.assertEqual(b["down_reason"], "connection")
+        # 첫 줄만 남고 stack trace 는 잘려야 한다.
+        self.assertIn("Connection error", b["status_detail"])
+        self.assertNotIn("Traceback", b["status_detail"])
+
+    def test_down_reason_http_code_fallback(self):
+        # 키워드로 못 잡으면 exception_status(HTTP 코드)로 버킷팅.
+        ll = {
+            "health": {"healthy_endpoints": [], "unhealthy_endpoints": [
+                {"api_base": "http://b/v1", "exception_status": 503,
+                 "error": "upstream returned bad gateway"}]},
+            "deployments": [{"model_name": "B", "api_base": "http://b/v1"}],
+        }
+        b = m.merge_deployments_with_health(ll)[0]
+        self.assertEqual(b["down_reason"], "server_error")
+
+    def test_down_reason_detail_length_cap(self):
+        # status_detail 은 200자 캡(...) — 폭주하는 error 문자열 방어.
+        ll = {
+            "health": {"healthy_endpoints": [], "unhealthy_endpoints": [
+                {"api_base": "http://b/v1", "error": "x" * 500}]},
+            "deployments": [{"model_name": "B", "api_base": "http://b/v1"}],
+        }
+        b = m.merge_deployments_with_health(ll)[0]
+        self.assertLessEqual(len(b["status_detail"]), 200)
+        self.assertTrue(b["status_detail"].endswith("..."))
+
+    def test_down_reason_no_ready_pods_via_k8s(self):
+        # /health 없이 k8s readiness 로 DOWN(ready 0, scale-to-zero 아님)이면
+        # 사유는 no_ready_pods 로 표면화.
+        ll = {"health": None, "deployments": [
+            {"model_name": "C", "api_base": "http://c/v1",
+             "backends_ready": 0, "backend_source": "deployment"}]}
+        c = m.merge_deployments_with_health(ll)[0]
+        self.assertEqual(c["status"], "DOWN")
+        self.assertEqual(c["down_reason"], "no_ready_pods")
+
+    def test_up_and_idle_have_no_down_reason(self):
+        # UP / '?'(idle·미상) 행에는 사유 필드를 붙이지 않는다.
+        ll = {
+            "health": {"healthy_endpoints": [{"api_base": "http://a/v1"}],
+                       "unhealthy_endpoints": []},
+            "deployments": [
+                {"model_name": "A", "api_base": "http://a/v1"},
+                {"model_name": "D", "api_base": "http://d/v1",
+                 "backends_ready": 0, "scale_to_zero": True,
+                 "backend_source": "knative-pa"},
+            ],
+        }
+        merged = {d["model_name"]: d for d in m.merge_deployments_with_health(ll)}
+        self.assertNotIn("down_reason", merged["A"])
+        self.assertNotIn("status_detail", merged["A"])
+        self.assertNotIn("down_reason", merged["D"])
+
 
 def _safe_service(**over):
     """안전 판정을 통과하는 일반 Service deployment 최소 dict (테스트 헬퍼)."""
@@ -694,6 +764,22 @@ class TestSummarize(unittest.TestCase):
         self.assertEqual(s["deployments_healthy"], 2)
         self.assertEqual(s["deployments_unhealthy"], 1)
 
+    def test_collect_error_counts(self):
+        # 수집 실패 총계(k8s_errors/gpu_errors)를 summary 에 집계해 배너/메트릭이
+        # 공유하게 한다(셀별 툴팁만으론 규모가 안 보임).
+        ll = {"groups": [], "health": None, "deployments": [
+            {"model_name": "A", "api_base": "http://a/v1",
+             "k8s_error": "pods: HTTP 403"},
+            {"model_name": "B", "api_base": "http://b/v1",
+             "gpu_error": "service: HTTP 404 Not Found"},
+            {"model_name": "C", "api_base": "http://c/v1",
+             "k8s_error": "x", "gpu_error": "y"},
+            {"model_name": "D", "api_base": "http://d/v1"},
+        ]}
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertEqual(s["k8s_errors"], 2)   # A, C
+        self.assertEqual(s["gpu_errors"], 2)   # B, C
+
 
 class TestResolveBackendCount(unittest.TestCase):
     def test_kserve_rawdeployment_label_sum(self):
@@ -1111,6 +1197,16 @@ class TestDemoSnapshot(unittest.TestCase):
         self.assertEqual(s["deployments_healthy"], statuses.count("UP"))
         self.assertEqual(s["deployments_unhealthy"], statuses.count("DOWN"))
 
+    def test_demo_has_epoch_and_error_surfacing(self):
+        # 데모도 build_snapshot 과 동일하게 ts_epoch 을 싣고, DOWN 사유·GPU 수집
+        # 오류를 노출해 새 UI(툴팁/배너)를 미리보기 할 수 있어야 한다.
+        snap = m.demo_snapshot()
+        self.assertIsInstance(snap.get("ts_epoch"), float)
+        self.assertGreaterEqual(snap["summary"]["gpu_errors"], 1)
+        downs = [d for d in snap["litellm"]["deployments"]
+                 if d.get("status") == "DOWN" and d.get("down_reason")]
+        self.assertTrue(downs, "데모에 사유가 붙은 DOWN 이 하나는 있어야 한다")
+
 
 class TestCollectUserAccess(unittest.TestCase):
     """per-user 키 접근 수집 — http_get_json 을 가짜로 갈아끼워 분기만 고정."""
@@ -1258,7 +1354,10 @@ class TestFilterSnapshotForUser(unittest.TestCase):
                     {"model_name": "secret-y", "api_base": "http://internal-b/v1",
                      "type": "vllm", "status": "DOWN",
                      "backends_ready": 0, "backends_desired": 1,
-                     "backend_source": "deployment"},
+                     "backend_source": "deployment",
+                     # DOWN 사유는 내부 주소를 담을 수 있어 비-admin 뷰에서 숨겨야 한다.
+                     "down_reason": "connection",
+                     "status_detail": "Connection error http://internal-b:8080"},
                 ],
             },
             "backends": [], "summary": {},
@@ -1294,6 +1393,17 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         # 상태·Pod 수(키 무관, deployment 단위)는 그대로 유지
         self.assertEqual(d["status"], "UP")
         self.assertEqual(d["backends_ready"], 2)
+
+    def test_hide_internal_strips_down_reason_detail(self):
+        # DOWN 사유(status_detail)에 내부 주소가 섞일 수 있어 비-admin 뷰에선
+        # allowlist 리댁션으로 자동 제거돼야 한다(admin 전체 뷰에만 노출).
+        out = m.filter_snapshot_for_user(
+            self._global(), {"accessible": ["secret-y"]}, hide_internal=True)
+        d = out["litellm"]["deployments"][0]
+        self.assertEqual(d["model_name"], "secret-y")
+        self.assertEqual(d["status"], "DOWN")          # 상태는 유지
+        self.assertNotIn("status_detail", d)           # 내부 주소 유출 방지
+        self.assertNotIn("down_reason", d)
 
     def test_redaction_keeps_type_axes_and_anon_backend_ref(self):
         out = m.filter_snapshot_for_user(
@@ -1552,6 +1662,59 @@ class TestPrometheusMetrics(unittest.TestCase):
     def test_loading_snapshot_reports_down(self):
         text = m.render_prometheus_metrics({"loading": True, "version": "x"})
         self.assertIn("model_monitor_up 0", text)
+
+    def test_reliability_gauges_present(self):
+        # 수집 신뢰도 게이지: reachable / litellm_errors / collect_failing /
+        # k8s·gpu 수집 에러 총계가 모두 노출돼야 한다.
+        ll = {"groups": [], "reachable": True,
+              "errors": ["health: timeout", "선택적 경고"],
+              "health": None, "deployments": [
+            {"model_name": "A", "api_base": "http://a/v1",
+             "backends_ready": 1, "backend_source": "deployment",
+             "k8s_error": "pods: 403"},
+            {"model_name": "B", "api_base": "http://b/v1",
+             "backends_ready": 2, "backend_source": "deployment",
+             "gpu_error": "service: 404"},
+        ]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "x", "litellm": ll, "backends": [],
+                "backend_count_enabled": True}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(parsed["model_monitor_litellm_reachable"], ["1"])
+        self.assertEqual(parsed["model_monitor_litellm_errors"], ["2"])
+        self.assertEqual(parsed["model_monitor_collect_errors"], ["1"])
+        self.assertEqual(parsed["model_monitor_gpu_collect_errors"], ["1"])
+        self.assertEqual(parsed["model_monitor_collect_failing"], ["0"])
+
+    def test_litellm_unreachable_and_collect_failing(self):
+        snap = {"version": "x", "backend_count_enabled": True,
+                "collect_error": "RuntimeError: boom",
+                "litellm": {"reachable": False, "errors": [],
+                            "deployments": []}}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(parsed["model_monitor_litellm_reachable"], ["0"])
+        self.assertEqual(parsed["model_monitor_collect_failing"], ["1"])
+
+    def test_snapshot_age_and_timestamp(self):
+        # ts_epoch 가 있으면 timestamp 를 그대로, age 는 음수 없이 노출.
+        ll = {"groups": [], "reachable": True, "health": None,
+              "deployments": []}
+        snap = {"version": "x", "litellm": ll, "backends": [],
+                "ts_epoch": 1_000_000.0}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(
+            parsed["model_monitor_snapshot_timestamp_seconds"], ["1000000"])
+        age = float(parsed["model_monitor_snapshot_age_seconds"][0])
+        self.assertGreaterEqual(age, 0.0)
+
+    def test_snapshot_age_absent_without_epoch(self):
+        # ts_epoch 가 없는(구버전) 스냅샷은 age/timestamp 시리즈를 안 만든다.
+        text = m.render_prometheus_metrics({"loading": True, "version": "x"})
+        self.assertNotIn("model_monitor_snapshot_timestamp_seconds", text)
+        self.assertNotIn("model_monitor_snapshot_age_seconds", text)
 
 
 # ----- 웹/배선 계층(FastAPI 전환으로 새로 추가된 코드) 단위 테스트 -----

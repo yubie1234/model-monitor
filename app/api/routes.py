@@ -112,6 +112,22 @@ async def metrics(request: Request):
 
 
 @router.get("/healthz", include_in_schema=False)
-@router.get("/readyz", include_in_schema=False)
 async def healthz() -> JSONResponse:
+    """Liveness — 프로세스가 살아 있으면 항상 200(수집 상태와 무관)."""
+    return JSONResponse({"status": "ok"})
+
+
+@router.get("/readyz", include_in_schema=False)
+async def readyz(request: Request) -> JSONResponse:
+    """Readiness — 첫 스냅샷을 아직 한 번도 만들지 못했으면 503.
+
+    기존엔 /healthz 와 같은 핸들러로 무조건 200 이라, LiteLLM 미도달·k8s 인증
+    실패로 첫 수집이 영원히 실패해도 Pod 가 Ready 로 마킹돼 'loading' 빈 화면을
+    서빙했다. **보수적으로** 첫 수집 완료 전(loading)에만 503 을 준다 — 일단
+    한 번이라도 스냅샷이 생기면, 이후 백그라운드 수집이 실패하거나 데이터가
+    낡아도 200 을 유지한다(가용성 우선; staleness 는 메트릭/대시보드로 노출).
+    """
+    snap = await request.app.state.store.get()
+    if snap.get("loading"):
+        return JSONResponse({"status": "loading"}, status_code=503)
     return JSONResponse({"status": "ok"})

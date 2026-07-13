@@ -115,3 +115,41 @@ spec:
           annotations:
             summary: "model-monitor k8s 수집 에러 {{ $value }}건"
             description: "일부 deployment 의 backend Pod 수가 부정확할 수 있음(RBAC/연결 확인)."
+
+        # GPU 수집 에러: nodes/pods RBAC·연결 문제로 GPU 수치가 광범위하게 깨짐.
+        - alert: ModelMonitorGpuCollectErrors
+          expr: model_monitor_gpu_collect_errors > 0
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: "model-monitor GPU 수집 에러 {{ $value }}건"
+            description: "일부 deployment 의 GPU 수치가 부정확할 수 있음(pods/nodes RBAC 확인)."
+
+        # 최상류 단일 의존성(LiteLLM) 미도달 — 죽으면 model_* 시리즈가 통째로
+        # 사라져(0 이 아니라 부재) ModelDown 이 안 걸리므로 별도로 잡는다.
+        - alert: LiteLLMUnreachable
+          expr: model_monitor_litellm_reachable == 0
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "LiteLLM 게이트웨이 미도달"
+            description: "model-monitor 가 LiteLLM 에 도달하지 못함 — 모델 목록·상태 갱신 불가."
+
+        # 스냅샷 정체(staleness): 스크레이프는 되는데(model_monitor_up=1) 백그라운드
+        # Refresher 가 멈춰 데이터가 낡음. age 가 refresh interval 을 크게 초과.
+        - alert: ModelMonitorSnapshotStale
+          expr: model_monitor_snapshot_age_seconds > 300
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "model-monitor 스냅샷이 낡음 ({{ $value | humanizeDuration }})"
+            description: "폴링은 되지만 새 스냅샷을 만들지 못함 — 표시 데이터가 stale."
+
+        # 마지막 백그라운드 수집이 실패 상태로 직전 스냅샷을 서빙 중.
+        - alert: ModelMonitorCollectFailing
+          expr: model_monitor_collect_failing == 1
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "model-monitor 백그라운드 수집 실패 지속"
+            description: "직전 스냅샷을 계속 서빙 중 — 원인 확인(로그·LiteLLM·k8s)."

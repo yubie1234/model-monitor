@@ -15,6 +15,7 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 | model groups | LiteLLM `GET /model_group/info` |
 | **model_name → api_base 매핑** | LiteLLM `GET /model/info` (api_base 평문, admin 키 권장) |
 | running(healthy) / unhealthy | LiteLLM `GET /health` (api_base 기준으로 위 매핑과 join) |
+| **DOWN 사유 (연결실패/타임아웃/5xx …)** | `/health` unhealthy endpoint 의 `error` 를 소수 카테고리로 정규화 — DOWN pill ⚠ 툴팁에 표시 |
 | **LB 뒤 backend Pod 개수 (ready/desired)** | Kubernetes API (EndpointSlice / Knative PodAutoscaler / Deployment) |
 | **GPU 개수 + 장치명 (H100/B200 …)** | Pod `resources.limits[nvidia.com/gpu]` + 노드 라벨 `nvidia.com/gpu.product` |
 | OpenAI 호환 모델 이름 목록 | LiteLLM `GET /v1/models` (이름만, **api_base 없음**) |
@@ -148,7 +149,11 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   값 **UP=1 · DOWN=0 · 미상/idle=-1**), `model_monitor_model_backend_pods_{ready,desired}`,
   `model_monitor_model_scale_to_zero`(0 Pod 가 정상 idle 인지 장애인지 구분).
 - **스크레이프 신뢰도**: `model_monitor_up`, `model_monitor_build_info{version=…}`,
-  `model_monitor_backend_count_enabled`, `model_monitor_collect_errors`(>0 이면 일부 Pod 수 부정확).
+  `model_monitor_backend_count_enabled`, `model_monitor_collect_errors`(>0 이면 일부 Pod 수 부정확),
+  `model_monitor_gpu_collect_errors`(>0 이면 일부 GPU 수 부정확),
+  `model_monitor_litellm_reachable`(0=최상류 게이트웨이 미도달), `model_monitor_litellm_errors`(수집 경고 수),
+  `model_monitor_collect_failing`(1=마지막 수집 실패, 직전 스냅샷 서빙 중),
+  `model_monitor_snapshot_timestamp_seconds`/`model_monitor_snapshot_age_seconds`(스냅샷 나이 — 커지면 수집 멈춤).
 - 활용 예: `model_monitor_model_up == 0 and model_monitor_model_scale_to_zero == 0` 으로 **"진짜 죽음"만**
   알림(정상 idle 오탐 제거), `model_up == 1 and model_backend_pods_ready == 0` 으로 **LB 는 200인데 뒤에
   Pod 0** 인 함정 탐지, `avg_over_time(model_monitor_model_up[30d])` 로 모델별 가동률 산출.
@@ -172,7 +177,8 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   추세 그래프, 모델별 상태 타임라인, 상세 테이블로 구성. `namespace`/`model` 변수로 필터.
 - [deploy/prometheus-alerts.yaml](deploy/prometheus-alerts.yaml) — 스크레이프 설정 예시 + 알림 룰
   (`PrometheusRule`): `ModelDown`(idle 제외), `BackendPodsZeroWhileUp`, `BackendCapacityDegraded`,
-  `ModelMonitorDown`, `ModelMonitorCollectErrors`.
+  `ModelMonitorDown`, `ModelMonitorCollectErrors`, `ModelMonitorGpuCollectErrors`, `LiteLLMUnreachable`,
+  `ModelMonitorSnapshotStale`, `ModelMonitorCollectFailing`.
 
 ### 설정 우선순위
 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`, `MONITOR_*`) > config 파일(`MONITOR_CONFIG_FILE`) > 기본값

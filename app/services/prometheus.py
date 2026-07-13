@@ -6,6 +6,8 @@
 api_base(내부 URL)는 노출하지 않는다(per-user 뷰에서 숨기는 내부 정보).
 """
 
+import time
+
 from app import __version__
 
 # 상태 -> 게이지 값. UP=1, DOWN=0, 그 외(?/unknown/scale-to-zero idle)=-1.
@@ -90,9 +92,38 @@ def render_prometheus_metrics(snap):
     emit("model_monitor_backend_count_enabled",
          "k8s 백엔드 Pod 수 수집이 켜져 있으면 1.", "gauge",
          [({}, 1 if snap.get("backend_count_enabled") else 0)])
+    # 백그라운드 수집이 실패해도 store 는 직전 스냅샷을 계속 서빙한다(model_monitor_up
+    # 은 그래도 1). 그래서 '마지막 수집이 실패 중'을 별도 신호로 노출한다.
+    emit("model_monitor_collect_failing",
+         "마지막 백그라운드 수집이 실패해 직전 스냅샷을 서빙 중이면 1.", "gauge",
+         [({}, 1 if snap.get("collect_error") else 0)])
+    # LiteLLM 은 최상류 단일 의존성 — 죽으면 deployment 시리즈가 통째로 사라질 뿐
+    # (0 이 아니라 부재)이라 알림이 안 걸린다. reachable 을 명시적으로 노출한다.
+    emit("model_monitor_litellm_reachable",
+         "LiteLLM 게이트웨이에 도달 가능하면 1(미도달/미설정이면 0).", "gauge",
+         [({}, 1 if ll.get("reachable") else 0)])
+    emit("model_monitor_litellm_errors",
+         "LiteLLM 수집 중 기록된 에러 문자열 수(도달성/선택적 health 경고 포함).",
+         "gauge",
+         [({}, len(ll.get("errors") or []))])
     emit("model_monitor_collect_errors",
          "k8s 조회 에러가 기록된 deployment 수(>0 이면 일부 Pod 수가 부정확).", "gauge",
-         [({}, sum(1 for d in deps if d.get("k8s_error")))])
+         [({}, s.get("k8s_errors", sum(1 for d in deps if d.get("k8s_error"))))])
+    emit("model_monitor_gpu_collect_errors",
+         "GPU 정보 조회 에러가 기록된 deployment 수(>0 이면 일부 GPU 수가 부정확).",
+         "gauge",
+         [({}, s.get("gpu_errors", sum(1 for d in deps if d.get("gpu_error"))))])
+    # 스냅샷 신선도: ts_epoch 를 그대로 노출하고 age 도 계산해 준다. Refresher 가
+    # 멈추면(model_monitor_up=1 인데도) age 가 계속 커진다 → SnapshotStale 알림.
+    ts_epoch = snap.get("ts_epoch")
+    if isinstance(ts_epoch, (int, float)):
+        emit("model_monitor_snapshot_timestamp_seconds",
+             "마지막 스냅샷을 만든 시각(unix epoch 초).", "gauge",
+             [({}, round(float(ts_epoch), 3))])
+        emit("model_monitor_snapshot_age_seconds",
+             "마지막 스냅샷 이후 경과 초(렌더 시점 기준). 계속 커지면 수집 멈춤.",
+             "gauge",
+             [({}, max(0.0, round(time.time() - float(ts_epoch), 1)))])
 
     # --- 요약(summary) 게이지 ---
     emit("model_monitor_deployments_total",

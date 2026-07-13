@@ -4,6 +4,7 @@ build_snapshot(settings) -> snap dict 가 API/대시보드/JSON 이 똑같이 �
 산출물이다. 렌더러가 아니라 이 스냅샷을 바꿔서 모든 출력을 동기화한다.
 """
 
+import time
 from datetime import datetime
 
 from app import __version__
@@ -25,6 +26,10 @@ def build_snapshot(settings, with_health=True):
     snap = {
         "version": __version__,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        # 스냅샷 신선도(staleness) 판정용 epoch. ts 는 사람용 로컬시간 문자열이라
+        # TZ·파싱이 필요하지만 ts_epoch 는 Prometheus 가 snapshot age 를 그대로
+        # 계산할 수 있게 한다(model_monitor_snapshot_timestamp_seconds).
+        "ts_epoch": time.time(),
         "litellm": None,
         "backends": [],
         "summary": {},
@@ -64,22 +69,85 @@ def build_snapshot(settings, with_health=True):
     return snap
 
 
+# DOWN 사유(down_reason) 정규화 카테고리 — 대시보드 그룹핑/필터, 그리고 (원한다면)
+# Prometheus 라벨로도 안전하게 쓸 수 있게 소수의 고정 집합으로 제한한다. LiteLLM
+# error 원문은 버전마다 표현이 달라 문자열 그대로는 카디널리티가 폭발하므로,
+# 키워드 → 카테고리로 접는다. exception_status(HTTP 코드)는 보조 신호.
+_REASON_KEYWORDS = [
+    ("connection", ("connection error", "getaddrinfo", "cannot connect",
+                    "connection refused", "connect call failed",
+                    "name or service not known", "no route to host")),
+    ("timeout", ("timeout", "timed out")),
+    ("rate_limit", ("rate limit", "ratelimit", "too many requests")),
+    ("auth", ("authenticationerror", "unauthorized", "invalid api key",
+              "permission")),
+    ("not_found", ("not found", "notfounderror", "no healthy",
+                   "does not exist")),
+    ("context_window", ("context window", "context length", "maximum context")),
+]
+
+
+def _classify_health_error(ep):
+    """/health unhealthy endpoint 의 error/exception_status 를 (down_reason,
+    status_detail) 로 정규화한다.
+
+    - down_reason: _REASON_KEYWORDS 의 소수 카테고리(없으면 HTTP 코드 버킷 →
+      server_error/client_error, 그래도 없으면 'other').
+    - status_detail: error 첫 줄만(스택트레이스 제거) 200자 캡. 운영자가 대시보드
+      툴팁에서 '왜 DOWN 인지'를 raw JSON 없이 바로 읽게 한다.
+    """
+    err = ep.get("error")
+    err = "" if err is None else str(err)
+    # 첫 줄만 — LiteLLM 은 'litellm.X: ... .\nstack trace: Traceback ...' 처럼
+    # 메시지 뒤에 스택트레이스를 개행으로 붙여 보낸다. 첫 줄이 사람이 읽을 요약.
+    detail = err.split("\n", 1)[0].strip()
+    if len(detail) > 200:
+        detail = detail[:197] + "..."
+    low = err.lower()
+    reason = None
+    for name, kws in _REASON_KEYWORDS:
+        if any(kw in low for kw in kws):
+            reason = name
+            break
+    if reason is None:
+        # HTTP 코드 버킷 폴백(문자/정수 모두 수용).
+        code = ep.get("exception_status")
+        try:
+            code = int(str(code).strip())
+        except (TypeError, ValueError):
+            code = None
+        if code is not None:
+            if 500 <= code <= 599:
+                reason = "server_error"
+            elif 400 <= code <= 499:
+                reason = "client_error"
+        if reason is None:
+            reason = "other" if (detail or code is not None) else "unknown"
+    return reason, (detail or None)
+
+
 def merge_deployments_with_health(ll):
     """/model/info(api_base) 와 /health(상태)를 api_base 기준으로 합친 뷰."""
     health = ll.get("health") or {}
     healthy = {_strip_openai_suffix(ep["api_base"])
                for ep in (health.get("healthy_endpoints") or [])
                if ep.get("api_base")}
-    unhealthy = {_strip_openai_suffix(ep["api_base"])
-                 for ep in (health.get("unhealthy_endpoints") or [])
-                 if ep.get("api_base")}
+    # DOWN 행에 사유를 실어 주기 위해 unhealthy 는 base -> endpoint 맵으로 둔다
+    # (기존엔 base 집합만 만들어 error 문자열을 통째로 버렸다). 같은 base 가
+    # 여러 번 오면 첫 항목을 유지한다(aggregate 단계에서 이미 dedup 됨).
+    unhealthy = {}
+    for ep in (health.get("unhealthy_endpoints") or []):
+        if ep.get("api_base"):
+            unhealthy.setdefault(_strip_openai_suffix(ep["api_base"]), ep)
     merged = []
     for d in ll.get("deployments") or []:
         base = _strip_openai_suffix(d["api_base"]) if d.get("api_base") else None
+        reason = detail = None
         if base in healthy:
             status, src = "UP", "health"
         elif base in unhealthy:
             status, src = "DOWN", "health"
+            reason, detail = _classify_health_error(unhealthy[base])
         else:
             # /health 미조회(타임아웃/권한)거나 매칭 실패 -> backend readiness 로 추정
             r = d.get("backends_ready")
@@ -90,9 +158,19 @@ def merge_deployments_with_health(ll):
                     status, src = "?", "k8s"      # scale-to-zero = 정상 idle
                 else:
                     status, src = "DOWN", "k8s"
+                    # k8s 로 DOWN 판정 = ready Pod 0. /health error 는 없지만
+                    # 사유는 명확하므로 동일 필드로 표면화한다.
+                    reason, detail = "no_ready_pods", "ready Pod 없음 (0개)"
             else:
                 status, src = "?", "unknown"
-        merged.append({**d, "status": status, "status_source": src})
+        row = {**d, "status": status, "status_source": src}
+        # DOWN 일 때만 사유 필드를 부착한다(UP/'?'엔 불필요). down_reason/status_detail
+        # 은 per-user 리댁션 allowlist 밖이라 비-admin 뷰에선 자동 미노출(fail-safe).
+        if reason is not None:
+            row["down_reason"] = reason
+        if detail is not None:
+            row["status_detail"] = detail
+        merged.append(row)
     # LiteLLM 은 replica 구성에 따라 model/info 순서가 매번 달라질 수 있어
     # model_name 기준으로 정렬해 표시 순서를 안정화한다(API/웹/JSON 공통).
     # 동률(대소문자만 다른 이름 'vllm-X'↔'vLLM-X', 또는 같은 이름의 deployment 가
@@ -122,6 +200,8 @@ def summarize(snap):
         "gpu_total": 0,              # 모든 backend 의 ready GPU 합 (Service dedup)
         "gpu_products": {},          # {장치명: 개수}
         "gpu_known": False,
+        "k8s_errors": 0,             # backend Pod 수 수집 실패 deployment 수
+        "gpu_errors": 0,             # GPU 정보 수집 실패 deployment 수
     }
     ll = snap.get("litellm")
     if ll:
@@ -129,6 +209,10 @@ def summarize(snap):
         deps = ll.get("deployments") or []
         s["deployments_registered"] = len(deps)
         health = ll.get("health") or {}
+        # 수집 실패 총계 — 셀별 ⚠ 툴팁만으론 '얼마나 광범위하게 깨졌는지'가 안 보여
+        # 상단 배너/메트릭이 읽을 총계를 여기서 만든다(추가 수집 없이 재조합).
+        s["k8s_errors"] = sum(1 for d in deps if d.get("k8s_error"))
+        s["gpu_errors"] = sum(1 for d in deps if d.get("gpu_error"))
 
         # 카드 수치를 표(merge_deployments_with_health 의 per-row status)와 항상
         # 일치시킨다. deployment 가 있으면 merged status 로 집계(=/health 가
