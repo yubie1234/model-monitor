@@ -224,7 +224,7 @@ class Refresher:
             if self.settings.get("health", False):
                 self._tasks.append(asyncio.create_task(
                     self._health_loop(self._fetch_full_health)))
-            elif self.settings.get("selective_health"):
+            elif self.settings.get("selective_health", True):
                 self._tasks.append(asyncio.create_task(
                     self._health_loop(self._fetch_selective_health)))
 

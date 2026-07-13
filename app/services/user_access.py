@@ -78,6 +78,18 @@ class AccessCache:
         self._d = {}            # sha256(key) -> (expiry, access)
         self._lock = threading.Lock()
 
+    def get(self, key, now):
+        """살아있는 캐시 항목만 반환(수집 없음) — 요청 경로의 세마포어 선회피용.
+
+        락 잡힌 dict 룩업 1회라 이벤트 루프에서 직접 불러도 안전하다. 미스/만료는
+        None — 호출측이 세마포어를 잡고 get_or_collect 로 넘어간다."""
+        h = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        with self._lock:
+            ent = self._d.get(h)
+            if ent and ent[0] > now:
+                return ent[1]
+        return None
+
     def get_or_collect(self, key, collect, now):
         """캐시에 살아있으면 그대로, 아니면 collect() 후 결과별 TTL 로 캐시."""
         h = hashlib.sha256(key.encode("utf-8")).hexdigest()

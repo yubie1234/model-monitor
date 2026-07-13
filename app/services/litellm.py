@@ -307,7 +307,7 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
         "groups": [],          # model_group/info data
         "deployments": [],     # /model/info 정규화: model_name -> api_base 등
         "health": None,        # /health raw
-        "models": [],          # /v1/models ids (이름만)
+        "models": [],          # 모델 이름 목록 — deployments(model_name)에서 유도
         "errors": [],
     }
 
@@ -424,6 +424,7 @@ def discover_backends(litellm_result):
     이름 규약(-predictor)이 폴백으로 동작한다.
     """
     discovered = {}
+    skipped = set()  # 실제로 제외된 base — 조용한 커버리지 축소가 되지 않게 기록
     unsafe = set()   # 위험 deployment 가 쓰는 base — probe 대상에서 제외
     for d in litellm_result.get("deployments") or []:
         if d.get("api_base") and not _deployment_health_safe(d):
@@ -435,6 +436,7 @@ def discover_backends(litellm_result):
             continue
         base = _strip_openai_suffix(api_base)
         if base in unsafe:
+            skipped.add(base)
             continue
         discovered.setdefault(base, {
             "name": d.get("model_name") or base,
@@ -451,10 +453,20 @@ def discover_backends(litellm_result):
             continue
         base = _strip_openai_suffix(api_base)
         if base in discovered or base in unsafe:
+            if base in unsafe:
+                skipped.add(base)
             continue
         if _looks_kserve({"api_base": base}):
+            skipped.add(base)
             continue
         model = ep.get("model", "")
         btype = _classify_backend(model, model, base)
         discovered[base] = {"name": model or base, "url": base, "type": btype}
+    # 제외를 조용히 삼키지 않는다 — selective health 의 '조용한 무력화 방지' 경고와
+    # 동일 패턴. 제외가 있으면 대시보드가 읽는 litellm.errors 에 1줄 요약을 남겨
+    # summary.backends_total 감소의 원인을 운영자가 볼 수 있게 한다.
+    if skipped:
+        litellm_result.setdefault("errors", []).append(
+            "probe: 안전 필터로 backend %d개 제외 — Serverless/미확인 KServe 는 "
+            "직접 probe 가 idle 백엔드를 깨울 수 있어 fail-safe 제외" % len(skipped))
     return list(discovered.values())

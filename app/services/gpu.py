@@ -88,7 +88,13 @@ def _node_gpu_product(client, node_name, cache):
     if ok:
         labels = (data.get("metadata") or {}).get("labels") or {}
         prod = labels.get(GPU_PRODUCT_LABEL)
-    cache[node_name] = prod
+        # 성공 응답만 캐시한다 — 캐시가 프로세스 수명(Refresher._node_cache)이 된
+        # 뒤로는 일시 실패(타임아웃/429/RBAC 순단)를 캐시하면 그 노드 장치명이
+        # 재기동 전까지 'GPU'(미상)로 영구히 굳는다. 실패는 다음 사이클에 재시도.
+        # (성공했지만 라벨 없는 노드는 캐시한다 — GFD 미설치 클러스터가 매 사이클
+        # 재조회로 돌아가지 않게. 부팅 직후 라벨이 늦게 붙는 노드가 미상으로 남는
+        # 트레이드오프는 수용 — 재기동/노드 교체 시 해소.)
+        cache[node_name] = prod
     return prod
 
 

@@ -18,7 +18,7 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 | **DOWN 사유 (연결실패/타임아웃/5xx …)** | `/health` unhealthy endpoint 의 `error` 를 소수 카테고리로 정규화 — DOWN pill ⚠ 툴팁에 표시 |
 | **LB 뒤 backend Pod 개수 (ready/desired)** | Kubernetes API (EndpointSlice / Knative PodAutoscaler / Deployment) |
 | **GPU 개수 + 장치명 (H100/B200 …)** | Pod `resources.limits[nvidia.com/gpu]` + 노드 라벨 `nvidia.com/gpu.product` |
-| OpenAI 호환 모델 이름 목록 | LiteLLM `GET /v1/models` (이름만, **api_base 없음**) |
+| OpenAI 호환 모델 이름 목록 | `/model/info` 의 model_name 에서 유도 — 별도 `/v1/models` 호출 없음(per-user 뷰의 키 검증은 예외) |
 | backends up (옵션) | 각 백엔드 `GET /v1/models`, `/health` 직접 probe |
 
 > 주의: `/v1/models` 는 OpenAI 호환 스펙이라 `id`(model_name)만 줍니다. **api_base 는 `/model/info` 에서** 나옵니다.

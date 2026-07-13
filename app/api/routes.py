@@ -65,12 +65,17 @@ async def api_snapshot_user(request: Request):
     # 고유 키가 늘어나도(잘못된 키 대입 포함) blocking LiteLLM 왕복이 수집 스레드풀
     # (_COLLECT_THREADS=8)을 독식하지 않게 동시 조회를 세마포어로 캡한다 — 초과
     # 요청은 스레드가 아니라 이벤트 루프에서 가볍게 대기한다.
-    async with st.user_access_sem:
-        access = await asyncio.to_thread(
-            st.access_cache.get_or_collect,
-            key,
-            lambda: collect_user_access(st.litellm_url, key, st.collect_timeout),
-            time.monotonic())
+    # 캐시 히트는 세마포어를 우회한다 — LiteLLM 이 느릴 때 미스 4건이 슬롯을 다
+    # 물고 있어도, 이미 검증된 폴링 사용자(warm 캐시)는 대기 없이 즉시 응답한다
+    # (선조회는 락 잡힌 dict 룩업 1회 — 마이크로초 단위라 루프 직접 호출 안전).
+    access = st.access_cache.get(key, time.monotonic())
+    if access is None:
+        async with st.user_access_sem:
+            access = await asyncio.to_thread(
+                st.access_cache.get_or_collect,
+                key,
+                lambda: collect_user_access(st.litellm_url, key, st.collect_timeout),
+                time.monotonic())
     if not access["ok"]:
         # fail-closed: 절대 unfiltered global 로 폴백하지 않는다.
         return JSONResponse(

@@ -764,6 +764,9 @@ class TestDiscoverBackends(unittest.TestCase):
         ]}
         out = m.discover_backends(ll)
         self.assertEqual([b["url"] for b in out], ["http://plain.ns.svc:8080"])
+        # 제외는 조용히 삼키지 않는다 — litellm.errors 에 1줄 요약. 개수는
+        # deployment 가 아니라 base 단위(foo-predictor, bar 2개 — bar 공유 2행은 1개).
+        self.assertTrue(any("probe" in e and "2개" in e for e in ll["errors"]))
 
     def test_raw_confirmed_kserve_included(self):
         ll = {"deployments": [
@@ -771,6 +774,7 @@ class TestDiscoverBackends(unittest.TestCase):
              "mode": "RawDeployment"}]}
         out = m.discover_backends(ll)
         self.assertEqual([b["url"] for b in out], ["http://r-predictor.ns.svc"])
+        self.assertFalse(ll.get("errors"))   # 제외 없음 → 경고 없음
 
     def test_health_only_endpoints_filtered_by_name_rule(self):
         # /health 에만 있는 주소는 k8s 판정이 없다 — KServe 이름 규약이면 Raw 확인이
@@ -1140,6 +1144,41 @@ class TestGpu(unittest.TestCase):
         self.assertEqual(out2["gpu_products"], {"H100": 2})
         self.assertFalse(any("/nodes/gpu-a" in p for p in c2.calls))
 
+    def test_node_cache_skips_failed_lookups(self):
+        # 회귀: 캐시가 프로세스 수명이 되면서, 노드 GET 일시 실패를 캐시하면 그
+        # 노드 장치명이 재기동 전까지 'GPU'(미상)로 영구히 굳는다 — 실패는 캐시
+        # 밖에 두고 다음 사이클에 자가 치유되어야 한다.
+        base_routes = [
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 1},
+                                "spec": {"replicas": 1}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [_pod("gpu-a", 2)]}, None)),
+        ]
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        node_cache = {}
+
+        # 1사이클: /nodes/gpu-a 라우트 없음(404) → 미상 'GPU' 버킷, 캐시 미기록
+        c1 = FakeClient(list(base_routes), default_namespace="kserve")
+        out1 = m.resolve_backend_count(dep, c1, self.GPU_SETTINGS,
+                                       node_cache=node_cache)
+        self.assertEqual(out1["gpu_products"], {"GPU": 2})
+        self.assertNotIn("gpu-a", node_cache)   # 실패는 캐시하지 않는다
+
+        # 2사이클: 노드 조회 복구 → 같은 캐시로 자가 치유
+        c2 = FakeClient(base_routes + [
+            ("/nodes/gpu-a",
+             (True, {"metadata": {"labels":
+                     {"nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"}}}, None)),
+        ], default_namespace="kserve")
+        out2 = m.resolve_backend_count(dep, c2, self.GPU_SETTINGS,
+                                       node_cache=node_cache)
+        self.assertEqual(out2["gpu_products"], {"H100": 2})
+        self.assertEqual(node_cache.get("gpu-a"), "NVIDIA-H100-80GB-HBM3")
+
     def test_gpu_zero_when_no_ready_pods(self):
         client = FakeClient([
             ("inferenceservices/qwen36-35b",
@@ -1377,6 +1416,16 @@ class TestCollectUserAccess(unittest.TestCase):
 
 class TestAccessCache(unittest.TestCase):
     """키별 접근 캐시 — 폴링 중복 호출 제거, 성공/실패 각각 TTL 만료."""
+
+    def test_get_peek_without_collect(self):
+        # get() 은 수집 없이 살아있는 항목만 돌려준다(요청 경로 세마포어 선회피).
+        cache = m.AccessCache(ttl=30.0)
+        self.assertIsNone(cache.get("sk-x", now=100.0))      # 미스
+        cache.get_or_collect(
+            "sk-x", lambda: {"ok": True, "accessible": ["a"]}, now=100.0)
+        hit = cache.get("sk-x", now=110.0)                   # TTL 내
+        self.assertEqual(hit["accessible"], ["a"])
+        self.assertIsNone(cache.get("sk-x", now=200.0))      # 만료
 
     def test_caches_success_and_skips_recollect(self):
         cache = m.AccessCache(ttl=30.0)
