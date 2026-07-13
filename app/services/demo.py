@@ -1,5 +1,6 @@
 """--demo 용 샘플 스냅샷 (라이브 엔드포인트 없이 대시보드 미리보기)."""
 
+import time
 from datetime import datetime
 
 from app import __version__
@@ -10,6 +11,7 @@ def demo_snapshot():
     snap = {
         "version": __version__,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_epoch": time.time(),   # build_snapshot 과 동일 — 신선도 판정용
         "litellm": {
             "url": "http://litellm:4000 (demo)",
             "reachable": True,
@@ -56,7 +58,9 @@ def demo_snapshot():
                  "backend_source": "deployment", "mode": "RawDeployment",
                  "scale_to_zero": False, "namespace": "serving",
                  "service": "qwen3-32b-vllm",
-                 "gpu_ready": 0, "gpu_products": {}},
+                 # GPU 수집 실패 데모: summary.gpu_errors 집계 + 상단 배너로 표면화
+                 "gpu_error": "pods: HTTP 403 Forbidden (nodes RBAC 없음)",
+                 "gpu_ready": None, "gpu_products": {}},
                 {"model_name": "Qwen3-Embedding-8B",
                  "underlying": "openai/Qwen3-Embedding-8B",
                  "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1",
@@ -108,7 +112,13 @@ def demo_snapshot():
                 ],
                 "unhealthy_endpoints": [
                     {"model": "hosted_vllm/Qwen3-32B-AWQ",
-                     "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"},
+                     "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1",
+                     # DOWN 사유 표면화 데모: 첫 줄만 status_detail 로, 'connection'
+                     # 카테고리로 정규화된다(뒤 스택트레이스는 잘려 나감).
+                     "error": "litellm.InternalServerError: OpenAIException - "
+                              "Connection error.\nstack trace: Traceback (most "
+                              "recent call last): ...",
+                     "exception_status": "500"},
                 ],
             },
             "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8",

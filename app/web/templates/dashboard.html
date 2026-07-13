@@ -449,9 +449,37 @@ function backendCell(d){
     +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
 }
 
-function statusPill(s){
+// DOWN 사유(down_reason) 사람이 읽는 라벨. 서버가 /health error 원문을 소수
+// 카테고리로 정규화해 준다 — 여기선 그 카테고리에 한국어 설명을 붙인다(미매핑은
+// 코드 그대로 노출).
+const DOWN_REASON_TIP = {
+  connection: "백엔드에 연결 실패 (Pod/DNS 소멸·미기동 정황)",
+  timeout: "응답 타임아웃",
+  rate_limit: "레이트 리밋 (429)",
+  auth: "인증 실패 (키/권한)",
+  not_found: "대상 없음 (404·healthy endpoint 없음)",
+  context_window: "컨텍스트 길이 초과",
+  server_error: "백엔드 5xx 서버 오류",
+  client_error: "요청 4xx 오류",
+  no_ready_pods: "ready Pod 0 (k8s readiness)",
+  other: "기타 오류",
+};
+// DOWN pill 툴팁: 사유 라벨 + 서버가 준 error 첫 줄(status_detail). 운영자가 pill 에
+// 마우스만 올리면 '왜 DOWN 인지'를 raw JSON 없이 바로 읽는다.
+function downTip(d){
+  if(!d) return "";
+  const parts = [];
+  if(d.down_reason) parts.push("사유: "+(DOWN_REASON_TIP[d.down_reason]||d.down_reason));
+  if(d.status_detail) parts.push(d.status_detail);
+  return parts.join("\n");
+}
+function statusPill(s, d){
   const cls = s==="UP"?"up":(s==="DOWN"?"down":"unk");
-  return '<span class="pill '+cls+'">'+esc(s)+'</span>';
+  // DOWN 이면 사유 툴팁 + ⚠ 표식(있을 때만).
+  const tip = s==="DOWN" ? downTip(d) : "";
+  const mark = tip ? " ⚠" : "";
+  return '<span class="pill '+cls+'"'+(tip?' title="'+esc(tip)+'"':'')+'>'
+    +esc(s)+mark+'</span>';
 }
 
 function card(label,val,cls,sub){
@@ -598,7 +626,7 @@ function groupedRows(merged, shared, showBk, showGpu){
       const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
       const others=sh?[...shared[k]].filter(x=>x!==name):[];
       const svcLabel=svcLabelOf(b);
-      html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?")+'</td>'
+      html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?",b)+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
           +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
       if(showBk){ html+='<td>'+backendCell(b)+'</td>';
@@ -802,10 +830,28 @@ function render(snap){
     $("#livedot").style.background = "var(--warn)";
     return;
   }
-  banner.innerHTML = snap.collect_error
-    ? '<div class="err">⚠ 백그라운드 수집 실패(직전 스냅샷 표시 중): '
-      + esc(snap.collect_error) + '</div>'
-    : "";
+  // 수집 신뢰도 배너를 누적한다(여러 문제가 동시에 날 수 있음):
+  //  1) 백그라운드 수집 실패(직전 스냅샷 서빙 중)
+  //  2) LiteLLM 게이트웨이 미도달 — 최상류 단일 의존성이라 별도 강조
+  //  3) k8s/GPU 수집 오류 총계 — 셀마다 hover 하지 않아도 규모가 보이게
+  let bhtml = "";
+  if(snap.collect_error){
+    bhtml += '<div class="err">⚠ 백그라운드 수집 실패(직전 스냅샷 표시 중): '
+      + esc(snap.collect_error) + '</div>';
+  }
+  if(ll && ll.reachable === false){
+    bhtml += '<div class="err">⚠ LiteLLM 게이트웨이 미도달 — 모델 목록·상태를 '
+      + '갱신할 수 없습니다(표시 데이터가 낡았을 수 있음).</div>';
+  }
+  const kerr = (s.k8s_errors||0), gerr = (s.gpu_errors||0);
+  if(kerr || gerr){
+    const segs = [];
+    if(kerr) segs.push("backend Pod 수 "+kerr+"건");
+    if(gerr) segs.push("GPU 정보 "+gerr+"건");
+    bhtml += '<div class="note-banner">⚠ 수집 오류 '+segs.join(" · ")
+      + ' — 해당 행 수치가 부정확할 수 있음(셀 ⚠ 에 원인).</div>';
+  }
+  banner.innerHTML = bhtml;
   lastSnap = snap;
   // summary cards
   let cards = "";
@@ -911,7 +957,7 @@ function render(snap){
     } else {
       body = tableDeps.map(d=>{
         let row = '<tr data-model="'+attrId(d.model_name)+'" data-svc="'+attrId(svcKeyOf(d))+'"><td>'
-          +statusPill(d.status||"?")+"</td>"
+          +statusPill(d.status||"?",d)+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
           +'<td>'+typeChips(netOf(d),engOf(d))+"</td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
