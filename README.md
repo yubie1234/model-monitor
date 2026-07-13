@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v1.0.4** — KServe 판별을 svc 네이밍 규약(`-predictor`) 기반으로 전환 + sibling 교차 제외(GLM 등 external IP 백엔드 체크 편입)
+**버전: v1.0.5** — 장애 원인·수집 신뢰도 가시화(DOWN 사유 툴팁 · LiteLLM 도달성/수집오류/스냅샷 나이 메트릭 · 정직한 /readyz)
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
