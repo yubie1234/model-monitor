@@ -96,7 +96,8 @@
   tbody tr:hover{background:var(--surface2)}
   td.mono,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
   td.api{font-family:var(--mono);font-size:12px;color:var(--muted);max-width:340px;
-    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:copy}
+  td.api.copied{color:var(--up)}   /* 클릭 복사 성공 피드백(잠깐 초록) */
   td.name{font-weight:550}
   /* 그래프 노드에 호버하면 표에서 대응하는 행을 하이라이트 (id 특이도로 grp/child 배경 위에 얹음) */
   #deployments tbody tr.hl>td{background:rgba(110,139,255,.16)}
@@ -279,9 +280,9 @@
     <div class="sec-title">Model ↔ Backend
       <span class="filters">
         <input type="search" id="f-search" class="search" autocomplete="off" spellcheck="false"
-               aria-label="model_name 검색"
-               placeholder="🔍 모델 검색  ( / )"
-               title="model_name 으로 필터 — 표·그래프에 함께 적용. 단축키 &quot;/&quot;, 지우기 Esc">
+               aria-label="모델·백엔드 검색"
+               placeholder="🔍 모델·백엔드 검색  ( / )"
+               title="model_name·service·api_base 로 필터 — 표·그래프에 함께 적용. 단축키 &quot;/&quot;, 지우기 Esc">
         <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
@@ -363,6 +364,39 @@ function saveGraphPin(){
 // 새로 그려지면 mouseleave 없이 노드가 떨어져 나가 하이라이트가 사라지므로, pin 복원과
 // 똑같이 재렌더 후 hover 도 다시 적용한다(pin 이 있으면 pin 우선 — hover 는 무시).
 let graphHover = null;
+
+// 필터 상태(검색어·status/net/eng·그룹/그래프 토글)도 pin 과 같은 이유로 sessionStorage 에
+// 보관해 F5 후 복원한다(pin 만 살아남고 필터는 리셋되던 비대칭 제거). 탭 닫으면 소멸.
+const FILTER_KEY = "mm_filters";
+function saveFilters(){
+  try{ sessionStorage.setItem(FILTER_KEY, JSON.stringify({
+    q:$("#f-search").value, s:$("#f-status").value, n:$("#f-net").value,
+    e:$("#f-eng").value, g:$("#f-group").checked, gr:$("#f-graph").checked })); }
+  catch(e){}
+}
+function loadFilters(){
+  let f=null; try{ f=JSON.parse(sessionStorage.getItem(FILTER_KEY)||"null"); }catch(e){}
+  if(!f) return;
+  $("#f-search").value = f.q||"";
+  if(f.s!=null) $("#f-status").value = f.s;
+  if(f.n!=null) $("#f-net").value = f.n;
+  if(f.e!=null) $("#f-eng").value = f.e;
+  if(f.g!=null) $("#f-group").checked = !!f.g;
+  if(f.gr!=null) $("#f-graph").checked = !!f.gr;
+}
+
+// 서버 스냅샷 갱신 멈춤(stale) 감지: 폴링(fetch)이 성공해도 서버측 Refresher 가 멈추면
+// 낡은 데이터가 초록불로 계속 표시된다. 서버가 찍은 ts 값이 "바뀌는지"만 보므로
+// (클라이언트 시계와 직접 비교·파싱하지 않음) 서버-브라우저 시계차와 무관하게 동작한다.
+let staleTs = null, staleSince = 0;   // ts 가 마지막으로 바뀐 시각(클라이언트 ms)
+let snapStale = false;                // 최근 render 가 판정한 stale 여부 — tick 이 dot 색에 반영
+function staleMs(snap){
+  if(window.__SNAPSHOT__ || !snap.ts) return 0;   // 정지 페이지는 판단 안 함
+  if(staleTs !== snap.ts){ staleTs = snap.ts; staleSince = Date.now(); }
+  return Date.now() - staleSince;
+}
+function fmtAgo(ms){ const s=Math.round(ms/1000);
+  return s<60 ? s+"초" : Math.floor(s/60)+"분 "+(s%60)+"초"; }
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -464,6 +498,13 @@ const DOWN_REASON_TIP = {
   no_ready_pods: "ready Pod 0 (k8s readiness)",
   other: "기타 오류",
 };
+// status_source 툴팁: 같은 UP 이라도 실제 /health 체크 결과인지, k8s readiness 추정인지
+// 신뢰도가 다르다 — pill 에 마우스를 올리면 판정 근거를 보여준다.
+const STATUS_SRC_TIP = {
+  health: "LiteLLM /health 체크 결과",
+  k8s: "k8s backend readiness 로 추정 (/health 미조회)",
+  unknown: "판단 불가 — /health 미조회 + backend 확인 실패",
+};
 // DOWN pill 툴팁: 사유 라벨 + 서버가 준 error 첫 줄(status_detail). 운영자가 pill 에
 // 마우스만 올리면 '왜 DOWN 인지'를 raw JSON 없이 바로 읽는다.
 function downTip(d){
@@ -475,9 +516,15 @@ function downTip(d){
 }
 function statusPill(s, d){
   const cls = s==="UP"?"up":(s==="DOWN"?"down":"unk");
-  // DOWN 이면 사유 툴팁 + ⚠ 표식(있을 때만).
-  const tip = s==="DOWN" ? downTip(d) : "";
-  const mark = tip ? " ⚠" : "";
+  // 판정 근거(status_source) + DOWN 사유를 한 툴팁에 합친다 — 같은 UP 이라도
+  // /health 실측인지 k8s 추정인지 신뢰도가 다르고, DOWN 이면 원인이 바로 필요하다.
+  const parts = [];
+  const srcTip = d ? STATUS_SRC_TIP[d.status_source] : null;
+  if(srcTip) parts.push("판정: "+srcTip);
+  const dtip = s==="DOWN" ? downTip(d) : "";
+  if(dtip) parts.push(dtip);
+  const tip = parts.join("\n");
+  const mark = dtip ? " ⚠" : "";
   return '<span class="pill '+cls+'"'+(tip?' title="'+esc(tip)+'"':'')+'>'
     +esc(s)+mark+'</span>';
 }
@@ -534,7 +581,15 @@ function compositeStatus(bes){
   return "?";
 }
 function statusPillCls(s){return s==="UP"?"up":(s==="DOWN"?"down":(s==="DEGRADED"?"deg":"unk"));}
-function compositePill(s){return '<span class="pill '+statusPillCls(s)+'">'+esc(s)+'</span>';}
+// 그룹 헤더의 합성 pill: 무엇으로 합성됐는지(UP/DOWN/? 내역) 툴팁으로 풀어준다.
+function compositePill(s, bes){
+  let tip="";
+  if(bes && bes.length){ let up=0,down=0,unk=0;
+    bes.forEach(b=>{const t=b.status||"?"; if(t==="UP")up++; else if(t==="DOWN")down++; else unk++;});
+    tip = bes.length+"개 backend 합성: UP "+up+" · DOWN "+down+(unk?" · ? "+unk:"");
+  }
+  return '<span class="pill '+statusPillCls(s)+'"'+(tip?' title="'+esc(tip)+'"':'')+'>'+esc(s)+'</span>';
+}
 function sumBackends(bes){
   let r=null,d=null;
   bes.forEach(b=>{ if(b.backends_ready!=null) r=(r||0)+b.backends_ready;
@@ -614,7 +669,7 @@ function groupedRows(merged, shared, showBk, showGpu){
     // data-svcs: 이 그룹이 품은 backend 들의 키(공백 구분) — backend 노드 호버 시 자식행뿐
     // 아니라 부모 그룹행도 함께 하이라이트되게(model 노드 호버가 부모+자식을 밝히는 것과 대칭).
     const svcs=bes.map(b=>attrId(svcKeyOf(b))).join(" ");
-    let html='<tr class="grp-row" data-model="'+attrId(name)+'" data-svcs="'+svcs+'"><td>'+compositePill(st)+'</td>'
+    let html='<tr class="grp-row" data-model="'+attrId(name)+'" data-svcs="'+svcs+'"><td>'+compositePill(st,bes)+'</td>'
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
       +'<td>'+typeChips(net,eng)+'</td>';
@@ -633,7 +688,7 @@ function groupedRows(merged, shared, showBk, showGpu){
         if(showGpu) html+='<td>'+gpuCell(b)+'</td>';
         html+='<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
           +'<td class="srccol">'+esc(b.backend_source||"-")+'</td>'; }
-      html+='<td class="api" title="'+esc(b.api_base)+'">'+esc(b.api_base||"-")+'</td></tr>';
+      html+='<td class="api" title="'+esc(b.api_base)+'\n(클릭하여 복사)">'+esc(b.api_base||"-")+'</td></tr>';
     });
     return html;
   }).join("");
@@ -910,9 +965,13 @@ function render(snap){
   const fQ = ($("#f-search").value||"").trim().toLowerCase();
   // status 필터: '!UP'(이상만)은 UP 이 아닌 것(DOWN·?) 전부, 그 외엔 정확히 일치.
   const stOk = d => !fS || (fS==="!UP" ? (d.status||"?")!=="UP" : (d.status||"?")===fS);
+  // 검색은 model_name 뿐 아니라 백엔드(service 라벨·api_base)도 매칭 — 운영자는
+  // svc 이름(*-predictor)으로 찾는 일이 많다. per-user 뷰는 리댁션돼 ref 라벨로 매칭.
+  const hayOf = d => (String(d.model_name||"")+" "+svcLabelOf(d)+" "
+    +String(d.api_base||"")).toLowerCase();
   const filterDep = d => stOk(d)
     && (!fN || netOf(d)===fN) && (!fE || engOf(d)===fE)
-    && (!fQ || String(d.model_name||"").toLowerCase().includes(fQ));
+    && (!fQ || hayOf(d).includes(fQ));
   let graphDeps = [];   // 그래프가 그릴 deployment(= 표와 동일한 필터 결과)
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
@@ -965,7 +1024,7 @@ function render(snap){
         if(showBk && !uHide) row +=
           '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
           +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
-        if(!uHide) row += '<td class="api" title="'+esc(d.api_base)+'">'
+        if(!uHide) row += '<td class="api" title="'+esc(d.api_base)+'\n(클릭하여 복사)">'
           +esc(d.api_base||"-")+"</td>";
         row += "</tr>";
         return row;
@@ -1027,7 +1086,16 @@ function render(snap){
   }
   if(snap.version) $("#ver").textContent = "v"+snap.version;
   $("#foot").textContent = "model_monitor v"+(snap.version||"?");
-  $("#updated").textContent = (snap.ts||"") + (snap.demo?"  (demo)":"");
+  // 갱신 멈춤 표시: auto-refresh 가 켜져 있는데(=계속 새 스냅샷이 와야 하는데)
+  // ts 가 폴링 3주기(최소 15초) 넘게 그대로면 서버 수집이 멈춘 것 — 명시 경고.
+  const stall = staleMs(snap);
+  snapStale = $("#auto").checked && stall > Math.max(REFRESH_MS*3, 15000);
+  const upd = $("#updated");
+  upd.textContent = (snap.ts||"") + (snap.demo?"  (demo)":"")
+    + (snapStale ? "  · ⚠ "+fmtAgo(stall)+"째 갱신 없음" : "");
+  upd.title = snapStale
+    ? "폴링은 성공하지만 서버가 새 스냅샷을 만들지 못하고 있습니다 — 표시 데이터가 낡았을 수 있음"
+    : "";
 }
 
 function showUvError(msg){
@@ -1064,6 +1132,9 @@ async function tick(){
     const u=$("#updated"); if(u) u.textContent += "  · saved snapshot (frozen)";
     return;
   }
+  // 숨긴(백그라운드) 탭에선 폴링하지 않는다 — 서버 부하·불필요한 per-user POST 방지.
+  // 다시 보이면 visibilitychange 리스너가 즉시 tick() 해 최신으로 따라잡는다.
+  if(document.hidden) return;
   // 키 필수 모드: 키가 없으면 무인증 호출을 아예 하지 않고 안내만.
   if(USER_VIEW && !uvActive()){
     showNeedKey();
@@ -1098,7 +1169,8 @@ async function tick(){
       snap = await r.json();
     }
     render(snap);
-    $("#livedot").style.background = "var(--up)";
+    // 갱신 멈춤(render 가 판정)이면 초록 대신 주황 — "연결은 되는데 데이터가 낡음".
+    $("#livedot").style.background = snapStale ? "var(--warn)" : "var(--up)";
   }catch(e){
     $("#livedot").style.background = "var(--down)";
     $("#updated").textContent = (e && e.name==="AbortError")
@@ -1114,17 +1186,39 @@ function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
   if(timer) clearInterval(timer);
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
-// 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
+// 탭이 다시 보이면 즉시 갱신(숨김 중엔 tick 이 폴링을 건너뜀 — 위 tick 참조).
+// auto-refresh 를 사용자가 껐다면 그 의사를 존중해 여기서도 갱신하지 않는다.
+document.addEventListener("visibilitychange", ()=>{
+  if(!document.hidden && $("#auto").checked) tick(); });
+// 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더 + sessionStorage 저장(F5 복원).
 // 검색은 타이핑마다(input) 즉시 반영 — 재수집 없이 표·그래프를 함께 좁힌다.
-$("#f-search").addEventListener("input", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-net").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-eng").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-group").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+function onFilterChange(){ saveFilters(); if(lastSnap) render(lastSnap); }
+$("#f-search").addEventListener("input", onFilterChange);
+$("#f-status").addEventListener("change", onFilterChange);
+$("#f-net").addEventListener("change", onFilterChange);
+$("#f-eng").addEventListener("change", onFilterChange);
+$("#f-group").addEventListener("change", onFilterChange);
 // 그래프를 끄면(pin 조작 수단이 사라지므로) 표를 좁힌 pin 도 함께 해제한다.
 $("#f-graph").addEventListener("change", ()=>{
   if(!$("#f-graph").checked && graphPin){ graphPin=null; saveGraphPin(); }
-  if(lastSnap) render(lastSnap); });
+  onFilterChange(); });
+// API_BASE 셀 클릭 → 전체 주소 복사(셀이 말줄임(…)되어 드래그 복사가 어렵다).
+// http(비보안 컨텍스트) 배포엔 clipboard API 가 없어 execCommand 폴백을 둔다.
+function copyText(t){
+  if(navigator.clipboard && window.isSecureContext)
+    return navigator.clipboard.writeText(t);
+  return new Promise((res,rej)=>{ const ta=document.createElement("textarea");
+    ta.value=t; ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand("copy") ? res() : rej(new Error("copy")); }
+    catch(e){ rej(e); } finally{ ta.remove(); } });
+}
+$("#deployments").addEventListener("click", (e)=>{
+  const td=e.target.closest("td.api"); if(!td) return;
+  const v=(td.textContent||"").trim(); if(!v || v==="-") return;
+  copyText(v).then(()=>{ td.classList.add("copied");   // 셀 잠깐 초록 = 복사됨
+    setTimeout(()=>td.classList.remove("copied"), 900); }).catch(()=>{});
+});
 // 📌 pin 칩 클릭 → pin 해제(표 전체 복원). 칩은 매 렌더마다 새로 그려지므로 위임으로 1회만.
 $("#dep-label").addEventListener("click", (e)=>{
   if(e.target.closest("#pin-badge") && graphPin){
@@ -1141,7 +1235,7 @@ document.addEventListener("keydown", (e)=>{
 document.addEventListener("keydown", (e)=>{
   if(e.key!=="Escape") return;
   const sb=$("#f-search");
-  if(sb && sb.value){ sb.value=""; if(lastSnap) render(lastSnap); return; }
+  if(sb && sb.value){ sb.value=""; onFilterChange(); return; }
   if(graphPin){ graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
 
 // 키 필수 모드: 키 입력 바 노출 + 조회/지우기/Enter, export 는 admin 키 헤더로.
@@ -1180,6 +1274,7 @@ if(USER_VIEW){
     setTimeout(()=>URL.revokeObjectURL(u), 15000);
   });
 }
+loadFilters();   // F5 복원: 저장된 필터를 첫 렌더 전에 되살린다(pin 복원과 짝)
 tick(); loop();
 </script>
 </body>
