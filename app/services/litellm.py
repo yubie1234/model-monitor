@@ -373,12 +373,14 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
             result["errors"].append(
                 "health: %s (모델 많으면 health_timeout 늘리기)" % err)
 
-    ok, data, err = http_get_json(base + "/v1/models", api_key, timeout)
-    if ok and isinstance(data, dict):
-        result["reachable"] = True
-        result["models"] = [m.get("id") for m in data.get("data", []) if m.get("id")]
-    elif err:
-        result["errors"].append("v1/models: %s" % err)
+    # /v1/models 의 id 는 /model/info 의 model_name(public name)과 같다(같은 게이트웨이
+    # 관점). 이미 model/info 를 받아 deployments 를 채웠으므로, 매 스냅샷 주기(기본 5s)
+    # 마다 /v1/models 를 또 호출하지 않고 그 목록에서 유도한다 — 어떤 렌더러도 별도로
+    # 안 쓰는 데이터를 위해 LiteLLM 왕복을 하루 수만 번 반복하지 않게 한다. "?"
+    # (model_name 미상 플레이스홀더)는 실제 모델이 아니므로 제외.
+    result["models"] = sorted(
+        {d["model_name"] for d in result["deployments"]
+         if d.get("model_name") and d["model_name"] != "?"})
 
     return result
 
@@ -411,20 +413,36 @@ def discover_backends(litellm_result):
 
     -> backends 를 수동으로 적을 필요가 없다. 주소의 원천은 LiteLLM 설정의
        litellm_params.api_base 이며, /model/info(우선) 또는 /health 가 그대로 돌려준다.
+
+    직접 probe 는 LiteLLM 을 경유하지 않고 백엔드에 바로 닿으므로, 선택적 health
+    check 와 같은 안전 판정(_deployment_health_safe)으로 위험 백엔드(Serverless/
+    scale-to-zero/Raw 확인 안 된 KServe)를 제외한다 — 리프레시 주기(기본 5s)마다
+    쏘는 probe 가 idle 백엔드를 깨우거나 scale-down 을 막지 않게. 같은 api_base 를
+    안전/위험 deployment 가 공유하면 그 base 전체를 제외한다(하나라도 위험하면 제외).
+    build_snapshot 은 backend_count 판정 **뒤**에 이 함수를 부르므로 k8s 필드
+    (serverless/scale_to_zero/mode)가 실려 있고, k8s 를 못 보는 환경에서도
+    이름 규약(-predictor)이 폴백으로 동작한다.
     """
     discovered = {}
+    unsafe = set()   # 위험 deployment 가 쓰는 base — probe 대상에서 제외
+    for d in litellm_result.get("deployments") or []:
+        if d.get("api_base") and not _deployment_health_safe(d):
+            unsafe.add(_strip_openai_suffix(d["api_base"]))
     # 1순위: /model/info 의 deployments (api_base 평문 + 종류 분류 포함)
     for d in litellm_result.get("deployments") or []:
         api_base = d.get("api_base")
         if not api_base:
             continue
         base = _strip_openai_suffix(api_base)
+        if base in unsafe:
+            continue
         discovered.setdefault(base, {
             "name": d.get("model_name") or base,
             "url": base,
             "type": d.get("type", "-"),
         })
-    # 2순위 보강: /health 에만 있는 주소
+    # 2순위 보강: /health 에만 있는 주소 — deployment 가 없어 k8s 판정이 불가하므로
+    # 이름 규약으로만 거른다(KServe 로 보이면 Raw/Serverless 구분이 안 돼 보수적 제외).
     health = litellm_result.get("health") or {}
     for ep in (health.get("healthy_endpoints") or []) + (
             health.get("unhealthy_endpoints") or []):
@@ -432,7 +450,9 @@ def discover_backends(litellm_result):
         if not api_base:
             continue
         base = _strip_openai_suffix(api_base)
-        if base in discovered:
+        if base in discovered or base in unsafe:
+            continue
+        if _looks_kserve({"api_base": base}):
             continue
         model = ep.get("model", "")
         btype = _classify_backend(model, model, base)

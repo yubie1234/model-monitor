@@ -74,6 +74,7 @@ m = types.SimpleNamespace(
     fetch_health_for_model=_ll.fetch_health_for_model,
     aggregate_selective_health=_ll.aggregate_selective_health,
     collect_litellm=_ll.collect_litellm,
+    discover_backends=_ll.discover_backends,
 )
 
 
@@ -702,6 +703,86 @@ class TestActiveHealthCheckMarker(unittest.TestCase):
         self.assertNotIn("active_health_check", self._collect(self._SENTINEL))
 
 
+class TestCollectLitellmModels(unittest.TestCase):
+    """result['models'] 는 별도 /v1/models 호출 없이 deployments 에서 유도한다.
+
+    회귀: 매 스냅샷 주기(기본 5s)마다 어떤 렌더러도 안 쓰는 /v1/models 를 다시
+    호출해 LiteLLM 왕복을 낭비하면 안 된다(부하 절감). 모델명은 /model/info 의
+    model_name(=/v1/models 의 id)에서 정렬·중복제거로 유도한다.
+    """
+
+    def test_models_derived_from_deployments_without_v1_models_call(self):
+        calls = []
+
+        def fake(url, key=None, timeout=10):
+            calls.append(url)
+            if "/model/info" in url:
+                return True, {"data": [
+                    {"model_name": "b-model",
+                     "litellm_params": {"model": "m", "api_base": "http://b/v1"},
+                     "model_info": {"id": "1"}},
+                    {"model_name": "a-model",
+                     "litellm_params": {"model": "m", "api_base": "http://a/v1"},
+                     "model_info": {"id": "2"}},
+                    {"model_name": "a-model",   # 중복 model_name → 1개로 축약
+                     "litellm_params": {"model": "m", "api_base": "http://a2/v1"},
+                     "model_info": {"id": "3"}},
+                    {"model_name": "?",         # 미상 플레이스홀더 → 제외
+                     "litellm_params": {"model": "m", "api_base": None},
+                     "model_info": {"id": "4"}},
+                ]}, None
+            return False, None, "skip"
+
+        orig = _ll.http_get_json
+        _ll.http_get_json = fake
+        try:
+            r = m.collect_litellm("http://llm", "sk", 5, with_health=False)
+        finally:
+            _ll.http_get_json = orig
+
+        self.assertEqual(r["models"], ["a-model", "b-model"])
+        self.assertFalse(any(u.endswith("/v1/models") for u in calls))
+        self.assertFalse(any("v1/models" in e for e in r["errors"]))
+
+
+class TestDiscoverBackends(unittest.TestCase):
+    """probe 자동발견 안전 필터 — 직접 probe 는 LiteLLM 을 안 거치고 백엔드에 바로
+    닿아 scale-to-zero 를 깨우므로, 선택적 health check 와 같은 안전 판정으로
+    위험 백엔드를 대상에서 제외해야 한다."""
+
+    def test_unsafe_and_shared_bases_excluded(self):
+        ll = {"deployments": [
+            {"model_name": "safe", "api_base": "http://plain.ns.svc:8080/v1"},
+            # 이름 규약(-predictor)인데 Raw 양성 확인 없음 → 보수적 제외
+            {"model_name": "kserve-unconfirmed",
+             "api_base": "http://foo-predictor.ns.svc/v1"},
+            # 양성 위험(scale-to-zero) → 제외
+            {"model_name": "s2z", "api_base": "http://bar.ns.svc/v1",
+             "scale_to_zero": True},
+            # 자체는 안전해 보여도 위험 deployment 와 같은 base 공유 → base 제외
+            {"model_name": "sharing-safe", "api_base": "http://bar.ns.svc/v1"},
+        ]}
+        out = m.discover_backends(ll)
+        self.assertEqual([b["url"] for b in out], ["http://plain.ns.svc:8080"])
+
+    def test_raw_confirmed_kserve_included(self):
+        ll = {"deployments": [
+            {"model_name": "raw", "api_base": "http://r-predictor.ns.svc/v1",
+             "mode": "RawDeployment"}]}
+        out = m.discover_backends(ll)
+        self.assertEqual([b["url"] for b in out], ["http://r-predictor.ns.svc"])
+
+    def test_health_only_endpoints_filtered_by_name_rule(self):
+        # /health 에만 있는 주소는 k8s 판정이 없다 — KServe 이름 규약이면 Raw 확인이
+        # 불가능하므로 제외, 일반 이름만 대상에 남긴다.
+        ll = {"deployments": [],
+              "health": {"healthy_endpoints": [
+                  {"model": "m1", "api_base": "http://x-predictor.ns.svc/v1"},
+                  {"model": "m2", "api_base": "http://plain2.ns.svc/v1"}]}}
+        out = m.discover_backends(ll)
+        self.assertEqual([b["url"] for b in out], ["http://plain2.ns.svc"])
+
+
 class TestSummarize(unittest.TestCase):
     def test_cards_match_table_when_health_times_out(self):
         # 회귀 테스트: /health 타임아웃(health=None)이라도 카드 healthy 수가
@@ -1025,6 +1106,39 @@ class TestGpu(unittest.TestCase):
         self.assertEqual(out["gpu_ready"], 4)            # 2 pod × 2 GPU
         self.assertEqual(out["gpu_products"], {"H100": 4})
         self.assertIsNone(out["gpu_error"])
+
+    def test_node_cache_persists_across_clients(self):
+        # 회귀: 노드 GPU 라벨은 노드 수명 동안 불변 → 사이클 간(=K8sClient 재생성)
+        # node_cache 를 넘기면 두 번째 조회에서 /nodes/... 를 다시 부르지 않는다
+        # (정적 라벨을 위해 Node 오브젝트를 5초마다 반복 조회하던 부하 제거).
+        routes = [
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 1},
+                                "spec": {"replicas": 1}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [_pod("gpu-a", 2)]}, None)),
+            ("/nodes/gpu-a",
+             (True, {"metadata": {"labels":
+                     {"nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"}}}, None)),
+        ]
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        node_cache = {}
+
+        c1 = FakeClient(routes, default_namespace="kserve")
+        out1 = m.resolve_backend_count(dep, c1, self.GPU_SETTINGS,
+                                       node_cache=node_cache)
+        self.assertEqual(out1["gpu_products"], {"H100": 2})
+        self.assertTrue(any("/nodes/gpu-a" in p for p in c1.calls))
+
+        # 다음 사이클: 새 클라이언트지만 같은 node_cache → 노드 재조회 없이 캐시 히트
+        c2 = FakeClient(routes, default_namespace="kserve")
+        out2 = m.resolve_backend_count(dep, c2, self.GPU_SETTINGS,
+                                       node_cache=node_cache)
+        self.assertEqual(out2["gpu_products"], {"H100": 2})
+        self.assertFalse(any("/nodes/gpu-a" in p for p in c2.calls))
 
     def test_gpu_zero_when_no_ready_pods(self):
         client = FakeClient([
@@ -1839,6 +1953,26 @@ class TestSnapshotStore(unittest.TestCase):
         self.assertNotIn("collect_error", base)
 
 
+class TestRefresherBackoff(unittest.TestCase):
+    """연속 수집 예외 시 리프레시 지연이 지수 백오프(상한 60s)로 늘어난다 —
+    예상 밖 결함이 5초 타이트 재시도로 CPU(200m 캡)와 로그를 태우지 않게."""
+
+    def test_next_delay_exponential_with_cap(self):
+        r = m.Refresher({}, m.SnapshotStore(), interval=5.0)
+        self.assertEqual(r._next_delay(0), 5.0)     # 정상 시 원래 주기
+        self.assertEqual(r._next_delay(1), 10.0)
+        self.assertEqual(r._next_delay(2), 20.0)
+        self.assertEqual(r._next_delay(3), 40.0)
+        self.assertEqual(r._next_delay(4), 60.0)    # 상한 도달
+        self.assertEqual(r._next_delay(50), 60.0)   # 계속 실패해도 상한 고정
+
+    def test_next_delay_never_below_interval(self):
+        # interval 이 상한(60s)보다 크면 백오프가 주기를 단축하지 않는다.
+        r = m.Refresher({}, m.SnapshotStore(), interval=120.0)
+        self.assertEqual(r._next_delay(0), 120.0)
+        self.assertEqual(r._next_delay(3), 120.0)
+
+
 class TestRefresherDemo(unittest.TestCase):
     def test_collect_once_demo_populates_store(self):
         store = m.SnapshotStore()
@@ -1860,8 +1994,8 @@ def _settings_ns(**over):
     env 우선순위는 os.environ 으로 별도 제어한다."""
     base = dict(
         host="0.0.0.0", port=8088, interval=5.0, demo=False,
-        litellm_url=None, api_key=None, timeout=10.0, health=True,
-        health_timeout=90.0, selective_health=False, probe_backends=False,
+        litellm_url=None, api_key=None, timeout=10.0, health=False,
+        health_timeout=90.0, selective_health=True, probe_backends=False,
         backend_count=True, gpu_info=True,
         k8s_api_server=None, k8s_token_file="/t/token", k8s_ca_file="/t/ca",
         k8s_insecure=False, k8s_timeout=5.0,
@@ -1934,9 +2068,9 @@ class TestBuildCollectorSettings(unittest.TestCase):
         self.assertFalse(c["backend_count"])                       # env 우선
 
     def test_selective_health_default_env_file(self):
-        # 기본 false / env 우선 / 파일(litellm.selective_health) 반영
+        # 기본 true(전량 /health 기본 off 를 보완) / env 우선 / 파일 반영
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(
+            self.assertTrue(
                 m.build_collector_settings(_settings_ns())["selective_health"])
         with mock.patch.dict(os.environ,
                              {"MONITOR_SELECTIVE_HEALTH": "true"}, clear=True):
@@ -1953,6 +2087,25 @@ class TestBuildCollectorSettings(unittest.TestCase):
         finally:
             os.unlink(path)
         self.assertTrue(c["selective_health"])   # 파일값 반영
+
+    def test_health_default_off_env_overrides(self):
+        # 전량 /health 는 모든 백엔드 실 ping(scale-to-zero 각성) — opt-in 으로만.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(m.build_collector_settings(_settings_ns())["health"])
+        with mock.patch.dict(os.environ, {"MONITOR_HEALTH": "true"}, clear=True):
+            self.assertTrue(m.build_collector_settings(
+                _settings_ns(health=True))["health"])
+        cfg = {"litellm": {"health": True}}
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                c = m.build_collector_settings(_settings_ns(config_file=path))
+        finally:
+            os.unlink(path)
+        self.assertTrue(c["health"])   # 파일값 반영
 
     def test_metrics_token_env_beats_file(self):
         cfg = {"metrics": {"enabled": True, "token": "file-tok"}}

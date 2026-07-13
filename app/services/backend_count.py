@@ -259,11 +259,16 @@ def _int_or_none(v):
         return None
 
 
-def resolve_backend_count(deployment, client, settings, cache=None):
+def resolve_backend_count(deployment, client, settings, cache=None,
+                          node_cache=None):
     """우선순위 체인으로 한 deployment 의 LB 뒤 backend 개수 산출 -> 필드 dict.
 
     cache={(ns,svc): out} 를 주면 같은 Service 를 가리키는 여러 model_name 이
     한 스냅샷 빌드 안에서 k8s API 를 중복 조회하지 않고 결과를 재사용한다.
+
+    node_cache={node_name: gpu_product} 를 주면 노드 GPU 장치명 라벨 조회를
+    스냅샷 주기를 넘어 재사용한다(라벨은 노드 수명 동안 불변). 미지정이면
+    client 수명(=한 사이클) 캐시로 폴백한다.
     """
     out = {"backends_ready": None, "backends_desired": None,
            "backend_source": "none", "mode": "Unknown",
@@ -396,12 +401,18 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     # 한 건 실패가 전체를 막지 않게 try/except -> gpu_ready=None(=?) 폴백.
     if settings.get("gpu_info"):
         try:
-            node_cache = getattr(client, "_node_cache", None)
-            if node_cache is None:
-                node_cache = {}
-                setattr(client, "_node_cache", node_cache)
+            # 노드 GPU 장치명 라벨(nvidia.com/gpu.product)은 노드 수명 동안 불변이라
+            # 매 사이클 Node 오브젝트(status.images 포함 수십 KB)를 다시 받을 이유가
+            # 없다. 호출측이 사이클 간 유지되는 node_cache 를 넘기면 그걸 쓰고(리프레셔
+            # 경로), 없으면(직접 호출/테스트) 종전처럼 client 수명(1사이클) 캐시로 폴백.
+            nc = node_cache
+            if nc is None:
+                nc = getattr(client, "_node_cache", None)
+                if nc is None:
+                    nc = {}
+                    setattr(client, "_node_cache", nc)
             g = collect_gpu_for_service(
-                client, ns, svc, isvc, info["found"], node_cache)
+                client, ns, svc, isvc, info["found"], nc)
             out["gpu_ready"] = g["gpu_ready"]
             out["gpu_products"] = g["gpu_products"]
             out["gpu_error"] = g["gpu_error"]

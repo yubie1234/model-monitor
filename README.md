@@ -212,8 +212,8 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_INTERVAL` | 스냅샷 갱신 주기 초 (5) |
 | `MONITOR_DEMO` | 샘플 데이터 모드 (false) |
 | `MONITOR_TIMEOUT` | HTTP 타임아웃 초 (10) |
-| `MONITOR_HEALTH` / `MONITOR_HEALTH_TIMEOUT` | `/health` 사용 / 타임아웃 초 (true / 90) |
-| `MONITOR_SELECTIVE_HEALTH` | 선택적 health check (false) — `MONITOR_HEALTH=false`일 때 안전한 모델만 `/health?model=` 개별 조회(ping 은 LiteLLM 이 대신). **KServe 판별 = svc 네이밍 규약(`-predictor`)**: KServe 는 k8s 가 RawDeployment 로 양성 확인한 경우만 체크, Serverless/scale-to-zero 는 절대 깨우지 않음. 그 외(일반 Service·**external IP 포함**)는 전부 체크 → UP/DOWN. 위험 sibling(같은 underlying 모델/api_base 공유)이 있는 이름은 함께 제외(LiteLLM 의 `?model=` 매칭이 이름보다 넓을 수 있어서). LiteLLM `model_info.active_health_check: true/false` 로 모델별 수동 override(단 Knative 양성 확인은 true 도 무시. bool 또는 "true"/"false" 문자열만 인정) |
+| `MONITOR_HEALTH` / `MONITOR_HEALTH_TIMEOUT` | 전량 `/health` 사용 / 타임아웃 초 (**false** / 90) — 전량 `/health` 는 LiteLLM 이 모든 백엔드를 실제 ping 해 scale-to-zero 를 깨우므로 기본 off, 필요 시 명시적으로 켠다 |
+| `MONITOR_SELECTIVE_HEALTH` | 선택적 health check (**true**) — `MONITOR_HEALTH=false`일 때 안전한 모델만 `/health?model=` 개별 조회(ping 은 LiteLLM 이 대신). **KServe 판별 = svc 네이밍 규약(`-predictor`)**: KServe 는 k8s 가 RawDeployment 로 양성 확인한 경우만 체크, Serverless/scale-to-zero 는 절대 깨우지 않음. 그 외(일반 Service·**external IP 포함**)는 전부 체크 → UP/DOWN. 위험 sibling(같은 underlying 모델/api_base 공유)이 있는 이름은 함께 제외(LiteLLM 의 `?model=` 매칭이 이름보다 넓을 수 있어서). LiteLLM `model_info.active_health_check: true/false` 로 모델별 수동 override(단 Knative 양성 확인은 true 도 무시. bool 또는 "true"/"false" 문자열만 인정) |
 | `MONITOR_PROBE_BACKENDS` | 백엔드 직접 probe (false) |
 | `MONITOR_BACKEND_COUNT` | LB 뒤 backend Pod 개수 수집 (true) |
 | `MONITOR_GPU_INFO` | GPU 개수/장치명 수집 (true; Pod·Node 읽기 권한 필요) |

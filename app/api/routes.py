@@ -29,7 +29,10 @@ async def api_snapshot(request: Request):
         return JSONResponse(
             {"error": "키 필수 모드입니다 — POST /api/snapshot/user 로 조회하세요.",
              "needs_key": True}, status_code=403)
-    return await request.app.state.store.get()
+    # 캐시 스냅샷을 JSONResponse 로 바로 내린다 — dict 를 반환하면 폴링 요청마다
+    # response_model(Snapshot) Pydantic 재검증·재직렬화 CPU 를 쓴다(Response 반환
+    # 시 FastAPI 는 이를 건너뛰고, response_model 은 OpenAPI 문서용으로 남는다).
+    return JSONResponse(await request.app.state.store.get())
 
 
 @router.post("/api/snapshot/user", summary="키별(per-user) 필터 스냅샷")
@@ -59,11 +62,15 @@ async def api_snapshot_user(request: Request):
     # collect_user_access 는 동기(blocking urllib) LiteLLM 호출이므로 절대 이벤트
     # 루프에서 직접 부르지 않는다 — to_thread 로 워커 스레드에서 돌린다(단일 워커
     # 루프가 LiteLLM 왕복 동안 멈춰 다른 요청·프로브가 타임아웃→ingress 502 나는 것 방지).
-    access = await asyncio.to_thread(
-        st.access_cache.get_or_collect,
-        key,
-        lambda: collect_user_access(st.litellm_url, key, st.collect_timeout),
-        time.monotonic())
+    # 고유 키가 늘어나도(잘못된 키 대입 포함) blocking LiteLLM 왕복이 수집 스레드풀
+    # (_COLLECT_THREADS=8)을 독식하지 않게 동시 조회를 세마포어로 캡한다 — 초과
+    # 요청은 스레드가 아니라 이벤트 루프에서 가볍게 대기한다.
+    async with st.user_access_sem:
+        access = await asyncio.to_thread(
+            st.access_cache.get_or_collect,
+            key,
+            lambda: collect_user_access(st.litellm_url, key, st.collect_timeout),
+            time.monotonic())
     if not access["ok"]:
         # fail-closed: 절대 unfiltered global 로 폴백하지 않는다.
         return JSONResponse(
@@ -73,9 +80,12 @@ async def api_snapshot_user(request: Request):
     # '내 뷰 JSON' 간 크로스 상관을 막고, 결정적이라 워커/재기동 간 안정적이다.
     ref_seed = hashlib.sha256(
         ("ref:%s:%s" % (st.admin_key, key)).encode("utf-8")).hexdigest()
-    return JSONResponse(
-        filter_snapshot_for_user(snap, access, hide_internal=st.hide_internal,
-                                 ref_seed=ref_seed))
+    # deepcopy+summary 재계산(filter_snapshot_for_user)은 스냅샷이 크면 ms 단위
+    # CPU 작업이고 클라이언트 수×폴링 주기만큼 반복되므로 이벤트 루프에서 직접
+    # 돌리지 않는다 — 단일 루프가 막히면 모든 응답·프로브가 같이 밀린다.
+    view = await asyncio.to_thread(
+        filter_snapshot_for_user, snap, access, st.hide_internal, ref_seed)
+    return JSONResponse(view)
 
 
 @router.get("/snapshot.json", include_in_schema=False)

@@ -18,10 +18,12 @@ from app.services.litellm import (
 )
 
 
-def build_snapshot(settings, with_health=True):
+def build_snapshot(settings, with_health=True, node_cache=None):
     """전체 수집 -> 스냅샷 dict.
 
     with_health=False 면 느린 /health 를 건너뛴다(웹은 health 를 별도로 주입).
+    node_cache 를 주면 노드 GPU 장치명 라벨을 사이클 간 재사용한다(불변 라벨을
+    5초마다 다시 받지 않게 — 리프레셔가 프로세스 수명 캐시를 넘긴다).
     """
     snap = {
         "version": __version__,
@@ -41,14 +43,6 @@ def build_snapshot(settings, with_health=True):
             settings.get("health_timeout"), with_health=with_health
         )
 
-    if settings.get("probe_backends"):
-        targets = settings.get("backends") or []
-        # 수동 목록이 없으면 LiteLLM /model/info + /health 에서 자동 발견.
-        if not targets and snap["litellm"]:
-            targets = discover_backends(snap["litellm"])
-        for b in targets:
-            snap["backends"].append(collect_backend(b, settings["timeout"]))
-
     # 각 deployment 의 LB(api_base) 뒤 backend Pod 개수 채우기
     client = K8sClient.from_settings(settings)
     snap["backend_count_enabled"] = bool(client)
@@ -56,9 +50,23 @@ def build_snapshot(settings, with_health=True):
         bc_cache = {}  # (ns,svc) -> 결과: 같은 Service 중복 k8s 조회 방지
         for d in snap["litellm"].get("deployments") or []:
             try:
-                d.update(resolve_backend_count(d, client, settings, bc_cache))
+                d.update(resolve_backend_count(
+                    d, client, settings, bc_cache, node_cache))
             except Exception as e:  # noqa: BLE001  (한 건 실패가 전체를 막지 않게)
                 d["k8s_error"] = "%s: %s" % (type(e).__name__, e)
+
+    # 백엔드 직접 probe — backend_count **뒤**에 실행한다: 직접 probe 는 LiteLLM
+    # 을 경유하지 않고 백엔드에 바로 닿으므로 Serverless(scale-to-zero)를 깨우는데,
+    # k8s 판정(serverless/scale_to_zero/mode)이 붙은 뒤라야 discover_backends 가
+    # 위험 백엔드를 안전 필터로 제외할 수 있다. 수동 backends 목록은 운영자의
+    # 명시 선택이므로 필터하지 않는다.
+    if settings.get("probe_backends"):
+        targets = settings.get("backends") or []
+        # 수동 목록이 없으면 LiteLLM /model/info + /health 에서 자동 발견.
+        if not targets and snap["litellm"]:
+            targets = discover_backends(snap["litellm"])
+        for b in targets:
+            snap["backends"].append(collect_backend(b, settings["timeout"]))
 
     # /health 상태 + backend readiness 를 합쳐 deployment 에 status 부여
     # (API/웹/JSON 모두 동일한 status 를 쓰도록 여기서 한 번에 적용)

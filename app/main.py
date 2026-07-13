@@ -86,6 +86,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.collect_timeout = collector_settings.get("timeout", 10.0)
     app.state.access_cache = AccessCache(
         ttl=float(collector_settings["user_view_cache_ttl"]))
+    # per-user 접근 조회(collect_user_access)의 동시 실행 상한 — blocking LiteLLM
+    # 왕복(최대 timeout 초)이 고유 키 수만큼 몰리면 수집 스레드풀(8)을 다 차지해
+    # 리프레셔·다른 요청이 굶는다. 캐시 미스만 스레드를 오래 물므로 4개면 충분하다.
+    app.state.user_access_sem = asyncio.Semaphore(4)
 
     app.state.root_path = root_path
     app.state.dashboard_html = load_dashboard_html(
