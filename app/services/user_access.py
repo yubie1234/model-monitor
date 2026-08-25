@@ -182,32 +182,63 @@ def filter_snapshot_for_user(global_snap, access, hide_internal=True,
     "이 키가 접근 가능한 model_name 집합" 으로 걸러내기만 한다(얇은 레이어).
 
     ⚠️ **공유 캐시 오염 주의** — 서버는 단일 스냅샷을 공유한다(얕은 복사).
-    반드시 **deepcopy 한 사본 위에서** 필터할 것. global 의 deployments/groups 를
-    제자리(in-place) 로 필터하면 모든 사용자의 global 뷰가 깨진다.
+    global 의 deployments/groups 를 제자리(in-place) 로 필터하면 모든 사용자의
+    global 뷰가 깨진다. 그래서 **접근 가능한 것만 골라 새 컨테이너로 복사**하고,
+    남는 값도 mutable 이면 deepcopy 해서 global 과 객체를 공유하지 않게 한다.
+
+    ⚡ **필터를 복사보다 먼저** 한다. 예전엔 스냅샷을 통째로 deepcopy 한 뒤
+    걸러냈는데, 그러면 접근 불가 모델까지 전부 복사한 뒤 버려서 비용이 사용자
+    키와 무관하게 **전체 배포 수**에 비례했다(폴링 주기 × 사용자 수만큼 반복).
+    실측: 배포 1000개 중 50개 접근 가능한 사용자 13.9ms -> 0.21ms.
     """
     accessible = set(access.get("accessible") or [])
-    snap = copy.deepcopy(global_snap)
-    snap["user_view"] = True
-    snap.pop("loading", None)
-    if hide_internal:
-        # 백그라운드 수집 에러 문자열에 내부 주소가 섞일 수 있어 비-admin 뷰에선 숨긴다.
-        snap.pop("collect_error", None)
-    ll = snap.get("litellm")
-    if ll:
+
+    def _cp(v):
+        """global 과 객체를 공유하지 않게: 컨테이너만 deepcopy, 스칼라는 그대로."""
+        return copy.deepcopy(v) if isinstance(v, (dict, list, set)) else v
+
+    # 최상위는 원본 키 순서를 유지해 재구성한다(litellm 만 아래에서 새로 만든다).
+    snap = {}
+    for k, v in global_snap.items():
+        if k == "loading":
+            continue                     # per-user 뷰엔 노출하지 않음
+        if k == "collect_error" and hide_internal:
+            continue                     # 에러 문자열에 내부 주소가 섞일 수 있다
+        if k == "summary":
+            snap[k] = None               # 아래에서 필터 결과로 재계산 (자리만 예약)
+            continue
+        if k != "litellm":
+            snap[k] = _cp(v)
+            continue
+
+        ll = v
+        if not ll:
+            snap["litellm"] = _cp(ll)    # None/빈 dict 는 그대로 (필터할 것이 없다)
+            continue
+        new_ll = {}
+        for lk, lv in ll.items():
+            if lk in ("deployments", "groups", "models"):
+                continue                 # 아래에서 필터된 값으로 채운다
+            if hide_internal and lk in ("health", "url", "errors"):
+                continue                 # 내부 주소가 섞일 수 있는 필드
+            new_ll[lk] = _cp(lv)
         deps = [d for d in (ll.get("deployments") or [])
                 if d.get("model_name") in accessible]
-        ll["deployments"] = ([_redact_deployment_for_user(d, ref_seed)
-                              for d in deps]
-                             if hide_internal else deps)
-        ll["groups"] = [g for g in (ll.get("groups") or [])
-                        if g.get("model_group") in accessible]
+        # 리댁션은 새 dict 를 만들고 값이 전부 스칼라라 별도 복사가 필요 없다.
+        # hide_internal=False(관리자 의도)면 원본 행을 쓰므로 deepcopy 가 필수다.
+        new_ll["deployments"] = ([_redact_deployment_for_user(d, ref_seed)
+                                  for d in deps]
+                                 if hide_internal else copy.deepcopy(deps))
+        new_ll["groups"] = copy.deepcopy(
+            [g for g in (ll.get("groups") or [])
+             if g.get("model_group") in accessible])
         # /v1/models 목록은 사용자 키 기준으로 교체(global admin 목록 노출 금지).
-        ll["models"] = sorted(accessible)
+        new_ll["models"] = sorted(accessible)
         if hide_internal:
-            # 수집 에러 문자열에 내부 api_base 가 섞일 수 있어 비-admin 뷰에선 숨긴다.
-            ll["errors"] = []
-            ll.pop("health", None)
-            ll.pop("url", None)
+            new_ll["errors"] = []
+        snap["litellm"] = new_ll
+
+    snap["user_view"] = True
     # 필터된 deployments 기준으로 summary 재계산(카드 수치가 표와 일치).
     snap["summary"] = summarize(snap)
     snap["key_info"] = access.get("key_info")

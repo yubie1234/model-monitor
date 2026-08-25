@@ -9,7 +9,8 @@
 
 import urllib.parse
 
-from app.services.gpu import collect_gpu_for_service, service_pod_selector
+from app.services.gpu import (collect_gpu_for_service, meta_drop, meta_get,
+                              meta_put, selector_key, service_pod_selector)
 
 
 def parse_api_base(api_base, default_namespace="default", overrides=None):
@@ -110,19 +111,38 @@ def count_via_endpoints(client, ns, svc):
     return {"ready": len(ips)}, None
 
 
-def detect_mode_and_revision(client, ns, svc):
-    """service 이름에서 ISVC 추정 -> deploymentMode + revision + found 여부."""
+def detect_mode_and_revision(client, ns, svc, meta_cache=None):
+    """service 이름에서 ISVC 추정 -> deploymentMode + revision + found 여부.
+
+    meta_cache 를 주면 **부재(HTTP 404)만** TTL 캐시한다. 일반 Service 는 이
+    조회가 매 사이클 404 를 받으므로(하루 17,280회/Service) 그것만 없애도 크다.
+
+    성공(found=True)은 캐시하지 않는다 — 반환하는 revision 이
+    status.components.predictor.latestReadyRevision 에서 오는 **동적** 값이라
+    캐시하면 롤아웃 후에도 옛 revision 이 굳고, 그걸 쓰는 Knative
+    PodAutoscaler 조회가 사라진 revision 을 가리킨다.
+
+    404 가 아닌 실패(RBAC/타임아웃/프록시)도 캐시하지 않는다 — 일시적 실패를
+    굳히면 network_type 이 TTL 동안 '-' 로 고정된다(node 라벨 캐시와 같은 원칙).
+    """
     isvc = svc
     for suffix in ("-predictor", "-transformer", "-explainer"):
         if isvc.endswith(suffix):
             isvc = isvc[: -len(suffix)]
             break
+    absent = {"mode": "Unknown", "revision": None, "isvc": isvc, "found": False}
+    hit, cached_err = meta_get(meta_cache, ("isvc-absent", ns, isvc))
+    if hit:
+        return dict(absent), cached_err
     ok, data, err = client.get(
         "/apis/serving.kserve.io/v1beta1/namespaces/%s/inferenceservices/%s"
         % (ns, isvc))
     if not ok:
-        return {"mode": "Unknown", "revision": None, "isvc": isvc,
-                "found": False}, err
+        # 호출측이 "HTTP 404" 접두사로 '없음' 과 '판정 불가' 를 가르므로 err 도
+        # 함께 캐시해 캐시 히트가 원본과 똑같이 분기되게 한다.
+        if str(err or "").startswith("HTTP 404"):
+            meta_put(meta_cache, ("isvc-absent", ns, isvc), err)
+        return dict(absent), err
     status = data.get("status") or {}
     mode = status.get("deploymentMode") or (
         data.get("metadata", {}).get("annotations", {})
@@ -212,7 +232,7 @@ def count_via_deployment(client, ns, svc):
             "source": "deployment"}, None
 
 
-def count_desired_via_selector(client, ns, svc):
+def count_desired_via_selector(client, ns, svc, meta_cache=None):
     """네이밍 독립적 desired 보강: Service selector -> Pod ownerReferences -> StatefulSet.
 
     Service 와 StatefulSet/Pod 사이엔 정해진 네이밍 규칙이 없어 같은 이름으로 못
@@ -222,7 +242,7 @@ def count_desired_via_selector(client, ns, svc):
     StatefulSet 은 Pod 을 직접 소유하므로 한 홉이면 된다. 소유 StatefulSet 이
     없거나 조회 실패면 (None, err) — desired 는 지어내지 않는다.
     """
-    sel, serr = service_pod_selector(client, ns, svc)
+    sel, serr = service_pod_selector(client, ns, svc, meta_cache)
     if sel is None:
         return None, serr
     ok, data, err = client.get(
@@ -230,6 +250,10 @@ def count_desired_via_selector(client, ns, svc):
         % (ns, urllib.parse.quote(sel, safe="=,")))
     if not ok:
         return None, "pods: %s" % err
+    if not (data.get("items") or []):
+        # 캐시한 selector 가 Pod 을 못 찾았다 — 라벨이 바뀐 재배포일 수 있으니
+        # 버리고 다음 사이클에 다시 읽는다(collect_gpu_for_service 와 같은 규칙).
+        meta_drop(meta_cache, selector_key(ns, svc))
     sts_names = set()
     for pod in data.get("items") or []:
         for ref in ((pod.get("metadata") or {}).get("ownerReferences") or []):
@@ -260,7 +284,7 @@ def _int_or_none(v):
 
 
 def resolve_backend_count(deployment, client, settings, cache=None,
-                          node_cache=None):
+                          node_cache=None, meta_cache=None):
     """우선순위 체인으로 한 deployment 의 LB 뒤 backend 개수 산출 -> 필드 dict.
 
     cache={(ns,svc): out} 를 주면 같은 Service 를 가리키는 여러 model_name 이
@@ -303,7 +327,7 @@ def resolve_backend_count(deployment, client, settings, cache=None,
     activator_ns = settings.get("activator_namespace", "knative-serving")
     errors = []
 
-    info, isvc_err = detect_mode_and_revision(client, ns, svc)
+    info, isvc_err = detect_mode_and_revision(client, ns, svc, meta_cache)
     out["mode"] = info["mode"]
     isvc, revision = info["isvc"], info["revision"]
     serverless = _is_serverless(info["mode"], revision)
@@ -388,7 +412,8 @@ def resolve_backend_count(deployment, client, settings, cache=None,
         # ownerReferences 로 소유 StatefulSet 을 찾아 desired 를 보강한다. 이게 없으면
         # EndpointSlice ready 만 잡혀 집계에서 ready 합 > desired 합(=100% 초과)이 된다.
         if out["backends_desired"] is None:
-            own, oerr = count_desired_via_selector(client, ns, svc)
+            own, oerr = count_desired_via_selector(client, ns, svc,
+                                                   meta_cache)
             if own is not None:
                 out["backends_desired"] = own.get("desired")
             elif oerr:
@@ -412,7 +437,7 @@ def resolve_backend_count(deployment, client, settings, cache=None,
                     nc = {}
                     setattr(client, "_node_cache", nc)
             g = collect_gpu_for_service(
-                client, ns, svc, isvc, info["found"], nc)
+                client, ns, svc, isvc, info["found"], nc, meta_cache)
             out["gpu_ready"] = g["gpu_ready"]
             out["gpu_products"] = g["gpu_products"]
             out["gpu_error"] = g["gpu_error"]

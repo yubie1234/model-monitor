@@ -70,6 +70,10 @@ class Refresher:
         # 사이클(기본 5s)마다 K8sClient 를 새로 만들어도 이 캐시는 유지해, 정적
         # 라벨을 위해 Node 오브젝트를 반복해서 받지 않는다(공유 k8s API 부하 절감).
         self._node_cache = {}
+        # 거의 변하지 않는 k8s 조회(ISVC 부재 · Service selector)의 TTL 캐시.
+        # node_cache 와 같은 이유로 프로세스 수명이다 — 사이클마다 새로
+        # 만들면(bc_cache 처럼) 사이클 간 절감이 0 이다.
+        self._meta_cache = {}
 
     async def collect_once(self):
         """스냅샷 1회 수집(메인은 health 없이 빠르게) 후 비동기 health 주입."""
@@ -79,7 +83,8 @@ class Refresher:
             return snap
 
         snap = await asyncio.to_thread(
-            build_snapshot, self.settings, False, self._node_cache)
+            build_snapshot, self.settings, False, self._node_cache,
+            self._meta_cache)
         if snap.get("litellm"):
             async with self._health_lock:
                 h = self._health

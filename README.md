@@ -97,6 +97,37 @@ Admin UI 의 토글 스위치). 꺼진 deployment 는 라우팅 풀에서 빠져
 > 필요한 RBAC 는 [deploy/k8s.yaml](deploy/k8s.yaml) 의 ClusterRole 참고 — 최소한 `endpointslices` 읽기,
 > GPU 정보까지 보려면 `pods`·`nodes` 읽기.
 
+### k8s API 호출량과 캐시
+
+한 스냅샷 주기에 **고유 Service 당** 다음 5회를 조회합니다. 같은 Service 를 공유하는 deployment 가
+여러 개여도 사이클 내 캐시로 1회로 접힙니다(배포 100개가 Service 12개를 공유하면 60회, 배포당 0.6회).
+
+| 조회 | 성질 | 사이클 간 캐시 |
+|------|------|----------------|
+| `inferenceservices/<isvc>` | ISVC 존재 여부 + deploymentMode + revision | **부재(404)만** TTL 5분 |
+| `services/<svc>` (`spec.selector`) | 라벨 셀렉터 | TTL 5분 + 자기치유 |
+| `endpointslices?…` | ready endpoint | 없음 (동적) |
+| `deployments/<name>` | readyReplicas / replicas | 없음 (동적) |
+| `pods?labelSelector=…` | GPU 수 · 엔진 | 없음 (동적) |
+| `nodes/<name>` | GPU 장치명 라벨 | 프로세스 수명 (노드 수명 동안 불변) |
+
+**v1.1.0 에서 위 두 항목을 캐시**해 정상 상태 호출을 Service 당 5회 → 3회로 줄였습니다
+(Service 12개·5초 주기 실측: 하루 약 103만 → 62만 회, **41만 회 절감**).
+
+캐시하지 **않는** 것이 안전장치입니다:
+
+- **ISVC 조회 성공은 캐시하지 않습니다.** 반환하는 revision 이 `latestReadyRevision` 에서 오는
+  동적 값이라, 캐시하면 롤아웃 후에도 옛 revision 이 굳고 그걸 쓰는 Knative PodAutoscaler 조회가
+  사라진 revision 을 가리킵니다. 절감은 "ISVC 가 없는 일반 Service" 에서만 나옵니다.
+- **404 가 아닌 실패(RBAC/타임아웃/프록시)도 캐시하지 않습니다.** 일시적 실패를 굳히면
+  `network_type` 이 TTL 동안 `-`(판정 불가)로 고정됩니다 — 노드 라벨 캐시와 같은 원칙.
+- **selector 는 자기치유합니다.** 캐시한 selector 로 Pod 조회가 0건이면 TTL 을 기다리지 않고
+  버려 다음 사이클에 다시 읽습니다(라벨을 바꾼 재배포 대응). 실제로 0 replica 인 Service 가
+  매 사이클 selector 를 다시 받는 것이 대가인데, 그쪽은 어차피 호출 예산이 남습니다.
+
+TTL 은 [app/services/gpu.py](app/services/gpu.py) 의 `META_TTL`(기본 300초). 전환 인지가 더 빨라야
+하면 줄이고, 호출을 더 줄이려면 늘리세요 — 5분이면 사이클 60회 중 59회를 회피합니다.
+
 ## 사용법
 
 ```bash
@@ -152,6 +183,11 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   지금 렌더 중인 per-user 스냅샷(서버 응답 그대로)을 파일로 저장할 수 있습니다 — 문의/디버그에
   첨부. 브라우저 밖에서는 `curl -X POST -H "X-LiteLLM-Key: <내 키>" <base>/api/snapshot/user`
   로 같은 JSON 을 받을 수 있습니다. (admin 전체 export 는 기존처럼 admin 키 전용.)
+- **뷰 생성 비용 (v1.1.0)**: 공유 스냅샷을 통째로 복사한 뒤 걸러내던 것을 **필터 먼저, 접근 가능한
+  것만 복사**로 바꿨습니다. 예전엔 비용이 사용자 키와 무관하게 *전체* 배포 수에 비례했습니다
+  (폴링 주기 × 사용자 수만큼 반복). 실측: 배포 1000개 중 50개 접근 사용자 **13.7ms → 0.24ms**,
+  전체 접근이어도 **5.5배**. 남기는 값은 컨테이너면 deepcopy 해 공유 스냅샷과 객체를 공유하지
+  않습니다(뷰를 변형해도 다른 사용자 뷰가 깨지지 않음 — 회귀 테스트로 고정).
 - **접근 캐시**: 같은 키의 `/v1/models` 결과를 **짧은 TTL(기본 30s)** 캐시해 폴링 중복 호출을 제거
   (해시만 보관, 원문 키 비저장). 성공만 캐시 → 무효 키는 매번 재검증. 취소/만료 키는 최대 TTL 동안 stale.
   config `user_view.cache_ttl` 로 조절.

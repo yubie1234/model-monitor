@@ -9,11 +9,14 @@ m.* 네임스페이스로 모아 노출한다. (web/route 계층은 별도이고
 """
 
 import asyncio
+import collections
 import copy
+import importlib
 import json
 import os
 import re
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -71,6 +74,11 @@ m = types.SimpleNamespace(
     _deployment_health_safe=_ll._deployment_health_safe,
     select_health_check_models=_ll.select_health_check_models,
     health_check_allowed_bases=_ll.health_check_allowed_bases,
+    detect_mode_and_revision=_bc.detect_mode_and_revision,
+    count_desired_via_selector=_bc.count_desired_via_selector,
+    service_pod_selector=_gpu.service_pod_selector,
+    collect_gpu_for_service=_gpu.collect_gpu_for_service,
+    selector_key=_gpu.selector_key,
     fetch_health=_ll.fetch_health,
     fetch_health_for_model=_ll.fetch_health_for_model,
     aggregate_selective_health=_ll.aggregate_selective_health,
@@ -1849,6 +1857,39 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         self.assertNotIn("health_status_source", d)
         self.assertFalse(out["summary"]["blocked_known"])
 
+    def test_view_is_isolated_from_global_snapshot(self):
+        """뷰의 mutable 을 건드려도 global 스냅샷이 안 깨져야 한다.
+
+        회귀: 예전 구현은 스냅샷을 통째로 deepcopy 해서 자동으로 격리됐다.
+        비용 때문에 '필터 먼저, 필요한 것만 복사' 로 바꿨으므로(배포 1000개 중
+        50개 접근 사용자 13.9ms -> 0.21ms) 남기는 값마다 복사를 빠뜨리면
+        모든 사용자가 공유하는 global 스냅샷이 오염된다. 두 모드 다 검사한다.
+        """
+        for hide in (True, False):
+            g = self._global()
+            before = json.dumps(g, sort_keys=True, default=str)
+            v = m.filter_snapshot_for_user(
+                g, {"accessible": ["gpt-x", "gpt-y"]}, hide_internal=hide)
+            v["litellm"]["deployments"].clear()
+            v["litellm"]["groups"].append({"model_group": "침입"})
+            v["litellm"]["models"].append("침입")
+            v["summary"]["deployments_total"] = -1
+            if isinstance(v.get("backends"), list):
+                v["backends"].append({"url": "침입"})
+            self.assertEqual(json.dumps(g, sort_keys=True, default=str), before,
+                             "hide_internal=%s 뷰 변형이 global 로 새어나갔다" % hide)
+
+    def test_nested_containers_are_not_shared_with_global(self):
+        # gpu_products 처럼 행 안의 중첩 dict 까지 복사돼야 한다 — 얕은 복사면
+        # 사용자가 받은 뷰와 global 이 같은 객체를 가리킨다(내부노출 모드).
+        g = self._global()
+        for d in g["litellm"]["deployments"]:
+            d["gpu_products"] = {"H100": 2}
+        v = m.filter_snapshot_for_user(
+            g, {"accessible": ["gpt-x", "gpt-y"]}, hide_internal=False)
+        for vd, gd in zip(v["litellm"]["deployments"], g["litellm"]["deployments"]):
+            self.assertIsNot(vd["gpu_products"], gd["gpu_products"])
+
     def test_show_internal_keeps_api_base(self):
         out = m.filter_snapshot_for_user(
             self._global(), {"accessible": ["gpt-x"]}, hide_internal=False)
@@ -2476,6 +2517,171 @@ class TestBuildCollectorSettings(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(m.build_collector_settings(
                 _settings_ns())["metrics_token"])
+
+
+class TestK8sMetaCache(unittest.TestCase):
+    """사이클 간 메타 캐시(ISVC 부재 · Service selector).
+
+    실측(배포 35 / 고유 Service 12 / 5초 주기): Service 마다 사이클당 k8s 5회 =
+    하루 약 103만 회인데, 그중 ISVC 부재 확인과 spec.selector 는 매번 같은 답을
+    준다. 이 둘만 TTL 캐시해 사이클당 60 -> 36회(40% 감소, 하루 약 41만 회)로
+    줄인다. 캐시하면 **안 되는** 것들이 회귀 포인트라 함께 고정한다.
+    """
+
+    class _Client:
+        default_namespace = "default"
+        enabled = True
+
+        def __init__(self, isvc_exists=False, isvc_err="HTTP 404 not found",
+                     pods=1, selector="app=x"):
+            self.calls = collections.Counter()
+            self.isvc_exists = isvc_exists
+            self.isvc_err = isvc_err
+            self.pods = pods
+            self.selector = selector
+
+        def get(self, path, *a, **kw):
+            if "inferenceservices" in path:
+                self.calls["isvc"] += 1
+                if not self.isvc_exists:
+                    return False, None, self.isvc_err
+                # revision 은 롤아웃마다 바뀌는 동적 값 — 호출마다 다르게 준다.
+                return True, {"status": {
+                    "deploymentMode": "RawDeployment",
+                    "components": {"predictor": {
+                        "latestReadyRevision": "rev-%d" % self.calls["isvc"]}}}}, None
+            if "/services/" in path:
+                self.calls["svc"] += 1
+                k, v = self.selector.split("=")
+                return True, {"spec": {"selector": {k: v}}}, None
+            if "/pods" in path:
+                self.calls["pods"] += 1
+                items = [{"metadata": {"name": "pod-1"},
+                          "spec": {"nodeName": "node-1", "containers": [
+                              {"image": "vllm/x", "resources": {
+                                  "limits": {"nvidia.com/gpu": "2"}}}]},
+                          "status": {"conditions": [
+                              {"type": "Ready", "status": "True"}]}}]
+                return True, {"items": items[:self.pods]}, None
+            if "/nodes/" in path:
+                self.calls["node"] += 1
+                return True, {"metadata": {"labels": {
+                    "nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"}}}, None
+            self.calls["other"] += 1
+            return False, None, "n/a"
+
+    def test_absent_isvc_is_cached_after_first_cycle(self):
+        meta = {}
+        counts = []
+        for _ in range(3):
+            c = self._Client()
+            m.detect_mode_and_revision(c, "ns", "svc", meta)
+            counts.append(c.calls["isvc"])
+        self.assertEqual(counts, [1, 0, 0], "ISVC 404 가 캐시되지 않았다")
+
+    def test_present_isvc_is_never_cached(self):
+        # 회귀: 성공을 캐시하면 revision(latestReadyRevision)이 굳고, 그걸 쓰는
+        # Knative PodAutoscaler 조회가 사라진 revision 을 가리킨다.
+        meta = {}
+        revs = []
+        # 클라이언트를 사이클 간 공유해야 revision 이 실제로 바뀐다(가짜 응답이
+        # 호출 횟수로 revision 을 만든다) — 캐시되면 조회가 안 일어나 값이 굳는다.
+        c = self._Client(isvc_exists=True)
+        for i in range(3):
+            info, _ = m.detect_mode_and_revision(c, "ns", "svc", meta)
+            self.assertEqual(c.calls["isvc"], i + 1,
+                             "성공을 캐시해 조회가 사라졌다")
+            revs.append(info["revision"])
+        self.assertEqual(revs, ["rev-1", "rev-2", "rev-3"],
+                         "revision 이 갱신되지 않았다(캐시에 굳었다)")
+        self.assertEqual(meta, {}, "found=True 를 캐시했다")
+
+    def test_transient_isvc_failure_is_not_cached(self):
+        # 404 가 아닌 실패(RBAC/타임아웃)를 캐시하면 network_type 이 TTL 동안
+        # '-'(판정 불가)로 굳는다 — 노드 라벨 캐시와 같은 원칙.
+        meta = {}
+        for _ in range(3):
+            c = self._Client(isvc_err="HTTP 403 forbidden")
+            m.detect_mode_and_revision(c, "ns", "svc", meta)
+            self.assertEqual(c.calls["isvc"], 1)
+        self.assertEqual(meta, {}, "일시적 실패가 캐시됐다")
+
+    def test_selector_is_cached(self):
+        meta = {}
+        counts = []
+        for _ in range(3):
+            c = self._Client()
+            m.service_pod_selector(c, "ns", "svc", meta)
+            counts.append(c.calls["svc"])
+        self.assertEqual(counts, [1, 0, 0])
+
+    def test_selector_failure_is_not_cached(self):
+        class NoSvc(TestK8sMetaCache._Client):
+            def get(self, path, *a, **kw):
+                if "/services/" in path:
+                    self.calls["svc"] += 1
+                    return False, None, "HTTP 403 forbidden"
+                return super().get(path, *a, **kw)
+        meta = {}
+        for _ in range(2):
+            c = NoSvc()
+            sel, err = m.service_pod_selector(c, "ns", "svc", meta)
+            self.assertIsNone(sel)
+            self.assertEqual(c.calls["svc"], 1)
+        self.assertEqual(meta, {})
+
+    def test_selector_dropped_when_pod_query_comes_back_empty(self):
+        # 자기치유: 라벨을 바꾼 재배포면 캐시한 selector 가 Pod 을 못 찾는다.
+        # TTL 을 기다리지 않고 버려 다음 사이클에 다시 읽어야 한다.
+        meta, nc = {}, {}
+        seen = []
+        for pods in (1, 1, 0, 1, 1):
+            c = self._Client(pods=pods)
+            m.collect_gpu_for_service(c, "ns", "svc", "svc", False, nc, meta)
+            seen.append(c.calls["svc"])
+        self.assertEqual(seen, [1, 0, 0, 1, 0],
+                         "Pod 0건 뒤에 selector 를 다시 읽지 않았다")
+
+    def test_cache_disabled_when_none(self):
+        # CLI/직접 호출/기존 테스트 경로: meta_cache 를 안 주면 종전 그대로.
+        for _ in range(3):
+            c = self._Client()
+            m.detect_mode_and_revision(c, "ns", "svc", None)
+            self.assertEqual(c.calls["isvc"], 1)
+            c2 = self._Client()
+            m.service_pod_selector(c2, "ns", "svc", None)
+            self.assertEqual(c2.calls["svc"], 1)
+
+    def test_ttl_expiry_refetches(self):
+        meta = {}
+        m_gpu = importlib.import_module("app.services.gpu")
+        m_gpu.meta_put(meta, ("sel", "ns", "s"), "app=y", ttl=0.05)
+        self.assertTrue(m_gpu.meta_get(meta, ("sel", "ns", "s"))[0])
+        time.sleep(0.1)
+        self.assertFalse(m_gpu.meta_get(meta, ("sel", "ns", "s"))[0])
+
+    def test_cache_is_bounded(self):
+        # node_cache 와 달리 상한을 둔다 — (ns,svc) 라 유계지만 안전망.
+        m_gpu = importlib.import_module("app.services.gpu")
+        cache = {}
+        for i in range(m_gpu._META_MAX + 100):
+            m_gpu.meta_put(cache, ("sel", "ns", "s%d" % i), "app=x")
+        self.assertLessEqual(len(cache), m_gpu._META_MAX)
+
+    def test_steady_state_call_reduction(self):
+        """정상상태에서 Service 당 5회 -> 3회 (동적 조회만 남는다)."""
+        def cycle(meta):
+            c = self._Client()
+            d = {"model_name": "m", "api_base": "http://svc.ns.svc:8000/v1"}
+            m.resolve_backend_count(d, c, {"gpu": True}, {}, {}, meta)
+            return sum(c.calls.values())
+        meta = {}
+        first, second, third = cycle(meta), cycle(meta), cycle(meta)
+        self.assertEqual(second, third, "정상상태가 안정적이지 않다")
+        self.assertLess(second, first)
+        # 남는 것은 EndpointSlice / Deployment status / Pod 목록 — 전부 동적.
+        self.assertEqual(first - second, 2,
+                         "절감이 ISVC+selector 2회가 아니다")
 
 
 class TestDashboardTemplateScopes(unittest.TestCase):

@@ -18,12 +18,15 @@ from app.services.litellm import (
 )
 
 
-def build_snapshot(settings, with_health=True, node_cache=None):
+def build_snapshot(settings, with_health=True, node_cache=None, meta_cache=None):
     """전체 수집 -> 스냅샷 dict.
 
     with_health=False 면 느린 /health 를 건너뛴다(웹은 health 를 별도로 주입).
     node_cache 를 주면 노드 GPU 장치명 라벨을 사이클 간 재사용한다(불변 라벨을
     5초마다 다시 받지 않게 — 리프레셔가 프로세스 수명 캐시를 넘긴다).
+    meta_cache 는 같은 취지의 TTL 캐시로, 거의 변하지 않는 k8s 조회(ISVC 부재 ·
+    Service selector)를 사이클 간 재사용한다 — 자세한 규칙은 gpu.META_TTL 참고.
+    둘 다 미지정이면 캐시 없이 종전대로 매 사이클 조회한다(CLI/테스트 경로).
     """
     snap = {
         "version": __version__,
@@ -51,7 +54,7 @@ def build_snapshot(settings, with_health=True, node_cache=None):
         for d in snap["litellm"].get("deployments") or []:
             try:
                 d.update(resolve_backend_count(
-                    d, client, settings, bc_cache, node_cache))
+                    d, client, settings, bc_cache, node_cache, meta_cache))
             except Exception as e:  # noqa: BLE001  (한 건 실패가 전체를 막지 않게)
                 d["k8s_error"] = "%s: %s" % (type(e).__name__, e)
 

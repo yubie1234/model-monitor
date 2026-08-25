@@ -5,10 +5,53 @@
 멀티노드 GPU 환경 없음 전제: Pod 1개 = 노드 1개.
 """
 
+import time
 import urllib.parse
 
 GPU_RESOURCE = "nvidia.com/gpu"
 GPU_PRODUCT_LABEL = "nvidia.com/gpu.product"
+
+# --- 사이클 간 메타 캐시 (거의 변하지 않는 k8s 조회 결과) -------------------
+# 실측(배포 35 / 고유 Service 12 / 5초 주기): 사이클당 Service 마다 k8s 5회 =
+# 하루 약 103만 회. 그중 2회는 매번 같은 답을 준다 — ISVC 부재(=이 Service 는
+# KServe 가 아니다)와 Service.spec.selector. 이 둘만 TTL 캐시해 하루 약 41만
+# 회를 없앤다. 나머지 3회(EndpointSlice / Deployment status / Pod 목록)는 진짜
+# 동적이라 캐시하지 않는다.
+#
+# node_cache(장치 라벨)와 달리 **TTL 이 필요하다**: 노드 라벨은 노드 수명 동안
+# 불변이지만, Service 는 나중에 KServe 로 이관될 수 있고 selector 도 라벨을 바꾼
+# 재배포로 변할 수 있다. TTL 5분이면 사이클 60회 중 59회를 회피하면서 전환
+# 인지 지연은 5분 이내로 묶인다.
+META_TTL = 300.0
+_META_MAX = 4096      # (ns,svc) 단위라 클러스터 Service 수로 이미 유계지만 상한을 둔다
+
+
+def meta_get(cache, key, now=None):
+    """TTL 메타 캐시 조회 -> (hit, value). cache=None 이면 항상 미스(캐시 비활성)."""
+    if cache is None:
+        return False, None
+    ent = cache.get(key)
+    if ent is not None and ent[0] > (now if now is not None else time.monotonic()):
+        return True, ent[1]
+    return False, None
+
+
+def meta_put(cache, key, value, now=None, ttl=META_TTL):
+    if cache is None or ttl <= 0:
+        return
+    now = now if now is not None else time.monotonic()
+    if len(cache) >= _META_MAX:
+        for k in [k for k, (e, _) in cache.items() if e <= now]:
+            cache.pop(k, None)
+        while len(cache) >= _META_MAX:
+            cache.pop(next(iter(cache)), None)
+    cache[key] = (now + ttl, value)
+
+
+def meta_drop(cache, key):
+    """캐시된 값이 틀렸다는 증거가 나왔을 때 즉시 무효화(TTL 을 기다리지 않는다)."""
+    if cache is not None:
+        cache.pop(key, None)
 
 
 def _gpu_qty(v):
@@ -98,12 +141,25 @@ def _node_gpu_product(client, node_name, cache):
     return prod
 
 
-def service_pod_selector(client, ns, svc):
+def selector_key(ns, svc):
+    """메타 캐시에서 selector 항목을 가리키는 키(무효화에도 같은 키를 쓴다)."""
+    return ("sel", ns, svc)
+
+
+def service_pod_selector(client, ns, svc, meta_cache=None):
     """Service 의 spec.selector -> Pod labelSelector 문자열. (sel, err).
 
     Service 이름 자체가 아니라 selector(라벨)로 Pod 을 찾으므로, Service 와
     StatefulSet/Deployment 사이의 네이밍 규칙에 의존하지 않는다.
+
+    meta_cache 를 주면 성공 결과를 TTL 재사용한다 — selector 는 라벨을 바꾼
+    재배포 때만 변하는데 매 사이클 Service 오브젝트를 다시 받고 있었다.
+    **실패는 캐시하지 않는다**(node 라벨 캐시와 같은 이유: 일시적 RBAC/타임아웃을
+    굳히면 그 Service 의 Pod 수가 TTL 동안 '?' 로 고정된다).
     """
+    hit, sel = meta_get(meta_cache, selector_key(ns, svc))
+    if hit:
+        return sel, None
     ok, sdata, serr = client.get(
         "/api/v1/namespaces/%s/services/%s" % (ns, svc))
     if not ok:
@@ -111,10 +167,13 @@ def service_pod_selector(client, ns, svc):
     seldict = ((sdata.get("spec") or {}).get("selector")) or {}
     if not seldict:
         return None, "service 에 selector 없음"
-    return ",".join("%s=%s" % (k, v) for k, v in sorted(seldict.items())), None
+    sel = ",".join("%s=%s" % (k, v) for k, v in sorted(seldict.items()))
+    meta_put(meta_cache, selector_key(ns, svc), sel)
+    return sel, None
 
 
-def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
+def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache,
+                            meta_cache=None):
     """(ns,svc) 뒤 ready Pod 들의 GPU 수 합 + 장치별 집계 + 서빙 엔진 판별.
 
     -> {"gpu_ready": int|None, "gpu_products": {short: count}, "gpu_error": str|None,
@@ -132,7 +191,7 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
     if found:
         sel = "serving.kserve.io/inferenceservice=%s" % isvc
     else:
-        sel, serr = service_pod_selector(client, ns, svc)
+        sel, serr = service_pod_selector(client, ns, svc, meta_cache)
         if sel is None:
             out["gpu_error"] = serr
             return out
@@ -142,6 +201,12 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache):
     if not ok:
         out["gpu_error"] = "pods: %s" % err
         return out
+    if not found and not (data.get("items") or []):
+        # 캐시한 selector 로 Pod 이 0건 — 정말 0 replica 일 수도 있지만 라벨이
+        # 바뀐 재배포일 수도 있다. TTL 을 기다리지 않고 버려 다음 사이클에 다시
+        # 읽는다(자기치유). 손해는 실제로 0 replica 인 Service 가 매 사이클
+        # selector 를 다시 받는 것뿐 — 그쪽은 어차피 예산이 남는다.
+        meta_drop(meta_cache, selector_key(ns, svc))
     total = 0
     products = {}
     any_ready = False
