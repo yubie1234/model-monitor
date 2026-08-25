@@ -56,6 +56,9 @@ class Deployment(_Loose):
     status_source: Optional[str] = None
     blocked: Optional[bool] = None     # LiteLLM 관리자 일시중지. None=알 수 없음
     health_status: Optional[str] = None  # PAUSED 이전의 원래 health 판정
+    # 그 판정의 근거(health/k8s/unknown). status_source 가 "blocked" 로
+    # 덮이므로 이게 없으면 실측/추정 구분이 사라진다.
+    health_status_source: Optional[str] = None
     gpu_ready: Optional[int] = None
     gpu_products: Dict[str, int] = {}
     gpu_error: Optional[str] = None

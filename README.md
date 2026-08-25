@@ -176,6 +176,12 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   값 **UP=1 · DOWN=0 · 미상/idle/일시중지=-1**), `model_monitor_model_backend_pods_{ready,desired}`,
   `model_monitor_model_scale_to_zero`(0 Pod 가 정상 idle 인지 장애인지 구분),
   `model_monitor_model_blocked`(관리자 일시중지 1/0 — 장애와 구분).
+- **GPU**: `model_monitor_backend_gpus_ready_total`(모든 LB 뒤 ready Pod 가 점유한 GPU 합계 — Pod 와
+  같은 이유로 공유 Service 는 1회만 집계), `model_monitor_backend_gpus_ready_by_device{device=…}`
+  (H100/B200 등 장치 모델별 — 이기종 클러스터에서 어느 장치가 부족한지),
+  `model_monitor_model_backend_gpus_ready`(모델 단위, 라벨 `model`/`namespace`/`service`),
+  `model_monitor_backend_gpus_known`(0 이면 노드 라벨/RBAC 문제로 GPU 를 하나도 못 알아낸 것 —
+  총량 0 이 '장애' 가 아니라 '미상' 임을 구분).
 - **스크레이프 신뢰도**: `model_monitor_up`, `model_monitor_build_info{version=…}`,
   `model_monitor_backend_count_enabled`, `model_monitor_collect_errors`(>0 이면 일부 Pod 수 부정확),
   `model_monitor_gpu_collect_errors`(>0 이면 일부 GPU 수 부정확),

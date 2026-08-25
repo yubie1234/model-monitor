@@ -182,16 +182,23 @@ def merge_deployments_with_health(ll):
             row["status_detail"] = detail
         # 이 함수는 한 스냅샷에서 **두 번** 돈다(build_snapshot 에서 health 없이
         # 한 번, state.Refresher 가 /health 를 주입한 뒤 한 번). 이전 회차가 남긴
-        # health_status 를 먼저 지워야 blocked 가 풀린 행에 옛 값이 남지 않는다.
+        # health_status* 를 먼저 지워야 blocked 가 풀린 행에 옛 값이 남지 않는다.
         row.pop("health_status", None)
+        row.pop("health_status_source", None)
         # 관리자 일시중지(LiteLLM model_info.blocked)는 health 결과를 덮어쓴다.
         # LiteLLM /health 는 blocked 백엔드도 그대로 ping 해서 healthy 로 보고
         # 하지만(v1.90.0), 라우팅 풀에서는 빠져 있어 트래픽을 전혀 못 받는다.
         # 그대로 UP 으로 두면 "정상인데 아무도 못 쓰는" 거짓 정상이 된다.
         # 원래 health 판정은 health_status 로 남긴다 — 운영자가 다시 켰을 때
         # 실제로 뜰 백엔드인지(Pod 가 살아있는지) 알아야 하기 때문.
+        #
+        # 그 판정의 **근거**(health_status_source)도 함께 남긴다. status_source 는
+        # "blocked" 로 덮이므로 이걸 안 남기면 PAUSED(UP) 의 UP 이 /health 실측인지
+        # k8s readiness 추정인지 구분이 사라진다 — MONITOR_HEALTH 기본값이 off 라
+        # 실제로는 추정값인 경우가 더 흔한데, 화면엔 같은 확신으로 보이게 된다.
         if d.get("blocked") is True:
             row["health_status"] = status
+            row["health_status_source"] = src
             row["status"], row["status_source"] = "PAUSED", "blocked"
         merged.append(row)
     # LiteLLM 은 replica 구성에 따라 model/info 순서가 매번 달라질 수 있어

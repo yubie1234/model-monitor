@@ -168,7 +168,7 @@ def _redact_deployment_for_user(d, ref_seed=None):
     # 단 **있을 때만** 넣는다: 위 dict 처럼 무조건 넣으면 값이 None 이어도 키가
     # 생겨 summarize 의 blocked_known(= 키 존재 여부)이 항상 참이 되고,
     # blocked 를 모르는 LiteLLM 에서도 "판별 가능" 이라고 거짓 보고하게 된다.
-    for k in ("blocked", "health_status"):
+    for k in ("blocked", "health_status", "health_status_source"):
         if k in d:
             out[k] = d[k]
     return out

@@ -538,6 +538,13 @@ function statusPill(s, d){
   const parts = [];
   const srcTip = d ? STATUS_SRC_TIP[d.status_source] : null;
   if(srcTip) parts.push("판정: "+srcTip);
+  // PAUSED 는 status_source 가 "blocked" 로 덮여 괄호 안 값(원래 health 판정)의
+  // 근거가 위 줄에서 사라진다. 실측인지 추정인지는 "다시 켜면 뜰까" 를 판단하는
+  // 신뢰도라 반드시 따로 보여준다 — MONITOR_HEALTH 기본 off 에서는 추정이 흔하다.
+  if(s==="PAUSED" && d && d.health_status && d.health_status_source){
+    const hsTip = STATUS_SRC_TIP[d.health_status_source];
+    if(hsTip) parts.push("괄호 안 "+d.health_status+" 의 근거: "+hsTip);
+  }
   // 사유는 DOWN 일 때, 그리고 일시중지됐지만 원래 health 가 DOWN 이었을 때도 보여준다
   // — 다시 켜도 뜨지 않을 백엔드인지 미리 알아야 하기 때문.
   const dtip = (s==="DOWN" || (s==="PAUSED" && d && d.health_status==="DOWN"))

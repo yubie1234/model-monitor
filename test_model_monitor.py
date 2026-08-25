@@ -915,6 +915,37 @@ class TestBlockedStatus(unittest.TestCase):
         self.assertEqual(merged["P"]["status_source"], "blocked")
         # 원래 health 판정은 보존 — 다시 켰을 때 뜰 백엔드인지 알아야 한다.
         self.assertEqual(merged["P"]["health_status"], "UP")
+        # 그 판정의 근거도 보존. status_source 는 "blocked" 로 덮이므로 이게
+        # 없으면 괄호 안 UP 이 실측인지 추정인지 화면에서 구분할 수 없다.
+        self.assertEqual(merged["P"]["health_status_source"], "health")
+
+    def test_paused_records_k8s_provenance_when_health_absent(self):
+        # 회귀: MONITOR_HEALTH 기본값이 off 라 PAUSED 의 괄호 값은 대개 k8s
+        # readiness 추정이다. 이를 "health" 로 뭉개거나 아예 안 남기면 화면이
+        # 추정을 실측과 같은 확신으로 보여준다(판정근거 가시화의 취지 위반).
+        ll = {"health": None,
+              "deployments": [{"model_name": "P", "api_base": "http://p/v1",
+                               "backends_ready": 2, "backends_desired": 2,
+                               "blocked": True}]}
+        row = m.merge_deployments_with_health(ll)[0]
+        self.assertEqual(row["status"], "PAUSED")
+        self.assertEqual(row["status_source"], "blocked")
+        self.assertEqual(row["health_status"], "UP")
+        self.assertEqual(row["health_status_source"], "k8s")   # 실측이 아니다
+
+    def test_health_status_source_cleared_when_unpaused(self):
+        # merge 는 한 스냅샷에서 두 번 돈다 — health_status 와 마찬가지로
+        # 근거 필드도 재병합 때 지워져야 옛 값이 유령처럼 남지 않는다.
+        ll = {"health": None,
+              "deployments": [{"model_name": "P", "api_base": "http://p/v1",
+                               "backends_ready": 2, "backends_desired": 2,
+                               "blocked": True}]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        for d in ll["deployments"]:
+            d["blocked"] = False
+        row = m.merge_deployments_with_health(ll)[0]
+        self.assertNotIn("health_status", row)
+        self.assertNotIn("health_status_source", row)
 
     def test_blocked_false_and_absent_are_untouched(self):
         merged = {d["model_name"]: d
@@ -1793,12 +1824,15 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         g = self._global()
         g["litellm"]["deployments"][0].update(
             {"blocked": True, "status": "PAUSED", "health_status": "UP",
-             "status_source": "blocked"})
+             "health_status_source": "k8s", "status_source": "blocked"})
         out = m.filter_snapshot_for_user(g, {"accessible": ["gpt-x"]})
         d = out["litellm"]["deployments"][0]
         self.assertIs(d["blocked"], True)
         self.assertEqual(d["status"], "PAUSED")
         self.assertEqual(d["health_status"], "UP")
+        # 괄호 안 UP 이 실측인지 추정인지도 사용자 뷰에서 구분돼야 한다
+        # (상태 문자열일 뿐 내부 토폴로지가 아니다).
+        self.assertEqual(d["health_status_source"], "k8s")
         # 내부 주소는 여전히 가려져 있어야 한다.
         self.assertNotIn("api_base", d)
         self.assertEqual(out["summary"]["deployments_blocked"], 1)
@@ -1812,6 +1846,7 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         d = out["litellm"]["deployments"][0]
         self.assertNotIn("blocked", d)
         self.assertNotIn("health_status", d)
+        self.assertNotIn("health_status_source", d)
         self.assertFalse(out["summary"]["blocked_known"])
 
     def test_show_internal_keeps_api_base(self):
