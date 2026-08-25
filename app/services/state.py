@@ -13,10 +13,10 @@ import asyncio
 from app import __version__
 from app.services.demo import demo_snapshot
 from app.services.litellm import (
-    _strip_openai_suffix,
     aggregate_selective_health,
     fetch_health,
     fetch_health_for_model,
+    health_check_allowed_bases,
     select_health_check_models,
 )
 from app.services.snapshot import (
@@ -168,13 +168,10 @@ class Refresher:
                     "selective health: deployment 에 k8s 판정(network_type)이 "
                     "없어 체크 대상을 못 고름 — backend_count 비활성/권한 확인")
             return h
-        # ?model= 응답 검증용: 모델별 허용 api_base(접미어 제거) 집합
-        allowed = {}
-        for d in deps:
-            n = d.get("model_name")
-            if n in names and d.get("api_base"):
-                allowed.setdefault(n, set()).add(
-                    _strip_openai_suffix(d["api_base"]))
+        # ?model= 응답 검증용: 모델별 허용 api_base(접미어 제거) 집합.
+        # 조회 대상(names)뿐 아니라 '일시중지라서만 빠진 안전한 backend' 도
+        # 포함된다 — 판정 규칙은 health_check_allowed_bases 참고.
+        allowed = health_check_allowed_bases(deps, names)
         sem = asyncio.Semaphore(self._SELECTIVE_PARALLEL)
 
         async def one(name):

@@ -117,6 +117,10 @@
   .pill.up{color:var(--up);background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.3)}
   .pill.down{color:var(--down);background:rgba(248,81,73,.10);border-color:rgba(248,81,73,.3)}
   .pill.unk{color:var(--muted);background:rgba(139,151,167,.1);border-color:var(--border)}
+  /* 일시중지 = 장애가 아니라 의도적으로 꺼둔 상태. 빨강(장애)과 반드시 구분되게
+     accent 계열 + 점선 테두리로 '멈춰 있음' 을 시각적으로 분리한다. */
+  .pill.pause{color:var(--accent);background:rgba(110,139,255,.10);
+    border-color:rgba(110,139,255,.35);border-style:dashed}
   .chip{font-family:var(--mono);font-size:11px;color:var(--muted);
     background:var(--surface2);border:1px solid var(--border);border-radius:5px;
     padding:1px 7px}
@@ -202,6 +206,9 @@
   .gnode.be.warn rect{fill:rgba(210,153,34,.12);stroke:rgba(210,153,34,.5)}
   .gnode.be.zero rect{fill:rgba(210,153,34,.08);stroke:rgba(210,153,34,.4)}
   .gnode.be.unk rect{fill:var(--surface2);stroke:var(--border)}
+  /* 일시중지 백엔드: accent 계열 + 반투명 — 장애(빨강)와 확실히 구분 */
+  .gnode.be.paused rect{fill:rgba(110,139,255,.07);stroke:rgba(110,139,255,.45)}
+  .gnode.be.paused .ntext{fill:var(--muted)}
   .gnode.be.shared rect{stroke-dasharray:4 3}
   .gedge{stroke:var(--faint);stroke-width:1.6;fill:none;opacity:.5}
   .gedge.shared{stroke:var(--warn);stroke-width:2;opacity:.8}
@@ -285,11 +292,12 @@
         <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
-        <select id="f-status" title="상태로 필터. '이상만(≠UP)'은 정상 확인 안 된 것(DOWN·?)을 한 번에 — 장애 트리아지용">
+        <select id="f-status" title="상태로 필터. '이상만'은 정상 확인 안 된 것(DOWN·?)을 한 번에 — 장애 트리아지용이라 의도적으로 꺼둔 PAUSED 는 빼고 본다">
           <option value="">all</option>
-          <option value="!UP">이상만 (≠UP)</option>
+          <option value="!UP">이상만 (장애후보)</option>
           <option value="UP">UP</option>
           <option value="DOWN">DOWN</option>
+          <option value="PAUSED">PAUSED (비활성)</option>
           <option value="?">?</option>
         </select>
         <label for="f-net">net</label>
@@ -449,9 +457,19 @@ function backendCell(d){
     +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
 }
 
-function statusPill(s){
-  const cls = s==="UP"?"up":(s==="DOWN"?"down":"unk");
-  return '<span class="pill '+cls+'">'+esc(s)+'</span>';
+function statusPill(s,d){
+  const cls = statusPillCls(s);
+  // PAUSED 는 'PAUSED(UP)' 처럼 원래 health 판정을 괄호로 덧붙인다 — 다시 켰을 때
+  // 실제로 뜰 백엔드인지(Pod 가 살아있는지)를 한눈에 보게.
+  let txt = s;
+  if(s==="PAUSED"){
+    const hs = d && d.health_status;
+    txt = "PAUSED" + (hs && hs!=="?" ? "("+hs+")" : "");
+  }
+  const tip = s==="PAUSED"
+    ? ' title="LiteLLM 에서 관리자가 일시중지(pause)한 모델 — 장애가 아니라 트래픽을 받지 않도록 꺼둔 상태입니다."'
+    : '';
+  return '<span class="pill '+cls+'"'+tip+'>'+esc(txt)+'</span>';
 }
 
 function card(label,val,cls,sub){
@@ -498,14 +516,20 @@ function trunc(s,n){s=String(s==null?"":s);return s.length>n?s.slice(0,n-1)+"…
 function backendHost(api){ if(!api) return "";
   return String(api).replace(/^[a-z]+:\/\//,"").replace(/[:\/].*$/,""); }
 function compositeStatus(bes){
+  // 일시중지된 backend 는 라우팅 풀에서 빠져 있으니 그룹 가용성 판정에서 뺀다
+  // (LiteLLM 도 blocked sibling 을 건너뛰고 남은 deployment 로 라우팅한다).
+  // 전부 일시중지면 그 모델 이름은 통째로 트래픽을 못 받는다 -> PAUSED.
+  const live = bes.filter(b=>(b.status||"?")!=="PAUSED");
+  if(live.length===0) return bes.length ? "PAUSED" : "?";
   let up=0,down=0;
-  bes.forEach(b=>{const s=b.status||"?"; if(s==="UP")up++; else if(s==="DOWN")down++;});
-  if(up===bes.length) return "UP";
-  if(down===bes.length && down>0) return "DOWN";
+  live.forEach(b=>{const s=b.status||"?"; if(s==="UP")up++; else if(s==="DOWN")down++;});
+  if(up===live.length) return "UP";
+  if(down===live.length && down>0) return "DOWN";
   if(up>0) return "DEGRADED";
   return "?";
 }
-function statusPillCls(s){return s==="UP"?"up":(s==="DOWN"?"down":(s==="DEGRADED"?"deg":"unk"));}
+function statusPillCls(s){return s==="UP"?"up":(s==="DOWN"?"down":
+  (s==="DEGRADED"?"deg":(s==="PAUSED"?"pause":"unk")));}
 function compositePill(s){return '<span class="pill '+statusPillCls(s)+'">'+esc(s)+'</span>';}
 function sumBackends(bes){
   let r=null,d=null;
@@ -524,6 +548,16 @@ function aggCell(r,d){
 function sharedMap(all){
   const mp={};
   (all||[]).forEach(d=>{const k=svcKeyOf(d);(mp[k]=mp[k]||new Set()).add(d.model_name);});
+  return mp;
+}
+// backend Service 별 '전부 일시중지인가'. sharedMap 과 마찬가지로 **필터 전**
+// 전체 목록으로 계산해야 한다 — 필터로 살아있는 sibling 이 화면에서 빠졌을 뿐인데
+// 물리 백엔드를 꺼진 것으로 칠하면 거짓말이 된다(status='PAUSED' 필터가 정확히
+// 그 상황을 만든다).
+function pausedMap(all){
+  const mp={};
+  (all||[]).forEach(d=>{const k=svcKeyOf(d);
+    mp[k]=(mp[k]===undefined?true:mp[k]) && d.status==="PAUSED";});
   return mp;
 }
 // 장치명 -> 색(고정 매핑 + 해시 폴백). 상태색(green/red)과 겹치지 않는 계열.
@@ -598,7 +632,7 @@ function groupedRows(merged, shared, showBk, showGpu){
       const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
       const others=sh?[...shared[k]].filter(x=>x!==name):[];
       const svcLabel=svcLabelOf(b);
-      html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?")+'</td>'
+      html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?",b)+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
           +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
       if(showBk){ html+='<td>'+backendCell(b)+'</td>';
@@ -613,6 +647,9 @@ function groupedRows(merged, shared, showBk, showGpu){
 
 // ── Model ↔ Backend 이분 그래프 (SVG, 외부 의존성 0) ─────────────────────
 function beNodeCls(o){
+  // 일시중지가 최우선 — Pod 가 살아 있어도(r>0) 라우팅에서 빠져 있으므로
+  // 초록(정상)으로 칠하면 안 된다.
+  if(o.paused) return "paused";
   if(o.ext) return "unk";
   if(o.stz) return "zero";
   if(o.r==null) return "unk";
@@ -625,7 +662,7 @@ function beNodeCls(o){
 // ('gpt.4' vs 'gpt_4' 등 pin/하이라이트가 엉뚱한 행에 걸리는 충돌 방지),
 // 출력에 " 나 \ 가 없어 큰따옴표 속성값/선택자에 그대로 넣어도 안전하다.
 function attrId(s){return encodeURIComponent(String(s));}
-function buildGraph(deps){
+function buildGraph(deps, pausedBy){
   if(!deps || !deps.length) return "";
   const names=[], seenN={};
   deps.forEach(d=>{ if(!seenN[d.model_name]){seenN[d.model_name]=1;names.push(d.model_name);} });
@@ -635,6 +672,10 @@ function buildGraph(deps){
   deps.forEach(d=>{ const k=svcKeyOf(d);
     if(!svc[k]){ svc[k]={key:k,label:svcLabelOf(d),
       r:d.backends_ready,des:d.backends_desired,status:d.status,
+      // 그 Service 를 가리키는 deployment 가 **전부** 일시중지일 때만 paused.
+      // 판정은 필터 전 전체 목록(pausedMap)에서 온다 — 필터된 목록으로 접으면
+      // 살아있는 sibling 이 화면에서 빠졌을 뿐인데 꺼진 것으로 칠하게 된다.
+      paused:!!(pausedBy && pausedBy[k]),
       gpu:d.gpu_ready,gpu_products:d.gpu_products,
       ext:(d.backend_source==="external"),stz:d.scale_to_zero,models:new Set()}; svcOrder.push(k); }
     svc[k].models.add(d.model_name); });
@@ -661,7 +702,8 @@ function buildGraph(deps){
   let snodes="";
   svcOrder.forEach(k=>{ const o=svc[k], sh=o.models.size>1, y=sY[k];
     const gtxt=(o.gpu!=null && o.gpu>0)?("  ·  "+gpuText(o.gpu,o.gpu_products)):"";
-    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" replicas"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
+    let sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" replicas"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
+    if(o.paused) sub="일시중지  ·  "+sub;
     snodes+='<g class="gnode be '+beNodeCls(o)+(sh?' shared':'')+'" data-key="'+attrId(k)+'" data-kind="b">'
       +'<title>'+esc(o.label)+(sub?' — '+esc(sub):'')+'</title>'  // 전체 라벨+상태 tooltip
       +'<rect x="'+colR+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
@@ -837,6 +879,12 @@ function render(snap){
   cards += card("Registered", s.deployments_registered||0, "");
   cards += card("Running (healthy)", s.deployments_healthy||0, "good",
     "unhealthy "+(s.deployments_unhealthy||0));
+  // 일시중지 카드는 실제로 꺼둔 게 있을 때만 — 평상시 대시보드에 0 카드를 늘려
+  // 시선을 뺏지 않는다. healthy/unhealthy 어디에도 안 잡히므로 이 카드가 없으면
+  // "Registered 는 10인데 healthy+unhealthy 가 8" 인 차이를 설명할 길이 없다.
+  if(s.deployments_blocked)
+    cards += card("Paused (비활성)", s.deployments_blocked, "accent",
+      "관리자가 트래픽 차단");
   if(s.backend_pods_known)
     cards += card("Replicas", (s.backend_pods_ready||0)
       +'<span style="color:var(--faint);font-size:16px"> / '
@@ -862,8 +910,12 @@ function render(snap){
   const fS = $("#f-status").value, fN = $("#f-net").value, fE = $("#f-eng").value;
   // model_name 검색: 대소문자 무시 부분일치. 표·그래프에 status/net/eng 와 함께 적용된다.
   const fQ = ($("#f-search").value||"").trim().toLowerCase();
-  // status 필터: '!UP'(이상만)은 UP 이 아닌 것(DOWN·?) 전부, 그 외엔 정확히 일치.
-  const stOk = d => !fS || (fS==="!UP" ? (d.status||"?")!=="UP" : (d.status||"?")===fS);
+  // status 필터: '!UP'(이상만)은 DOWN·? 를 한 번에, 그 외엔 정확히 일치.
+  // '이상만' 은 장애 트리아지용이라 PAUSED(의도적으로 꺼둔 것)는 빼고 본다 —
+  // 안 그러면 운영자가 일부러 중지한 모델이 매번 장애 후보로 섞여 올라온다.
+  const stOk = d => !fS || (fS==="!UP"
+    ? ((d.status||"?")!=="UP" && (d.status||"?")!=="PAUSED")
+    : (d.status||"?")===fS);
   const filterDep = d => stOk(d)
     && (!fN || netOf(d)===fN) && (!fE || engOf(d)===fE)
     && (!fQ || String(d.model_name||"").toLowerCase().includes(fQ));
@@ -911,7 +963,7 @@ function render(snap){
     } else {
       body = tableDeps.map(d=>{
         let row = '<tr data-model="'+attrId(d.model_name)+'" data-svc="'+attrId(svcKeyOf(d))+'"><td>'
-          +statusPill(d.status||"?")+"</td>"
+          +statusPill(d.status||"?",d)+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
           +'<td>'+typeChips(netOf(d),engOf(d))+"</td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
@@ -948,7 +1000,7 @@ function render(snap){
     gcol.style.display = "";
     split.classList.remove("no-graph");
     gwrap.innerHTML = graphDeps.length
-      ? buildGraph(graphDeps)
+      ? buildGraph(graphDeps, pausedMap(all))
       : '<div class="empty">필터 결과 없음</div>';
     const svg = gwrap.querySelector("svg");
     if(svg) wireGraph(svg);

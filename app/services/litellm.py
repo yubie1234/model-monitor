@@ -8,6 +8,30 @@ import urllib.parse
 
 from app.core.http import http_get_json
 
+_TRUE_WORDS = ("true", "1", "yes", "on")
+_FALSE_WORDS = ("false", "0", "no", "off")
+
+
+def _parse_bool_marker(v):
+    """model_info 의 bool 마커를 엄격 파싱 -> True/False, 판독 불가면 None.
+
+    bool() 강제 변환 금지: YAML 에 "false"(따옴표 문자열)로 쓰는 흔한 실수가
+    bool("false")==True 로 뒤집혀 opt-out 이 opt-in 이 된다. bool 과 명시적
+    true/false 문자열만 인정하고, 그 외 값은 무시한다(fail-safe).
+
+    None 반환 = "이 필드가 없거나 못 읽었다" — 호출측은 키를 아예 안 만들어서
+    '모름' 과 '거짓' 을 구분한다.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in _TRUE_WORDS:
+            return True
+        if low in _FALSE_WORDS:
+            return False
+    return None
+
 
 def _classify_backend(model_name, underlying, api_base):
     """(레거시) model_name 접두사/underlying model 로 백엔드 종류 추정 (표시용).
@@ -156,6 +180,14 @@ def select_health_check_models(deployments):
     있다(같은 underlying 모델의 **다른 이름** deployment 의 endpoint 가 응답에
     포함됨). 안전한 이름이라도 위험한 sibling 과 underlying 또는 api_base 를
     공유하면 그 ping 이 sibling(Serverless)까지 깨울 수 있으므로 함께 제외한다.
+
+    또 **모든** deployment 가 blocked(관리자 일시중지)인 이름은 건너뛴다.
+    트래픽을 하나도 안 받는 모델이라 ping 해서 알아낼 게 없고, 운영자가 일부러
+    꺼둔 백엔드를 모니터가 계속 두드리지 않게 한다. LiteLLM /health 는 blocked
+    를 걸러주지 않으므로(v1.90.0 확인) 이 제외는 모니터 쪽에서만 가능하다.
+    반대로 **일부만** blocked 면 이름을 계속 체크한다 — 남은 sibling 이 실제로
+    트래픽을 받고 있어 그 상태를 봐야 하고, /health?model= 은 이름 단위라
+    살아있는 쪽만 골라 ping 할 수단이 없다(LiteLLM 의 '완전 차단' 개념과 동일).
     """
     # underlying 은 같은 모델이라도 provider 접두사 유무가 섞인다(실데이터:
     # "openai/Qwen3-Next-..." vs "Qwen3-Next-..."). 접두사를 떼고 비교해야
@@ -180,6 +212,10 @@ def select_health_check_models(deployments):
                 unsafe_base.add(_strip_openai_suffix(d["api_base"]))
 
     def _name_ok(ds):
+        # 전부 일시중지 = 라우팅 대상이 하나도 없음 -> ping 할 이유가 없다.
+        # (blocked 는 '깨우기 위험' 신호가 아니므로 unsafe_* 오염엔 쓰지 않는다)
+        if ds and all(d.get("blocked") is True for d in ds):
+            return False
         for d in ds:
             if not _deployment_health_safe(d):
                 return False
@@ -192,6 +228,33 @@ def select_health_check_models(deployments):
         return True
 
     return sorted(n for n, ds in by_name.items() if _name_ok(ds))
+
+
+def health_check_allowed_bases(deployments, names):
+    """?model= 응답 검증용 허용 base 집합 {model_name: {base, ...}}.
+
+    합집합이 답하는 질문은 **"이 endpoint 가 ping 돼도 괜찮은가"** 이지
+    "이 이름으로 조회를 보내는가" 가 아니다. 둘을 같은 집합으로 쓰면,
+    일시중지라 조회 대상에서 뺀 backend 가 sibling 응답에 섞여 올 때
+    "Serverless 가 ping 됐다" 는 오경보가 매 라운드 뜬다(일시중지는 깨우기
+    위험이 아니므로 경보 대상이 아니다).
+
+    그래서 조회 대상(names)의 base 에 더해, **일시중지라서만 빠졌고 그 자체로는
+    ping 해도 안전한** deployment 의 base 도 넣는다. 반대로 일시중지이면서
+    Serverless/KServe 위험인 backend 는 넣지 않는다 — 그건 실제로 깨어난
+    정황이라 경보가 맞다.
+    """
+    out = {}
+    sel = set(names or [])
+    for d in deployments or []:
+        base = d.get("api_base")
+        if not base:
+            continue
+        name = d.get("model_name")
+        if name in sel or (d.get("blocked") is True
+                           and _deployment_health_safe(d)):
+            out.setdefault(name, set()).add(_strip_openai_suffix(base))
+    return out
 
 
 def fetch_health_for_model(url, api_key, name, timeout):
@@ -348,18 +411,24 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
             # 선택적 health check 수동 override — LiteLLM config 의
             # model_info.active_health_check (true=판정불가여도 체크 허용,
             # false=항상 제외). 없으면 k8s 판정(select_health_check_models)만 쓴다.
-            # bool() 강제 변환 금지: YAML 에 "false"(따옴표 문자열)로 쓰는 흔한
-            # 실수가 bool("false")==True 로 뒤집혀 opt-out 이 opt-in 이 된다.
-            # bool 과 명시적 true/false 문자열만 인정, 그 외 값은 무시(fail-safe).
-            ahc = mi.get("active_health_check")
-            if isinstance(ahc, bool):
+            ahc = _parse_bool_marker(mi.get("active_health_check"))
+            if ahc is not None:
                 dep["active_health_check"] = ahc
-            elif isinstance(ahc, str):
-                low = ahc.strip().lower()
-                if low in ("true", "1", "yes", "on"):
-                    dep["active_health_check"] = True
-                elif low in ("false", "0", "no", "off"):
-                    dep["active_health_check"] = False
+            # 관리자 일시중지(pause) 상태 — LiteLLM v1.90.0+ 의 model_info.blocked.
+            # (POST /model/block, /model/unblock, PATCH /model/{id}/update)
+            # blocked=true 인 deployment 는 LiteLLM 라우팅 풀에서 제외돼 트래픽을
+            # 전혀 받지 않는다. **장애가 아니라 의도적으로 꺼둔 상태**다.
+            #
+            # 주의: LiteLLM /health 는 blocked 를 전혀 걸러내지 않는다(v1.90.0
+            # 확인). 즉 일시중지된 백엔드도 계속 ping 돼 healthy 로 보고되므로,
+            # 이 플래그가 없으면 "트래픽을 안 받는데 UP" 인 거짓 정상이 뜬다.
+            #
+            # DB 등록 모델에만 붙고 config.yaml 전용 모델엔 키 자체가 없다
+            # → 3상태: True(비활성) / False(활성) / 키 없음(구버전 LiteLLM
+            # 이거나 config 전용 = 알 수 없음). 없으면 키를 만들지 않는다.
+            blocked = _parse_bool_marker(mi.get("blocked"))
+            if blocked is not None:
+                dep["blocked"] = blocked
             result["deployments"].append(dep)
     elif err:
         result["errors"].append("model/info: %s" % err)
