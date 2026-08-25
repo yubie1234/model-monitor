@@ -1,7 +1,9 @@
 """Prometheus 메트릭 (text exposition format 0.0.4).
 
 수집은 하지 않는다 — 이미 만들어진 스냅샷을 문자열로 포맷만 한다(요청 경로 비차단).
-상태 인코딩: UP=1, DOWN=0, ?(미상/scale-to-zero idle)=-1.
+상태 인코딩: UP=1, DOWN=0, ?(미상/scale-to-zero idle/PAUSED)=-1.
+PAUSED(관리자 일시중지)는 model_monitor_model_blocked 로 따로 노출한다 — 기존
+알림(model_up==0)을 건드리지 않으면서 "꺼둔 모델 제외" 를 표현할 수 있게.
 카디널리티: 라벨은 model/namespace/service/backend_source/status_source 로 한정하고
 api_base(내부 URL)는 노출하지 않는다(per-user 뷰에서 숨기는 내부 정보).
 """
@@ -135,6 +137,15 @@ def render_prometheus_metrics(snap):
     emit("model_monitor_deployments_unhealthy",
          "상태 DOWN 인 deployment 수.", "gauge",
          [({}, s.get("deployments_unhealthy", 0))])
+    emit("model_monitor_deployments_blocked",
+         "관리자가 LiteLLM 에서 일시중지(pause)한 deployment 수. "
+         "healthy/unhealthy 어느 쪽에도 포함되지 않는다.", "gauge",
+         [({}, s.get("deployments_blocked", 0))])
+    emit("model_monitor_blocked_known",
+         "LiteLLM 이 일시중지 상태(model_info.blocked)를 알려주면 1. "
+         "0 이면 구버전이거나 config 전용 모델이라 '비활성' 판별 자체가 불가.",
+         "gauge",
+         [({}, 1 if s.get("blocked_known") else 0)])
     emit("model_monitor_model_groups",
          "LiteLLM 모델 그룹 수.", "gauge",
          [({}, s.get("model_groups", 0))])
@@ -168,7 +179,7 @@ def render_prometheus_metrics(snap):
             lab["service"] = d["service"]
         return lab
 
-    up_s, ready_s, desired_s, s2z_s, gpu_s = [], [], [], [], []
+    up_s, ready_s, desired_s, s2z_s, gpu_s, blk_s = [], [], [], [], [], []
     for d in deps:
         lab = base_labels(d)
         up_lab = dict(lab)
@@ -184,10 +195,26 @@ def render_prometheus_metrics(snap):
         gpu_s.append((dict(lab), d.get("gpu_ready")))
         s2z_s.append(({"model": d.get("model_name") or ""},
                       1 if d.get("scale_to_zero") else 0))
+        # 일시중지는 model_up 에서 -1(미상)로 뭉뚱그려지므로 별도 게이지로 뺀다.
+        # 기존 DOWN 알림(model_up == 0)은 -1 이라 애초에 안 걸리니 제외 절이 필요
+        # 없다. 굳이 명시하려면 라벨 매칭을 반드시 붙일 것 — model_up 에는
+        # status_source 라벨이 더 있어 bare unless 는 라벨셋이 달라 **절대 매칭되지
+        # 않는다**(조용한 무효 절):
+        #   model_monitor_model_up == 0
+        #     unless on(model, namespace, service) model_monitor_model_blocked == 1
+        blk_s.append((dict(lab), 1 if d.get("status") == "PAUSED" else 0))
 
     emit("model_monitor_model_up",
-         "모델 상태: UP=1, DOWN=0, 미상/idle=-1.", "gauge",
+         "모델 상태: UP=1, DOWN=0, 미상/idle/일시중지=-1. "
+         "일시중지 구분은 model_monitor_model_blocked 를 함께 볼 것.", "gauge",
          _dedup_samples(up_s, _status_reduce))
+    emit("model_monitor_model_blocked",
+         "관리자가 일시중지(pause)해 트래픽을 안 받으면 1. 장애(DOWN)와 구분용.",
+         "gauge",
+         # 같은 (model,ns,svc) 에 deployment 가 여러 개면 min = '전부 꺼졌을 때만 1'.
+         # 하나라도 살아 있으면 그 조합은 여전히 라우팅되므로 1 로 표시하면 거짓
+         # 양성이다. 대시보드의 compositeStatus·그래프 노드와 같은 '완전 차단' 규칙.
+         _dedup_samples(blk_s, min))
     emit("model_monitor_model_backend_pods_ready",
          "이 모델 LB 뒤 ready Pod 수. 여러 모델이 같은 Service 를 공유할 수 있어 "
          "단순 합산은 물리 Pod 를 중복 집계한다 — 총합은 *_total 사용.", "gauge",

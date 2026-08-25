@@ -174,10 +174,25 @@ def merge_deployments_with_health(ll):
         row = {**d, "status": status, "status_source": src}
         # DOWN 일 때만 사유 필드를 부착한다(UP/'?'엔 불필요). down_reason/status_detail
         # 은 per-user 리댁션 allowlist 밖이라 비-admin 뷰에선 자동 미노출(fail-safe).
+        # 아래 PAUSED 승격보다 **먼저** 붙인다 — 일시중지된 행에도 원래 health 가
+        # DOWN 이었다면 그 사유를 남겨야 한다(다시 켰을 때 실제로 뜰지 판단용).
         if reason is not None:
             row["down_reason"] = reason
         if detail is not None:
             row["status_detail"] = detail
+        # 이 함수는 한 스냅샷에서 **두 번** 돈다(build_snapshot 에서 health 없이
+        # 한 번, state.Refresher 가 /health 를 주입한 뒤 한 번). 이전 회차가 남긴
+        # health_status 를 먼저 지워야 blocked 가 풀린 행에 옛 값이 남지 않는다.
+        row.pop("health_status", None)
+        # 관리자 일시중지(LiteLLM model_info.blocked)는 health 결과를 덮어쓴다.
+        # LiteLLM /health 는 blocked 백엔드도 그대로 ping 해서 healthy 로 보고
+        # 하지만(v1.90.0), 라우팅 풀에서는 빠져 있어 트래픽을 전혀 못 받는다.
+        # 그대로 UP 으로 두면 "정상인데 아무도 못 쓰는" 거짓 정상이 된다.
+        # 원래 health 판정은 health_status 로 남긴다 — 운영자가 다시 켰을 때
+        # 실제로 뜰 백엔드인지(Pod 가 살아있는지) 알아야 하기 때문.
+        if d.get("blocked") is True:
+            row["health_status"] = status
+            row["status"], row["status_source"] = "PAUSED", "blocked"
         merged.append(row)
     # LiteLLM 은 replica 구성에 따라 model/info 순서가 매번 달라질 수 있어
     # model_name 기준으로 정렬해 표시 순서를 안정화한다(API/웹/JSON 공통).
@@ -199,6 +214,8 @@ def summarize(snap):
         "deployments_total": 0,
         "deployments_healthy": 0,
         "deployments_unhealthy": 0,
+        "deployments_blocked": 0,    # 관리자 일시중지(PAUSED) deployment 수
+        "blocked_known": False,      # LiteLLM 이 blocked 를 알려주면 True
         "backends_up": 0,
         "backends_total": 0,
         "backend_models": 0,
@@ -225,6 +242,12 @@ def summarize(snap):
         # 카드 수치를 표(merge_deployments_with_health 의 per-row status)와 항상
         # 일치시킨다. deployment 가 있으면 merged status 로 집계(=/health 가
         # 타임아웃해도 k8s readiness 보정이 반영됨), 없으면 /health 카운트로 폴백.
+        # 일시중지(PAUSED)는 UP 도 DOWN 도 아닌 제3의 상태 — healthy/unhealthy
+        # 어느 쪽에도 안 들어간다. 장애 카드에 섞이면 안 되고(의도된 정지),
+        # 정상 카드에 섞여도 안 된다(트래픽을 못 받으니 가용 용량이 아님).
+        # 카드 = 표 항등식은 그대로 유지된다: 양쪽 다 같은 per-row status 를 센다.
+        s["blocked_known"] = any("blocked" in d for d in deps)
+        s["deployments_blocked"] = sum(1 for d in deps if d.get("status") == "PAUSED")
         if deps and any("status" in d for d in deps):
             s["deployments_healthy"] = sum(1 for d in deps if d.get("status") == "UP")
             s["deployments_unhealthy"] = sum(1 for d in deps if d.get("status") == "DOWN")

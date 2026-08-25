@@ -20,6 +20,8 @@ class Summary(_Loose):
     deployments_total: int = 0
     deployments_healthy: int = 0
     deployments_unhealthy: int = 0
+    deployments_blocked: int = 0
+    blocked_known: bool = False
     backends_up: int = 0
     backends_total: int = 0
     backend_models: int = 0
@@ -50,8 +52,10 @@ class Deployment(_Loose):
     namespace: Optional[str] = None
     service: Optional[str] = None
     k8s_error: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[str] = None       # UP | DOWN | PAUSED | ?
     status_source: Optional[str] = None
+    blocked: Optional[bool] = None     # LiteLLM 관리자 일시중지. None=알 수 없음
+    health_status: Optional[str] = None  # PAUSED 이전의 원래 health 판정
     gpu_ready: Optional[int] = None
     gpu_products: Dict[str, int] = {}
     gpu_error: Optional[str] = None

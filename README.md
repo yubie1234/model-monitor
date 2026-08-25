@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v1.0.5** — 장애 원인·수집 신뢰도 가시화(DOWN 사유 툴팁 · LiteLLM 도달성/수집오류/스냅샷 나이 메트릭 · 정직한 /readyz)
+**버전: v1.1.0** — 관리자 일시중지(`model_info.blocked`) 를 `PAUSED` 로 구분 · 장애 원인·수집 신뢰도 가시화 · 대시보드 UX · 시스템 부하 개선
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -16,12 +16,38 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 | **model_name → api_base 매핑** | LiteLLM `GET /model/info` (api_base 평문, admin 키 권장) |
 | running(healthy) / unhealthy | LiteLLM `GET /health` (api_base 기준으로 위 매핑과 join) |
 | **DOWN 사유 (연결실패/타임아웃/5xx …)** | `/health` unhealthy endpoint 의 `error` 를 소수 카테고리로 정규화 — DOWN pill ⚠ 툴팁에 표시 |
+| **일시중지(PAUSED) 여부** | LiteLLM `GET /model/info` 의 `model_info.blocked` (v1.90.0+) |
 | **LB 뒤 backend Pod 개수 (ready/desired)** | Kubernetes API (EndpointSlice / Knative PodAutoscaler / Deployment) |
 | **GPU 개수 + 장치명 (H100/B200 …)** | Pod `resources.limits[nvidia.com/gpu]` + 노드 라벨 `nvidia.com/gpu.product` |
 | OpenAI 호환 모델 이름 목록 | `/model/info` 의 model_name 에서 유도 — 별도 `/v1/models` 호출 없음(per-user 뷰의 키 검증은 예외) |
 | backends up (옵션) | 각 백엔드 `GET /v1/models`, `/health` 직접 probe |
 
 > 주의: `/v1/models` 는 OpenAI 호환 스펙이라 `id`(model_name)만 줍니다. **api_base 는 `/model/info` 에서** 나옵니다.
+
+### 모델 비활성화(일시중지) 판별 — `PAUSED`
+
+LiteLLM v1.90.0 부터 관리자가 모델 deployment 를 **삭제하지 않고 껐다 켤 수** 있습니다
+(`POST /model/block` · `POST /model/unblock` · `PATCH /model/{id}/update {"blocked":true}`,
+Admin UI 의 토글 스위치). 꺼진 deployment 는 라우팅 풀에서 빠져 **트래픽을 전혀 받지 않습니다**.
+
+모니터는 이 상태를 `/model/info` 의 `model_info.blocked` 로 읽어 `PAUSED` 상태로 표시합니다.
+
+**왜 필요한가** — LiteLLM `/health` 는 `blocked` 를 걸러주지 않습니다(v1.90.0 소스 확인).
+일시중지된 백엔드도 계속 ping 되어 **healthy 로 보고**되므로, 이 판별이 없으면
+"트래픽을 못 받는데 대시보드에는 UP" 인 거짓 정상이 그대로 남습니다.
+
+- 표에는 `PAUSED(UP)` 처럼 **원래 health 판정을 괄호로** 함께 보여줍니다(`health_status` 필드) —
+  다시 켰을 때 실제로 뜰 백엔드인지 판단할 수 있게.
+- `PAUSED` 는 healthy 카드에도 unhealthy 카드에도 **들어가지 않고** 별도 `Paused` 카드로 셉니다
+  (장애와 의도된 정지를 섞지 않기 위해). status 필터의 "이상만(장애후보)" 에서도 제외됩니다.
+- 모든 deployment 가 꺼진 이름은 **능동 health check 대상에서 제외**합니다(꺼둔 백엔드를 두드리지 않음).
+  일부만 꺼졌으면 살아있는 sibling 상태를 봐야 하므로 계속 체크합니다.
+- **3상태**입니다: `true`(비활성) / `false`(활성) / **키 없음**(구버전 LiteLLM 이거나
+  `config.yaml` 전용 모델 — `blocked` 는 DB 등록 모델에만 붙습니다). 키가 없으면 '알 수 없음'
+  으로 두고 기존과 완전히 동일하게 동작합니다(`model_monitor_blocked_known` 으로 확인 가능).
+- **한계**: 한 이름의 deployment 가 **전부** 꺼지면 LiteLLM 이 그 이름을 `/v1/models` 에서 숨깁니다.
+  키별(per-user) 뷰의 접근 목록은 사용자 키의 `/v1/models` 에서 나오므로, 그런 모델은
+  사용자 뷰에서 `PAUSED` 로 보이는 게 아니라 **목록에서 사라집니다**(전체/admin 뷰에는 보입니다).
 
 ## LB 뒤 backend Pod 개수 (핵심)
 
@@ -142,12 +168,14 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 요청 경로에서 수집하지 않고 **백그라운드 캐시 스냅샷을 포맷만** 하므로(다른 엔드포인트와 동일) 스크레이프가
 수집을 막지 않습니다. 시점 대시보드를 **시계열·알림**으로 확장하는 용도입니다(기존 Prometheus/Grafana 연동).
 
-- **요약 게이지**: `model_monitor_deployments_{total,healthy,unhealthy}`,
+- **요약 게이지**: `model_monitor_deployments_{total,healthy,unhealthy,blocked}`,
   `model_monitor_backend_pods_{ready,desired}_total`(공유 Service 는 1회만 집계),
-  `model_monitor_model_groups`, `model_monitor_backend_pods_known`.
+  `model_monitor_model_groups`, `model_monitor_backend_pods_known`,
+  `model_monitor_blocked_known`(0 이면 이 LiteLLM 이 일시중지 상태를 안 알려줌).
 - **모델(deployment) 단위**: `model_monitor_model_up`(라벨 `model`/`namespace`/`service`/`status_source`,
-  값 **UP=1 · DOWN=0 · 미상/idle=-1**), `model_monitor_model_backend_pods_{ready,desired}`,
-  `model_monitor_model_scale_to_zero`(0 Pod 가 정상 idle 인지 장애인지 구분).
+  값 **UP=1 · DOWN=0 · 미상/idle/일시중지=-1**), `model_monitor_model_backend_pods_{ready,desired}`,
+  `model_monitor_model_scale_to_zero`(0 Pod 가 정상 idle 인지 장애인지 구분),
+  `model_monitor_model_blocked`(관리자 일시중지 1/0 — 장애와 구분).
 - **스크레이프 신뢰도**: `model_monitor_up`, `model_monitor_build_info{version=…}`,
   `model_monitor_backend_count_enabled`, `model_monitor_collect_errors`(>0 이면 일부 Pod 수 부정확),
   `model_monitor_gpu_collect_errors`(>0 이면 일부 GPU 수 부정확),
@@ -156,7 +184,9 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   `model_monitor_snapshot_timestamp_seconds`/`model_monitor_snapshot_age_seconds`(스냅샷 나이 — 커지면 수집 멈춤).
 - 활용 예: `model_monitor_model_up == 0 and model_monitor_model_scale_to_zero == 0` 으로 **"진짜 죽음"만**
   알림(정상 idle 오탐 제거), `model_up == 1 and model_backend_pods_ready == 0` 으로 **LB 는 200인데 뒤에
-  Pod 0** 인 함정 탐지, `avg_over_time(model_monitor_model_up[30d])` 로 모델별 가동률 산출.
+  Pod 0** 인 함정 탐지, `avg_over_time(model_monitor_model_up[30d])` 로 모델별 가동률 산출,
+  `model_monitor_model_blocked == 1` 을 `for: 24h` 로 걸어 **꺼둔 채 잊힌 모델**(Pod·GPU 는 물고
+  트래픽은 0) 탐지. 일시중지는 `model_up` 이 0 이 아니라 -1 이라 기존 DOWN 알림에 **자동으로 안 걸립니다**.
 - **주의**: 한 `model_name` 에 여러 deployment(로드밸런싱)가 있으면 동일 라벨 series 가 중복될 수 있어
   내부적으로 합칩니다(상태는 DOWN 우선). 내부 `api_base` 는 라벨로 노출하지 않습니다(카디널리티·보안).
 - **키 필수 모드(`MONITOR_USER_VIEW=true`)** 에선 `/metrics` 도 인증이 필요합니다. 두 가지 방법:

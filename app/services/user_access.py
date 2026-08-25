@@ -149,7 +149,7 @@ def _redact_deployment_for_user(d, ref_seed=None):
     """per-user 뷰에서 내부 토폴로지(api_base/underlying/namespace/내부 URL)를 떼고
     상태·종류·backend Pod 수만 남긴다(비-admin 에 클러스터 구조 비노출).
     백엔드 식별은 익명 backend_ref 로만 제공한다."""
-    return {
+    out = {
         "model_name": d.get("model_name"),
         "type": d.get("type", "-"),
         "network_type": d.get("network_type", "-"),
@@ -163,6 +163,15 @@ def _redact_deployment_for_user(d, ref_seed=None):
         "mode": d.get("mode"),
         "backend_ref": _backend_ref(d, ref_seed),
     }
+    # 일시중지는 내부 토폴로지가 아니라 "내 모델이 왜 응답이 없나" 의 답이라
+    # 비-admin 뷰에도 남긴다(health_status 도 상태 문자열일 뿐).
+    # 단 **있을 때만** 넣는다: 위 dict 처럼 무조건 넣으면 값이 None 이어도 키가
+    # 생겨 summarize 의 blocked_known(= 키 존재 여부)이 항상 참이 되고,
+    # blocked 를 모르는 LiteLLM 에서도 "판별 가능" 이라고 거짓 보고하게 된다.
+    for k in ("blocked", "health_status"):
+        if k in d:
+            out[k] = d[k]
+    return out
 
 
 def filter_snapshot_for_user(global_snap, access, hide_internal=True,

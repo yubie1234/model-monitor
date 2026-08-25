@@ -70,6 +70,7 @@ m = types.SimpleNamespace(
     build_collector_settings=_build_cs,
     _deployment_health_safe=_ll._deployment_health_safe,
     select_health_check_models=_ll.select_health_check_models,
+    health_check_allowed_bases=_ll.health_check_allowed_bases,
     fetch_health=_ll.fetch_health,
     fetch_health_for_model=_ll.fetch_health_for_model,
     aggregate_selective_health=_ll.aggregate_selective_health,
@@ -445,6 +446,61 @@ class TestSelectHealthCheckModels(unittest.TestCase):
         deps = [_safe_service(model_name="?"), _safe_service(model_name="ok")]
         self.assertEqual(m.select_health_check_models(deps), ["ok"])
 
+    def test_fully_blocked_name_skipped(self):
+        # 전부 일시중지 = 라우팅 대상 0 -> ping 할 이유가 없다.
+        # (LiteLLM /health 는 blocked 를 안 걸러주므로 모니터가 걸러야 한다)
+        deps = [_safe_service(model_name="paused", blocked=True),
+                _safe_service(model_name="paused", api_base="http://p2/v1",
+                              blocked=True)]
+        self.assertEqual(m.select_health_check_models(deps), [])
+
+    def test_partially_blocked_name_still_checked(self):
+        # 남은 sibling 이 실제 트래픽을 받으므로 상태를 봐야 한다.
+        # /health?model= 은 이름 단위라 살아있는 쪽만 골라 ping 할 수단이 없고,
+        # blocked 는 '깨우기 위험' 신호가 아니라 이름 전체를 버리지 않는다.
+        deps = [_safe_service(model_name="mixed", blocked=True),
+                _safe_service(model_name="mixed", api_base="http://m2/v1",
+                              blocked=False)]
+        self.assertEqual(m.select_health_check_models(deps), ["mixed"])
+
+    def test_blocked_does_not_poison_sibling_names(self):
+        # blocked 는 unsafe_underlying/unsafe_base 오염원이 아니다 — 같은
+        # underlying 을 쓰는 다른 이름까지 체크가 끊기면 안 된다.
+        deps = [_safe_service(model_name="paused", underlying="openai/X",
+                              blocked=True),
+                _safe_service(model_name="live", api_base="http://l/v1",
+                              underlying="openai/X")]
+        self.assertEqual(m.select_health_check_models(deps), ["live"])
+
+    def test_allowed_bases_include_paused_safe_backend(self):
+        # 회귀: 일시중지라 조회 대상에서 빠진 backend 의 base 가 합집합에서도
+        # 빠지면, LiteLLM 의 넓은 ?model= 매칭으로 그 endpoint 가 sibling 응답에
+        # 섞여 올 때마다 "Serverless 가 ping 됐다" 는 오경보가 영구히 뜬다.
+        # 합집합이 답하는 질문은 '조회 대상인가' 가 아니라 'ping 돼도 되는가'.
+        deps = [_safe_service(model_name="paused", underlying="openai/Q",
+                              api_base="http://p/v1", blocked=True),
+                _safe_service(model_name="live", underlying="Q",
+                              api_base="http://l/v1")]
+        names = m.select_health_check_models(deps)
+        allowed = m.health_check_allowed_bases(deps, names)
+        union = {b for s in allowed.values() for b in s}
+        self.assertEqual(names, ["live"])          # 조회는 살아있는 것만
+        self.assertIn("http://p", union)           # 하지만 ping 돼도 경보는 안 냄
+        self.assertIn("http://l", union)
+
+    def test_allowed_bases_exclude_paused_serverless(self):
+        # 반대로 일시중지 + Serverless 는 합집합에 넣으면 안 된다 — 그 endpoint 가
+        # 응답에 나타났다는 건 실제로 깨어났다는 뜻이라 경보가 맞다.
+        deps = [_safe_service(model_name="paused", api_base="http://s/v1",
+                              blocked=True, scale_to_zero=True,
+                              backend_source="knative-pa", mode="Serverless"),
+                _safe_service(model_name="live", api_base="http://l/v1")]
+        names = m.select_health_check_models(deps)
+        union = {b for s in m.health_check_allowed_bases(deps, names).values()
+                 for b in s}
+        self.assertNotIn("http://s", union)
+        self.assertIn("http://l", union)
+
     def test_dedup_and_sort(self):
         deps = [
             _safe_service(model_name="b"),
@@ -785,6 +841,128 @@ class TestDiscoverBackends(unittest.TestCase):
                   {"model": "m2", "api_base": "http://plain2.ns.svc/v1"}]}}
         out = m.discover_backends(ll)
         self.assertEqual([b["url"] for b in out], ["http://plain2.ns.svc"])
+
+
+class TestBlockedMarker(unittest.TestCase):
+    """model_info.blocked 파싱 (LiteLLM v1.90.0+ 관리자 일시중지).
+
+    active_health_check 와 같은 엄격 파싱을 쓴다 — bool() 강제 변환을 하면
+    "false" 문자열이 True 가 되어 멀쩡히 서빙 중인 모델을 PAUSED 로 오표시한다.
+    키가 아예 없는 경우(구버전 LiteLLM / config.yaml 전용 모델)는 '모름' 이라
+    키를 만들지 않는다 — 없는 것을 '활성' 으로 단정하지 않기 위해서."""
+
+    _SENTINEL = object()   # "키 자체가 없음" 표시
+
+    def _collect(self, blocked_value):
+        def fake(url, key=None, timeout=10):
+            if "/model/info" in url:
+                mi = {"id": "x"}
+                if blocked_value is not self._SENTINEL:
+                    mi["blocked"] = blocked_value
+                return True, {"data": [{
+                    "model_name": "mm",
+                    "litellm_params": {"model": "m", "api_base": "http://a/v1"},
+                    "model_info": mi}]}, None
+            return False, None, "skip"
+        orig = _ll.http_get_json
+        _ll.http_get_json = fake
+        try:
+            r = m.collect_litellm("http://llm", "sk", 5, with_health=False)
+        finally:
+            _ll.http_get_json = orig
+        return r["deployments"][0]
+
+    def test_bool_passthrough(self):
+        self.assertIs(self._collect(True).get("blocked"), True)
+        self.assertIs(self._collect(False).get("blocked"), False)
+
+    def test_string_forms_parsed_strictly(self):
+        self.assertIs(self._collect("false").get("blocked"), False)
+        self.assertIs(self._collect("True").get("blocked"), True)
+
+    def test_absent_key_stays_absent(self):
+        # 구버전 LiteLLM / config 전용 모델 -> '모름'. False 로 단정하면 안 된다.
+        self.assertNotIn("blocked", self._collect(self._SENTINEL))
+        self.assertNotIn("blocked", self._collect("maybe"))
+        self.assertNotIn("blocked", self._collect(1))
+
+
+class TestBlockedStatus(unittest.TestCase):
+    """blocked -> PAUSED 승격. LiteLLM /health 는 blocked 를 걸러주지 않아서
+    (v1.90.0 확인) 일시중지된 백엔드도 healthy 로 보고된다. 그대로 두면
+    '트래픽을 못 받는데 UP' 인 거짓 정상이 대시보드에 남는다."""
+
+    def _ll(self):
+        return {
+            "health": {
+                "healthy_endpoints": [{"api_base": "http://a/v1"},
+                                      {"api_base": "http://p/v1"}],
+                "unhealthy_endpoints": [{"api_base": "http://b/v1"}],
+            },
+            "deployments": [
+                {"model_name": "A", "api_base": "http://a/v1"},
+                {"model_name": "B", "api_base": "http://b/v1"},
+                # health 는 healthy 라고 하지만 관리자가 꺼둔 모델
+                {"model_name": "P", "api_base": "http://p/v1", "blocked": True},
+                {"model_name": "N", "api_base": "http://n/v1", "blocked": False},
+            ],
+        }
+
+    def test_blocked_overrides_healthy_status(self):
+        merged = {d["model_name"]: d
+                  for d in m.merge_deployments_with_health(self._ll())}
+        self.assertEqual(merged["P"]["status"], "PAUSED")
+        self.assertEqual(merged["P"]["status_source"], "blocked")
+        # 원래 health 판정은 보존 — 다시 켰을 때 뜰 백엔드인지 알아야 한다.
+        self.assertEqual(merged["P"]["health_status"], "UP")
+
+    def test_blocked_false_and_absent_are_untouched(self):
+        merged = {d["model_name"]: d
+                  for d in m.merge_deployments_with_health(self._ll())}
+        self.assertEqual(merged["A"]["status"], "UP")     # 키 없음
+        self.assertEqual(merged["B"]["status"], "DOWN")   # 키 없음
+        self.assertEqual(merged["N"]["status"], "?")      # blocked=False
+        self.assertNotIn("health_status", merged["A"])
+        self.assertNotIn("health_status", merged["N"])
+
+    def test_summary_excludes_paused_from_both_cards(self):
+        ll = self._ll()
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"litellm": ll, "backends": []}
+        s = m.summarize(snap)
+        statuses = [d["status"] for d in ll["deployments"]]
+        # 카드 == 표 항등식 유지 (PAUSED 는 양쪽 어디에도 안 들어간다)
+        self.assertEqual(s["deployments_healthy"], statuses.count("UP"))
+        self.assertEqual(s["deployments_unhealthy"], statuses.count("DOWN"))
+        self.assertEqual(s["deployments_healthy"], 1)     # A 만
+        self.assertEqual(s["deployments_unhealthy"], 1)   # B 만
+        self.assertEqual(s["deployments_blocked"], 1)     # P
+        self.assertEqual(s["deployments_total"], 4)       # 전체는 그대로
+        self.assertTrue(s["blocked_known"])
+
+    def test_merge_is_idempotent_for_health_status(self):
+        # 이 함수는 한 스냅샷에서 두 번 돈다(build_snapshot -> state.Refresher 가
+        # /health 주입 후 재실행). 회귀: 이전 회차의 health_status 가 남으면
+        # blocked 가 풀린 행에 옛 판정이 유령처럼 붙는다.
+        ll = self._ll()
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        # 운영자가 P 를 다시 켰다고 가정(다음 /model/info 가 blocked=False 를 준다)
+        for d in ll["deployments"]:
+            if d["model_name"] == "P":
+                d["blocked"] = False
+        again = {d["model_name"]: d
+                 for d in m.merge_deployments_with_health(ll)}
+        self.assertEqual(again["P"]["status"], "UP")       # health 로 복귀
+        self.assertNotIn("health_status", again["P"])      # 옛 값이 남지 않는다
+
+    def test_blocked_known_false_when_litellm_never_reports_it(self):
+        # 구버전 LiteLLM: 키가 하나도 없으면 '판별 불가' 로 남아야 한다.
+        ll = {"health": None,
+              "deployments": [{"model_name": "A", "api_base": "http://a/v1"}]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertFalse(s["blocked_known"])
+        self.assertEqual(s["deployments_blocked"], 0)
 
 
 class TestSummarize(unittest.TestCase):
@@ -1609,6 +1787,33 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         self.assertIsNotNone(a)
         self.assertNotEqual(a, b)
 
+    def test_redaction_keeps_blocked_state(self):
+        # "내 모델이 왜 응답이 없나" 의 답 — 내부 토폴로지가 아니므로 비-admin
+        # 뷰에도 남긴다. 여기서 빠지면 사용자는 장애와 일시중지를 구분 못 한다.
+        g = self._global()
+        g["litellm"]["deployments"][0].update(
+            {"blocked": True, "status": "PAUSED", "health_status": "UP",
+             "status_source": "blocked"})
+        out = m.filter_snapshot_for_user(g, {"accessible": ["gpt-x"]})
+        d = out["litellm"]["deployments"][0]
+        self.assertIs(d["blocked"], True)
+        self.assertEqual(d["status"], "PAUSED")
+        self.assertEqual(d["health_status"], "UP")
+        # 내부 주소는 여전히 가려져 있어야 한다.
+        self.assertNotIn("api_base", d)
+        self.assertEqual(out["summary"]["deployments_blocked"], 1)
+        self.assertTrue(out["summary"]["blocked_known"])
+
+    def test_redaction_does_not_invent_blocked_key(self):
+        # 회귀: 리댁션이 blocked 키를 무조건 넣으면(값 None 이라도) summarize 의
+        # blocked_known 이 항상 참이 되어, blocked 를 모르는 LiteLLM 에서도
+        # "일시중지 판별 가능" 이라고 거짓 보고한다.
+        out = m.filter_snapshot_for_user(self._global(), {"accessible": ["gpt-x"]})
+        d = out["litellm"]["deployments"][0]
+        self.assertNotIn("blocked", d)
+        self.assertNotIn("health_status", d)
+        self.assertFalse(out["summary"]["blocked_known"])
+
     def test_show_internal_keeps_api_base(self):
         out = m.filter_snapshot_for_user(
             self._global(), {"accessible": ["gpt-x"]}, hide_internal=False)
@@ -1815,6 +2020,65 @@ class TestPrometheusMetrics(unittest.TestCase):
         text = m.render_prometheus_metrics(snap)
         # 따옴표·역슬래시가 이스케이프되어야 한다.
         self.assertIn(r'model="we\"ird\\name"', text)
+
+    def test_blocked_metrics(self):
+        ll = {
+            "groups": [], "health": None,
+            "deployments": [
+                {"model_name": "A", "api_base": "http://a/v1",
+                 "namespace": "ns1", "service": "svc-a", "backends_ready": 2},
+                {"model_name": "P", "api_base": "http://p/v1",
+                 "namespace": "ns1", "service": "svc-p",
+                 "backends_ready": 2, "blocked": True},
+            ],
+        }
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "9.9.9", "litellm": ll, "backends": []}
+        snap["summary"] = m.summarize(snap)
+        g = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(
+            g['model_monitor_model_blocked{model="P",namespace="ns1",service="svc-p"}'],
+            ["1"])
+        self.assertEqual(
+            g['model_monitor_model_blocked{model="A",namespace="ns1",service="svc-a"}'],
+            ["0"])
+        self.assertEqual(g["model_monitor_deployments_blocked"], ["1"])
+        self.assertEqual(g["model_monitor_blocked_known"], ["1"])
+        # PAUSED 는 model_up 에서 -1(미상) — 기존 DOWN 알림(==0)을 건드리지 않는다.
+        self.assertEqual(
+            g['model_monitor_model_up{model="P",namespace="ns1",'
+              'service="svc-p",status_source="blocked"}'], ["-1"])
+        # 일시중지는 healthy 카드에도 안 잡힌다.
+        self.assertEqual(g["model_monitor_deployments_healthy"], ["1"])
+
+    def test_blocked_series_collapse_requires_all_blocked(self):
+        # 같은 (model,ns,svc) 라벨의 deployment 가 둘인데 하나만 꺼진 경우,
+        # 그 조합은 여전히 라우팅된다 -> 0 이어야 한다(min). max 면 거짓 양성.
+        ll = {
+            "groups": [], "health": None,
+            "deployments": [
+                {"model_name": "M", "api_base": "http://m1/v1",
+                 "namespace": "ns", "service": "svc",
+                 "backends_ready": 2, "blocked": True},
+                {"model_name": "M", "api_base": "http://m2/v1",
+                 "namespace": "ns", "service": "svc",
+                 "backends_ready": 2, "blocked": False},
+            ],
+        }
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "9.9.9", "litellm": ll, "backends": []}
+        snap["summary"] = m.summarize(snap)
+        g = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(
+            g['model_monitor_model_blocked{model="M",namespace="ns",service="svc"}'],
+            ["0"])
+        # 행 단위 집계는 그대로 1건이 PAUSED (그래야 카드가 표와 일치한다)
+        self.assertEqual(g["model_monitor_deployments_blocked"], ["1"])
+
+    def test_blocked_known_zero_on_old_litellm(self):
+        g = self._parse(m.render_prometheus_metrics(self._snap()))
+        self.assertEqual(g["model_monitor_blocked_known"], ["0"])
+        self.assertEqual(g["model_monitor_deployments_blocked"], ["0"])
 
     def test_no_api_base_label_leak(self):
         # 내부 URL(api_base)은 메트릭 라벨에 노출되면 안 된다(카디널리티/보안).
