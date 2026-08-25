@@ -1037,9 +1037,14 @@ function render(snap){
   const filterDep = d => stOk(d)
     && (!fN || netOf(d)===fN) && (!fE || engOf(d)===fE)
     && (!fQ || hayOf(d).includes(fQ));
+  // 필터 전 **전체** deployment 목록. sharedMap/pausedMap 은 "필터로 화면에서만
+  // 빠진 sibling" 까지 봐야 정확하므로 반드시 이 목록으로 계산한다. 그래프는 아래
+  // 표 블록 **밖에서** 그리므로 함수 스코프에 둔다 — 블록 지역(const)으로 두면
+  // pausedMap(all) 이 ReferenceError 로 죽고, render 를 감싼 폴링 try/catch 가
+  // 그것을 "수집 실패" 로 위장해 그래프가 조용히 사라진다(회귀 있었음).
+  const all = (ll && ll.deployments) || [];
   let graphDeps = [];   // 그래프가 그릴 deployment(= 표와 동일한 필터 결과)
-  if(ll && ll.deployments && ll.deployments.length){
-    const all = ll.deployments;
+  if(all.length){
     const merged = all.filter(filterDep);
     graphDeps = merged;   // 그래프는 (status/net/eng) 필터 결과 전체를 그린다 — pin 으로 좁히지 않음
     // 그래프 노드 클릭(pin) 시: 표만 그 노드로 좁힌다(그래프는 유지 → 다른 노드로 이동 가능).

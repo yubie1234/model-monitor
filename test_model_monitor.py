@@ -2478,6 +2478,56 @@ class TestBuildCollectorSettings(unittest.TestCase):
                 _settings_ns())["metrics_token"])
 
 
+class TestDashboardTemplateScopes(unittest.TestCase):
+    """대시보드 템플릿의 JS 스코프 정적 검사.
+
+    render() 는 표를 그리는 if 블록 안에서 필터 전 전체 목록(`all`)을 잡고,
+    그래프는 그 블록 **밖에서** 그린다. `all` 을 블록 지역(const)으로 두면
+    pausedMap(all) 이 ReferenceError 로 죽는데, render 호출이 폴링 try/catch 로
+    감싸여 있어 예외가 "수집 실패" 문구로 위장되고 **그래프만 조용히 사라진다**
+    — 실제로 그렇게 회귀했고, HTTP 200 · 표 렌더 정상이라 스모크 테스트로는
+    잡히지 않았다. 브라우저 없이도 재발을 막기 위해 중괄호 깊이로 검사한다.
+
+    파이썬 테스트가 JS 를 실행할 수는 없으므로(stdlib-only·에어갭) 완전한
+    스코프 분석이 아니다. `X(all)` 호출 지점까지 가는 길에 선언 시점보다 깊이가
+    얕아지는 구간이 있으면(= 선언 블록을 벗어났으면) 실패시킨다.
+    """
+
+    ROOT = os.path.dirname(os.path.abspath(__file__))
+    TPL = ("app", "web", "templates", "dashboard.html")
+
+    def test_all_is_in_scope_at_every_call_site(self):
+        with open(os.path.join(self.ROOT, *self.TPL), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+
+        decl = [i for i, l in enumerate(lines)
+                if re.match(r"\s*const all\s*=", l)]
+        self.assertEqual(len(decl), 1,
+                         "render() 의 `const all` 선언을 정확히 1개 찾지 못함 "
+                         "(이름이 바뀌었으면 이 테스트도 함께 고칠 것)")
+        decl = decl[0]
+
+        depth = 0
+        for l in lines[:decl + 1]:
+            depth += l.count("{") - l.count("}")
+
+        calls, cur, lowest = [], depth, depth
+        for i in range(decl + 1, len(lines)):
+            cur += lines[i].count("{") - lines[i].count("}")
+            if re.search(r"\b\w*Map\(all\)", lines[i]):
+                calls.append((i + 1, lines[i].strip(), lowest))
+            lowest = min(lowest, cur)
+
+        self.assertTrue(calls, "sharedMap(all)/pausedMap(all) 호출을 찾지 못함 "
+                               "— 검사가 무력화됐는지 확인할 것")
+        for lineno, src, low in calls:
+            self.assertGreaterEqual(
+                low, depth,
+                "%d행 `%s` 이 `const all` 선언 블록 밖이다 — 그래프가 "
+                "ReferenceError 로 죽고 폴링 try/catch 가 '수집 실패' 로 "
+                "위장한다. `all` 을 함수 스코프로 올릴 것." % (lineno, src))
+
+
 class TestVersionConsistency(unittest.TestCase):
     """버전 문자열이 여러 파일에 흩어져 있고(단일 출처 __version__ 에 자동 연동되지
     않는 수동 복제본), 릴리스 때 한 곳을 빠뜨리기 쉽다 — 실제로 deploy/k8s.yaml 의
