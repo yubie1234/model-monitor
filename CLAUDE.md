@@ -58,6 +58,12 @@ The core pipeline is `build_snapshot(settings)` → a single `snap` dict consume
    게이지를 못 읽으면 `unknown` 이지 0 이 아니다. Pod 주소가 없으면 LB 1회 샘플링하고 `scope="lb-sample"`
    로 **표본을 드러낸다**(UI 의 `PODS` 열). tok/s 는 생성 토큰 카운터를 직전 샘플과 차분해서 내므로
    watch/serve 의 2번째 갱신부터 나온다(`_TPUT_HISTORY`). 기본 ON, `--no-load` 로 끈다.
+   엔진별 이름 차이는 `_PROM_SPECS` 한 곳에서 흡수한다 — 규칙 셋: (a) `:` 를 `_` 로 정규화해
+   `sglang:` / `sglang_` 양쪽을 받고(신형 SGLang 은 언더스코어로 노출된다), (b) 같은 필드의
+   이름 튜플은 **alias 라 더하지 않고 먼저 있는 하나만** 쓰며(`kv_cache_usage_perc` 와
+   `gpu_cache_usage_perc` 가 둘 다 있으면 2배가 된다), (c) `tp_rank`/`pp_rank`/`moe_ep_rank` 는
+   같은 상태의 복제 보고라 그룹 안에서 max 로 접고 `dp_rank`·`engine` 만 합산한다(TP=4 에서
+   4배 부풀림 방지). 아는 게이지가 하나도 없으면 엔진을 추측하지 않고 `unknown`.
 
 4. **누적 사용량** (`collect_usage` + `attach_usage_to_deployments`) — 모델별 요청 수/토큰. **기본 OFF**
    (`--usage` 로 켬) — "지금 바쁜가"와 다른 축이고 LiteLLM DB 가 있어야 한다. LiteLLM 은 버전마다

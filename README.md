@@ -79,6 +79,33 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 - Pod IP 로 직접 접속하므로 **모니터 Pod → 백엔드 Pod 네트워크가 열려 있어야** 합니다.
   (RBAC 은 기존 `endpointslices` 읽기 권한 그대로면 됩니다.)
 
+### 엔진마다 메트릭이 다릅니다 (vLLM vs SGLang)
+
+이름·단위·라벨이 전부 달라서, 읽는 쪽에서 흡수합니다. 실제로 읽는 이름:
+
+| 우리 열 | vLLM | SGLang |
+|---------|------|--------|
+| `RUN` | `vllm:num_requests_running` | `sglang:num_running_reqs` |
+| `QUEUE` | `vllm:num_requests_waiting` (없으면 `..._by_reason` 합) | `sglang:num_queue_reqs` |
+| `KV CACHE` | `vllm:kv_cache_usage_perc` (V1) / `vllm:gpu_cache_usage_perc` (V0) | `sglang:token_usage` (없으면 `full_token_usage`) |
+| `TOK/S` | `vllm:generation_tokens_total` **카운터 차분** | `sglang:gen_throughput` **게이지 직접** |
+
+버전·구현 차이를 흡수하는 규칙 세 가지:
+
+1. **접두사 구분자 정규화** — SGLang 은 소스에 `sglang:` 로 선언돼 있지만 prometheus_client
+   버전에 따라 실제 노출이 `sglang_` (언더스코어)로 나옵니다. 이름 조회에서 `:` 를 `_` 로
+   정규화해 **양쪽 다** 받습니다. (콜론만 보면 신형 SGLang 을 통째로 못 읽습니다.)
+2. **alias 는 더하지 않고 하나만** — `kv_cache_usage_perc` 와 `gpu_cache_usage_perc` 처럼 같은
+   뜻의 이름이 둘 다 있는 버전에서 합치면 조용히 2배가 됩니다. 먼저 있는 것 하나만 씁니다.
+3. **rank 라벨은 접고, 워커는 더한다** — SGLang 은 `tp_rank`/`pp_rank`/`moe_ep_rank` 라벨로
+   **같은 스케줄러 상태를 복제 보고**합니다. 그대로 합치면 TP=4 에서 실행 요청이 4배로
+   부풀려집니다. rank 축은 그룹 안에서 max 로 접고, `dp_rank`·`engine`(=진짜 다른 워커)만
+   합산합니다. 사용률(KV)은 애초에 더하는 값이 아니라 최댓값을 씁니다.
+
+> **SGLang 은 `--enable-metrics` 로 띄워야 `/metrics` 가 열립니다**(기본 꺼짐). vLLM 은 기본으로
+> 열려 있고 `--disable-log-stats` 면 닫힙니다. 못 읽으면 `LOAD` 가 `?` 로 뜨고 그 사유가 툴팁에
+> 그대로 나옵니다. 아는 게이지가 하나도 없으면 **엔진을 추측하지 않습니다**(TGI 등 다른 엔진).
+
 ### 이 조회가 백엔드에 주는 부하
 
 측정값 (모델 10개 · Service 10개 · Pod 30개 · loopback 기준):

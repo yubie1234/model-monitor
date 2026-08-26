@@ -421,8 +421,8 @@ sglang:gen_throughput{model_name="q"} 240.5
 
     def test_parse_prom_metrics_labels_and_bare(self):
         out = m.parse_prom_metrics('a{x="1"} 2.5\nb 7\n# comment\n\nbad_line\n')
-        self.assertEqual(out["a"], [2.5])
-        self.assertEqual(out["b"], [7.0])
+        self.assertEqual(out["a"], [({"x": "1"}, 2.5)])   # 라벨까지 보존
+        self.assertEqual(out["b"], [({}, 7.0)])
         self.assertNotIn("bad_line", out)
 
     def test_live_from_prom_vllm(self):
@@ -459,6 +459,93 @@ sglang:gen_throughput{model_name="q"} 240.5
         # 카운터가 줄면(Pod 재시작) 값을 만들지 않고 기준만 다시 잡는다
         self.assertIsNone(m._throughput_from_counter(url, 5, now=120.0))
         self.assertIsNone(m._throughput_from_counter(url, None, now=130.0))
+
+
+class TestEngineMetricDifferences(unittest.TestCase):
+    """vLLM 과 SGLang 은 이름·단위·라벨이 다르다. 소스에서 확인한 형태를 고정한다.
+
+    - vLLM V0: vllm:gpu_cache_usage_perc  /  V1: vllm:kv_cache_usage_perc
+    - SGLang : 선언은 sglang:xxx 인데 prometheus_client 버전에 따라 노출이
+               sglang_xxx (언더스코어)로 나온다 -> 양쪽 다 받아야 한다.
+    - 라벨: vLLM(model_name, engine) vs SGLang(model_name, engine_type, tp_rank, ...)
+    """
+
+    def test_vllm_v0_gpu_cache_name(self):
+        live = m.live_from_prom(
+            'vllm:num_requests_running{model_name="a"} 3\n'
+            'vllm:num_requests_waiting{model_name="a"} 1\n'
+            'vllm:gpu_cache_usage_perc{model_name="a"} 0.55\n')
+        self.assertEqual(live["engine"], "vllm")
+        self.assertEqual(live["kv_cache_pct"], 55.0)
+
+    def test_vllm_v1_kv_cache_name(self):
+        live = m.live_from_prom(
+            'vllm:num_requests_running{model_name="a",engine="0"} 3\n'
+            'vllm:kv_cache_usage_perc{model_name="a",engine="0"} 0.81\n')
+        self.assertEqual(live["kv_cache_pct"], 81.0)
+
+    def test_vllm_data_parallel_engines_are_summed(self):
+        # engine 라벨은 서로 다른 워커 -> 합이 맞다
+        live = m.live_from_prom(
+            'vllm:num_requests_running{model_name="a",engine="0"} 3\n'
+            'vllm:num_requests_running{model_name="a",engine="1"} 4\n')
+        self.assertEqual(live["running"], 7)
+
+    def test_sglang_underscore_prefix(self):
+        # SGLang 신형 노출 형태(sglang_) — 콜론만 보면 통째로 못 읽는다
+        live = m.live_from_prom(
+            'sglang_num_running_reqs{model_name="q",engine_type="unified"} 5.0\n'
+            'sglang_num_queue_reqs{model_name="q",engine_type="unified"} 2.0\n'
+            'sglang_token_usage{model_name="q"} 0.62\n'
+            'sglang_gen_throughput{model_name="q"} 812.0\n')
+        self.assertEqual(live["engine"], "sglang")
+        self.assertEqual(live["running"], 5)
+        self.assertEqual(live["waiting"], 2)
+        self.assertEqual(live["kv_cache_pct"], 62.0)
+        self.assertEqual(live["throughput"], 812.0)   # SGLang 은 tok/s 를 직접 준다
+
+    def test_sglang_colon_prefix_same_result(self):
+        colon = m.live_from_prom('sglang:num_running_reqs{model_name="q"} 5.0\n'
+                                 'sglang:token_usage{model_name="q"} 0.62\n')
+        under = m.live_from_prom('sglang_num_running_reqs{model_name="q"} 5.0\n'
+                                 'sglang_token_usage{model_name="q"} 0.62\n')
+        self.assertEqual(colon, under)
+
+    def test_tp_ranks_are_not_double_counted(self):
+        # TP rank 는 같은 스케줄러 상태를 복제 보고한다 -> 합치면 TP 배수로 부풀려진다
+        live = m.live_from_prom(
+            'sglang_num_running_reqs{model_name="q",tp_rank="0"} 7.0\n'
+            'sglang_num_running_reqs{model_name="q",tp_rank="1"} 7.0\n'
+            'sglang_num_running_reqs{model_name="q",tp_rank="2"} 7.0\n'
+            'sglang_num_running_reqs{model_name="q",tp_rank="3"} 7.0\n')
+        self.assertEqual(live["running"], 7)      # 28 이 되면 안 된다
+
+    def test_dp_workers_summed_while_tp_collapsed(self):
+        live = m.live_from_prom(
+            'sglang_num_running_reqs{model_name="q",dp_rank="0",tp_rank="0"} 3\n'
+            'sglang_num_running_reqs{model_name="q",dp_rank="0",tp_rank="1"} 3\n'
+            'sglang_num_running_reqs{model_name="q",dp_rank="1",tp_rank="0"} 5\n'
+            'sglang_num_running_reqs{model_name="q",dp_rank="1",tp_rank="1"} 5\n')
+        self.assertEqual(live["running"], 8)      # dp 는 합(3+5), tp 는 접기
+
+    def test_alias_names_are_alternatives_not_additive(self):
+        # 같은 뜻의 이름이 둘 다 있는 버전에서 더해버리면 조용히 2배가 된다
+        live = m.live_from_prom(
+            'vllm:num_requests_running{model_name="a"} 2\n'
+            'vllm:kv_cache_usage_perc{model_name="a"} 0.40\n'
+            'vllm:gpu_cache_usage_perc{model_name="a"} 0.40\n')
+        self.assertEqual(live["kv_cache_pct"], 40.0)
+
+    def test_percent_scale_metrics_are_not_doubled(self):
+        # 이미 % 단위(0~100)로 주는 구현이면 100 을 다시 곱하지 않는다
+        live = m.live_from_prom('vllm:num_requests_running 1\n'
+                                'vllm:kv_cache_usage_perc 73.0\n')
+        self.assertEqual(live["kv_cache_pct"], 73.0)
+
+    def test_unknown_engine_metrics_ignored(self):
+        # 다른 엔진(TGI 등)이 떠 있으면 아는 척하지 않는다
+        self.assertIsNone(m.live_from_prom(
+            'tgi_queue_size 3\ntgi_batch_current_size 2\n'))
 
 
 class TestClassifyLoad(unittest.TestCase):

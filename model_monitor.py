@@ -602,50 +602,90 @@ def attach_usage_to_deployments(ll, usage):
 #   찌르면 뒤에 있는 Pod 중 하나만 응답해서, 3개 중 1개만 터져도 안 보인다.
 # ----------------------------------------------------------------------------
 
+# 엔진별 메트릭 이름. 같은 뜻인데 엔진·버전마다 이름이 다르다:
+#   vLLM V0: vllm:gpu_cache_usage_perc  -> V1: vllm:kv_cache_usage_perc
+#   SGLang : sglang:num_running_reqs (선언은 콜론) 인데, prometheus_client 버전에
+#            따라 노출은 sglang_num_running_reqs (언더스코어)로 나온다.
+#            -> 이름 조회는 ':' 를 '_' 로 정규화해서 양쪽을 모두 받는다.
+# 각 필드의 튜플은 **대안(alias)** 이다 — 합치지 않고 먼저 있는 것 하나만 쓴다
+# (둘 다 있는 버전에서 이중 집계되면 조용히 부풀려진다).
 _PROM_SPECS = [
     ("vllm", {
         "running": ("vllm:num_requests_running",),
-        "waiting": ("vllm:num_requests_waiting",),
-        "kv_cache": ("vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc"),
-        "gen_tokens": ("vllm:generation_tokens_total",),
-        "throughput": (),
+        "waiting": ("vllm:num_requests_waiting", "vllm:num_requests_waiting_by_reason"),
+        "kv_cache": ("vllm:kv_cache_usage_perc",        # V1
+                     "vllm:gpu_cache_usage_perc"),      # V0
+        "gen_tokens": ("vllm:generation_tokens_total", "vllm:generation_tokens"),
+        "throughput": (),                               # vLLM 은 tok/s 게이지가 없다
     }),
     ("sglang", {
         "running": ("sglang:num_running_reqs",),
         "waiting": ("sglang:num_queue_reqs",),
-        "kv_cache": ("sglang:token_usage", "sglang:kv_cache_usage"),
+        "kv_cache": ("sglang:token_usage", "sglang:full_token_usage",
+                     "sglang:kv_cache_usage"),
         "gen_tokens": ("sglang:generation_tokens_total",),
-        "throughput": ("sglang:gen_throughput",),   # tok/s 를 직접 주는 버전
+        "throughput": ("sglang:gen_throughput",),       # tok/s 를 직접 준다
     }),
 ]
 
-# Pod URL -> (monotonic 시각, 누적 생성 토큰). 카운터 차분으로 지금의 tok/s 를 낸다.
-_TPUT_HISTORY = {}
-_TPUT_LOCK = threading.Lock()
+# TP/PP/EP rank 는 **같은 스케줄러 상태를 복제 보고**하는 축이다. 이 축까지 더하면
+# TP=4 에서 실행 요청 수가 4배로 뻥튀기된다 -> 그룹 안에서는 max, 그룹 간에는 합.
+# (dp_rank·engine 처럼 진짜로 다른 워커를 가리키는 축은 합쳐야 맞다.)
+_RANK_LABELS = ("tp_rank", "pp_rank", "moe_ep_rank")
+
+
+def _norm_metric_name(name):
+    """sglang_x 와 sglang:x 를 같은 키로 (엔진 접두사 구분자만 정규화)."""
+    return name.replace(":", "_", 1)
 
 
 def parse_prom_metrics(text):
-    """Prometheus 텍스트 -> {metric_name: [값, ...]} (라벨은 무시, 값만 모은다)."""
+    """Prometheus 텍스트 -> {정규화된 이름: [(labels, 값), ...]}."""
     out = {}
     for line in (text or "").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        labels = {}
         if "{" in line:
-            name = line.split("{", 1)[0].strip()
-            rest = line.rsplit("}", 1)[-1].split()
+            name, rest = line.split("{", 1)
+            label_blob, _, tail = rest.rpartition("}")
+            for part in label_blob.split(","):
+                k, sep, v = part.partition("=")
+                if sep:
+                    labels[k.strip()] = v.strip().strip('"')
+            fields = tail.split()
         else:
-            parts = line.split()
-            if len(parts) < 2:
+            fields = line.split()
+            if len(fields) < 2:
                 continue
-            name, rest = parts[0], parts[1:]
-        if not rest:
+            name, fields = fields[0], fields[1:]
+        if not fields:
             continue
-        val = _num(rest[0])
+        val = _num(fields[0])
         if val is None:
             continue
-        out.setdefault(name, []).append(val)
+        out.setdefault(_norm_metric_name(name.strip()), []).append((labels, val))
     return out
+
+
+def _series(metrics, names):
+    """alias 중 **먼저 존재하는 하나**의 시리즈만 반환 (이중 집계 방지)."""
+    for n in names:
+        hit = metrics.get(_norm_metric_name(n))
+        if hit:
+            return hit
+    return None
+
+
+def _sum_workers(series):
+    """rank 복제는 접고(max), 서로 다른 워커는 더한다."""
+    groups = {}
+    for labels, val in series:
+        key = tuple(sorted((k, v) for k, v in labels.items()
+                           if k not in _RANK_LABELS))
+        groups[key] = max(groups[key], val) if key in groups else val
+    return sum(groups.values())
 
 
 def live_from_prom(text):
@@ -654,28 +694,32 @@ def live_from_prom(text):
     if not metrics:
         return None
     for engine, spec in _PROM_SPECS:
-        if not any(n in metrics for names in spec.values() for n in names):
+        if not any(_series(metrics, names) for names in spec.values() if names):
             continue
         live = {"engine": engine, "running": None, "waiting": None,
                 "kv_cache_pct": None, "gen_tokens": None, "throughput": None}
         for field, names in spec.items():
-            vals = []
-            for n in names:
-                vals.extend(metrics.get(n) or [])
-            if not vals:
+            series = _series(metrics, names) if names else None
+            if not series:
                 continue
             if field == "kv_cache":
-                # 0~1 비율로 나오는 게 보통 -> % 로. 라벨이 여러 개면 가장 붐비는 값.
-                pct = max(vals)
+                # 사용률은 더하는 값이 아니다 -> 가장 붐비는 시리즈 기준.
+                # 0~1 비율로 주는 게 보통(vLLM·SGLang 둘 다) -> % 로 환산.
+                pct = max(v for _, v in series)
                 live["kv_cache_pct"] = round(pct * 100.0 if pct <= 1.0 else pct, 1)
             elif field == "throughput":
-                live["throughput"] = round(sum(vals), 1)
+                live["throughput"] = round(_sum_workers(series), 1)
             elif field == "gen_tokens":
-                live["gen_tokens"] = sum(vals)
+                live["gen_tokens"] = _sum_workers(series)
             else:
-                live[field] = int(sum(vals))   # 라벨(모델)별로 나뉘어 있으면 합
+                live[field] = int(_sum_workers(series))
         return live
     return None
+
+
+# Pod URL -> (monotonic 시각, 누적 생성 토큰). 카운터 차분으로 지금의 tok/s 를 낸다.
+_TPUT_HISTORY = {}
+_TPUT_LOCK = threading.Lock()
 
 
 def _throughput_from_counter(url, gen_tokens, now=None):
@@ -707,7 +751,9 @@ def probe_pod_load(url, timeout, api_key=None, now=None):
     live = live_from_prom(text)
     if live is None:
         return {"url": url,
-                "error": "엔진 게이지 없음(vllm:/sglang: 메트릭 미노출)"}
+                "error": "엔진 게이지 없음 — /metrics 는 응답했지만 vllm/sglang "
+                         "메트릭이 없음 (SGLang 은 --enable-metrics 필요, "
+                         "vLLM 은 --disable-log-stats 확인)"}
     live["url"] = url
     if live.get("throughput") is None:
         live["throughput"] = _throughput_from_counter(url, live.get("gen_tokens"), now)
