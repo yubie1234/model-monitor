@@ -17,7 +17,8 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 | running(healthy) / unhealthy | LiteLLM `GET /health` (api_base 기준으로 위 매핑과 join) |
 | **LB 뒤 backend Pod 개수 (ready/desired)** | Kubernetes API (EndpointSlice / Knative PodAutoscaler / Deployment) |
 | OpenAI 호환 모델 이름 목록 | LiteLLM `GET /v1/models` (이름만, **api_base 없음**) |
-| **모델별 요청 수 / 토큰 / 분당 요청(rpm)** | LiteLLM 분석 엔드포인트 (`GET /global/activity/model` → `/global/daily/activity` → `/model/metrics` 순으로 시도) |
+| **모델별 요청 수 / 토큰** | LiteLLM `GET /global/activity/model` (→ `/gateway/daily/activity` → `/model/metrics` 순으로 폴백) |
+| **분당 요청(rpm)** | 위 요청 수 ÷ 집계 구간 (LiteLLM 이 주는 값이 아니라 **모니터가 계산**) |
 | **rpm/tpm 한도 대비 사용률** | 위 사용량 ÷ `GET /model_group/info` 의 `rpm`·`tpm` |
 | **현재 실행/대기 요청, KV 캐시 사용률** (옵션) | 백엔드 `GET /metrics` (vLLM/SGLang Prometheus 게이지, `--probe-metrics`) |
 | backends up (옵션) | 각 백엔드 `GET /v1/models`, `/health` 직접 probe |
@@ -52,6 +53,17 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 | `IN-FLIGHT` | **지금** 처리 중인 요청 수(+대기 큐) | 백엔드 `/metrics` (`--probe-metrics`) |
 | `KV CACHE` | **지금** GPU KV 캐시가 얼마나 찼는지(%) = 실질 포화도 | 백엔드 `/metrics` (`--probe-metrics`) |
 
+**전제: LiteLLM 에 DB 가 붙어 있어야 합니다.** 요청 수는 LiteLLM 이 모든 요청을 `LiteLLM_SpendLogs`
+테이블에 적어두고, `/global/activity/model` 이 그걸 `model_group`·일자로 GROUP BY 해서 돌려주는
+값입니다. DB(`DATABASE_URL`) 가 없으면 LiteLLM 이 `Database not connected` 를 돌려주고, 모니터는
+그 사유를 그대로 표시한 뒤 요청 수 열을 생략합니다.
+
+- **RPM 은 LiteLLM 이 주는 값이 아닙니다.** LiteLLM 은 구간 누적 요청 수만 주고, 분당 요청은
+  모니터가 `요청 수 ÷ 구간 길이` 로 계산합니다(= 구간 평균이지 순간 속도가 아님). 순간 부하는
+  `IN-FLIGHT`/`KV CACHE` 를 보세요.
+- **키 권한에 따라 범위가 달라집니다.** `/global/activity/model` 은 admin 키면 전체를, internal user
+  키면 **그 사용자 몫만** 돌려줍니다(LiteLLM 이 role 로 쿼리를 스코프함). 전체 현황을 보려면 admin 키를 쓰세요.
+  같은 이유로 `/user/daily/activity` 는 폴백 후보에서 제외했습니다 — 조용히 과소 집계될 수 있습니다.
 - **누적(LiteLLM) 과 실시간(엔진 게이지)은 다른 것**입니다. LiteLLM 은 "지난 24시간에 몇 번 불렸나"만
   알고, "지금 몇 개가 물려 있나"는 vLLM/SGLang 이 직접 노출하는 게이지에서만 나옵니다.
 - LiteLLM 은 버전마다 분석 엔드포인트가 달라져서, 후보를 **우선순위로 시도하고 처음 데이터가 나온
@@ -174,8 +186,9 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
   `/health` 가 도착하면 보강합니다. 그래도 부족하면 `--health-timeout`(기본 90s)을 늘리거나,
   k8s readiness 만으로 충분하면 `--no-health` 로 끄세요. (KServe 모델은 `/health` 없이도 backend
   Pod 가 ready 면 UP 으로 표시됩니다. 단 외부 IP 백엔드는 `/health` 가 있어야 status 가 나옵니다.)
-- **REQ/RPM 열이 안 보임**: LiteLLM 분석 엔드포인트가 전부 실패한 경우입니다(구버전이라 경로가 없거나,
-  admin 권한이 아니거나, 로그 DB 가 꺼져 있음). 표 아래에 시도한 엔드포인트와 사유가 나옵니다.
+- **REQ/RPM 열이 안 보임**: LiteLLM 분석 엔드포인트가 전부 실패한 경우입니다. 가장 흔한 원인은
+  **LiteLLM 에 DB 가 안 붙어 있는 것**(`Database not connected`)이고, 그 다음이 버전 차이로 경로가
+  없는 경우입니다. 표 아래에 시도한 엔드포인트와 사유가 그대로 나옵니다.
   `--json` 의 `usage.errors` 에서도 확인할 수 있습니다.
 - **IN-FLIGHT/KV 가 `?`**: 백엔드 `/metrics` 가 없거나(엔진 옵션), 다른 포트로 떠 있거나, 라우팅이
   막힌 경우입니다. vLLM 은 `vllm:num_requests_running`, SGLang 은 `sglang:num_running_reqs` 게이지를

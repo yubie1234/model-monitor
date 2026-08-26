@@ -433,6 +433,15 @@ def _usage_from_model_metrics(data):
 def usage_candidates(now, window_hours):
     """(path, parser, granularity) 후보 목록 — 앞에 있는 것부터 시도한다.
 
+    1순위 /global/activity/model 이 LiteLLM 소스(spend_management_endpoints.py)에서
+    확인된 정식 경로다: LiteLLM_SpendLogs 를 model_group·일자로 GROUP BY 해서
+    [{model, sum_api_requests, sum_total_tokens, daily_data[{date, api_requests,
+    total_tokens}]}] 를 돌려준다. 2순위는 신형 일별 집계(/gateway/daily/activity),
+    3순위는 구버전 UI 가 쓰던 /model/metrics.
+
+    ※ /user/daily/activity 는 후보에 넣지 않는다 — 호출한 키의 사용자 범위만
+      돌려줘서 전체 현황처럼 보여주면 조용히 과소 집계가 된다.
+
     granularity="day" 인 소스는 날짜 단위라 실제로 커버하는 구간이 요청한
     window 보다 넓다(그 날 00:00 부터). rate 계산 시 이를 반영한다.
     """
@@ -442,7 +451,7 @@ def usage_candidates(now, window_hours):
     return [
         ("/global/activity/model?start_date=%s&end_date=%s" % (d0, d1),
          _usage_from_activity_model, "day"),
-        ("/global/daily/activity?start_date=%s&end_date=%s&page_size=1000" % (d0, d1),
+        ("/gateway/daily/activity?start_date=%s&end_date=%s&page_size=1000" % (d0, d1),
          _usage_from_daily_activity, "day"),
         ("/model/metrics?startTime=%s&endTime=%s" % (t0, t1),
          _usage_from_model_metrics, "exact"),
@@ -460,6 +469,9 @@ def collect_usage(url, api_key, timeout, window_hours=24.0, now=None):
     now = now or datetime.now()
     start = now - timedelta(hours=window_hours)
     base = url.rstrip("/")
+    # 사용량은 LiteLLM 이 요청을 DB(LiteLLM_SpendLogs)에 적어둬야 나온다.
+    # DB 미연결이면 LiteLLM 이 "Database not connected" 를 돌려주고, 그 본문이
+    # errors 에 그대로 실려 UI 에 노출된다(우리가 원인을 추측하지 않는다).
     out = {
         "source": None,
         "granularity": None,

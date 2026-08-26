@@ -251,6 +251,18 @@ class TestUsageParsers(unittest.TestCase):
         self.assertEqual(out["B"]["requests"], 5)
         self.assertEqual(out["B"]["tokens"], 50)
 
+    def test_activity_model_real_shape(self):
+        # LiteLLM 실제 응답 형태(spend_management_endpoints.py 의 /global/activity/model):
+        # LiteLLM_SpendLogs 를 model_group·일자로 GROUP BY 한 결과.
+        data = [{"model": "Qwen3-32B",
+                 "sum_api_requests": 1200, "sum_total_tokens": 570000,
+                 "daily_data": [
+                     {"date": "2026-08-25", "api_requests": 900, "total_tokens": 450000},
+                     {"date": "2026-08-26", "api_requests": 300, "total_tokens": 120000}]}]
+        out = m._usage_from_activity_model(data)
+        self.assertEqual(out["Qwen3-32B"]["requests"], 1200)   # 상단 합계 우선
+        self.assertEqual(out["Qwen3-32B"]["tokens"], 570000)   # daily 와 이중 합산 금지
+
     def test_activity_model_sums_daily_data_when_no_totals(self):
         # 상단 합계가 없는 버전 -> daily_data 합산으로 폴백
         data = {"data": [{"model": "A", "daily_data": [
@@ -305,8 +317,8 @@ class TestCollectUsage(unittest.TestCase):
 
     def test_falls_through_to_next_endpoint(self):
         fake, calls = self._fake_http([
-            # 1순위는 404, 2순위(신형 daily activity)에서 데이터가 나온다
-            ("/global/daily/activity", (True, {"results": [{"breakdown": {"models": {
+            # 1순위는 404, 2순위(신형 /gateway/daily/activity)에서 데이터가 나온다
+            ("/gateway/daily/activity", (True, {"results": [{"breakdown": {"models": {
                 "A": {"metrics": {"api_requests": 120, "total_tokens": 6000}}}}}]}, None)),
         ])
         orig = m.http_get_json
@@ -316,7 +328,7 @@ class TestCollectUsage(unittest.TestCase):
                                 now=datetime(2026, 8, 26, 12, 0, 0))
         finally:
             m.http_get_json = orig
-        self.assertEqual(u["source"], "/global/daily/activity")
+        self.assertEqual(u["source"], "/gateway/daily/activity")
         self.assertEqual(u["models"]["A"]["requests"], 120)
         self.assertEqual(u["totals"]["requests"], 120)
         self.assertEqual(u["totals"]["models_used"], 1)

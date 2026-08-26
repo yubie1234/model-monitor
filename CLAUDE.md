@@ -52,10 +52,13 @@ The core pipeline is `build_snapshot(settings)` → a single `snap` dict consume
    `parse_api_base` turns an `api_base` URL into `(namespace, service)`; IPs/public domains classify as `external` and short-circuit (no k8s calls). A `(ns, svc)` cache dedupes k8s lookups across deployments sharing a Service. The k8s client auto-enables in-cluster via the ServiceAccount token (`--no-backend-count` disables).
 
 3. **사용량** (`collect_usage` + `attach_usage_to_deployments`) — 모델별 요청 수/토큰. LiteLLM 은 버전마다
-   분석 엔드포인트가 달라서 후보(`/global/activity/model` → `/global/daily/activity` → `/model/metrics`)를
+   분석 엔드포인트가 달라서 후보(`/global/activity/model` → `/gateway/daily/activity` → `/model/metrics`)를
    **우선순위로 시도하고 처음 데이터가 나온 응답만** 정규화한다(`usage["source"]` 에 기록). 전부 실패하면
    비워 두고 UI 에서 열이 사라진다 — backend 개수와 같은 원칙으로 **추정값을 넣지 않는다**. 사용량은
    `model_name`(그룹) 단위라 합계는 반드시 `usage["totals"]` 를 쓴다(행을 더하면 replica 만큼 중복 — 테스트로 고정).
+   전제 두 가지: LiteLLM 에 DB 가 있어야 하고(요청 수는 `LiteLLM_SpendLogs` 집계), 키 role 에 따라
+   범위가 스코프된다(internal user 키면 본인 몫만 — 그래서 `/user/daily/activity` 는 후보에서 뺐다).
+   rpm 은 LiteLLM 이 주는 값이 아니라 `요청 수 ÷ 구간` 으로 계산한 구간 평균이다.
    `--probe-metrics` 를 켜면 백엔드 `/metrics`(vLLM/SGLang Prometheus 게이지)에서 현재 실행/대기 요청과
    KV 캐시 사용률을 읽어 붙인다(LB 경유라 Pod 1개 샘플이라는 점을 UI 에 표기).
 
