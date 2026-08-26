@@ -121,6 +121,10 @@ tok/s · 등급(idle/ok/BUSY/FULL)을 deployment 행에 붙인다. Pod 주소는
   `dp_rank`/`engine` 만 합산(TP=4 에서 4배 부풀림 방지).
 - **모델 등급은 라우팅 방식에 따른다**(`MONITOR_LOAD_ROUTING`): least-busy(기본)=가장 한가한 backend,
   shuffle=가장 나쁜 backend. `summarize` 와 대시보드가 **같은 규칙**을 써야 카드와 표가 안 어긋난다.
+- **주기 60초**(`MONITOR_LOAD_INTERVAL`, 스냅샷 갱신 5초와 분리) + 화면에 `N초 전` 표기. 즉시
+  갱신은 `POST /api/load/refresh`(`Refresher.refresh_load_now`) — 요청 경로에서 실제 수집하는
+  유일한 예외라 최소 간격 10초 + 진행 중 락으로 직렬화한다. 백그라운드 루프는 **세션 수와 무관하게
+  하나**이므로 보는 사람이 늘어도 백엔드 조회는 늘지 않는다.
 - per-user 뷰에는 평탄한 스칼라(`load_state`/`load_running`/...)로만 나간다 — `per_pod` 에 Pod 주소가
   있어 그대로 넘기면 내부가 샌다. 사유도 원문 대신 정규화 코드(`load_reason_code`).
 

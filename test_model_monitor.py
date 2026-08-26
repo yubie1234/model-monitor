@@ -2455,7 +2455,7 @@ def _settings_ns(**over):
         user_view=False, user_view_show_internal=False,
         user_view_cache_ttl=30.0, metrics=True, metrics_token=None,
         load=True, load_timeout=3.0, load_threads=12,
-        load_routing="least-busy", load_interval=None,
+        load_routing="least-busy", load_interval=60.0,
         prometheus_url=None, prometheus_first=False, prometheus_lookback="2m",
         config_file=None,
     )
@@ -3209,6 +3209,67 @@ class TestSummarizeLoad(unittest.TestCase):
         self.assertEqual(s["running"], 4)
         self.assertEqual(s["queued"], 2)
         self.assertEqual(s["models_busy"], 2)
+
+
+class TestManualLoadRefresh(unittest.TestCase):
+    """수동 새로고침 — 버튼 하나가 백엔드 팬아웃이라 서버가 직렬화·제한한다."""
+
+    def _refresher(self, fetched):
+        store = _state.SnapshotStore()
+        asyncio.run(store.set({"litellm": {"deployments": [
+            {"model_name": "A", "api_base": "http://a/v1"}]}, "summary": {}}))
+        r = _state.Refresher({"load": True, "load_routing": "least-busy"},
+                             store, 5.0)
+        calls = {"n": 0}
+
+        async def fake_fetch():
+            calls["n"] += 1
+            return fetched
+        r._fetch_load = fake_fetch
+        return r, store, calls
+
+    def test_refresh_updates_snapshot_immediately(self):
+        loads = {"http://a": {"state": "busy", "state_reason": "대기 2건",
+                              "running": 4, "waiting": 2, "kv_cache_pct": 70.0,
+                              "pods_sampled": 1, "pods_failed": 0, "per_pod": []}}
+        r, store, calls = self._refresher((loads, {}))
+        out = asyncio.run(r.refresh_load_now())
+        self.assertTrue(out["ok"])
+        self.assertEqual(calls["n"], 1)
+        snap = asyncio.run(store.get())
+        # 다음 폴링을 기다리지 않고 캐시 스냅샷에 바로 반영된다
+        self.assertEqual(snap["litellm"]["deployments"][0]["load"]["state"], "busy")
+        self.assertTrue(snap["load_enabled"])
+        self.assertIsNotNone(snap["load_ts_epoch"])
+        self.assertEqual(snap["summary"]["queued"], 2)
+
+    def test_min_gap_blocks_hammering(self):
+        r, _store, calls = self._refresher(({}, {}))
+        first = asyncio.run(r.refresh_load_now())
+        second = asyncio.run(r.refresh_load_now())
+        self.assertTrue(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertGreater(second["retry_after"], 0)
+        self.assertEqual(calls["n"], 1)      # 두 번째는 백엔드로 안 나간다
+
+    def test_failed_round_keeps_previous_value(self):
+        r, _store, _calls = self._refresher(None)   # 전부 실패 -> None
+        out = asyncio.run(r.refresh_load_now())
+        self.assertFalse(out["ok"])
+        self.assertIn("직전 값 유지", out["error"])
+
+    def test_disabled_when_load_off(self):
+        r, _s, calls = self._refresher(({}, {}))
+        r.settings = dict(r.settings, load=False)
+        out = asyncio.run(r.refresh_load_now())
+        self.assertFalse(out["ok"])
+        self.assertEqual(calls["n"], 0)
+
+    def test_period_default_is_one_minute(self):
+        r = _state.Refresher({"load_interval": 60.0}, None, 5.0)
+        self.assertEqual(r._load_period(), 60.0)
+        # 미설정이면 스냅샷 갱신 주기를 따른다
+        self.assertEqual(_state.Refresher({}, None, 5.0)._load_period(), 5.0)
 
 
 class TestPerUserLoadRedaction(unittest.TestCase):

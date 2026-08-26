@@ -89,7 +89,11 @@ class Refresher:
         # 실패 라운드가 마지막 정상 결과를 지우지 않는다.
         self._load = None
         self._load_alias = {}
+        self._load_at = None          # 마지막 부하 수집 시각(epoch) — 화면의 "N초 전"
         self._load_lock = asyncio.Lock()
+        # 수동 새로고침 버튼용 — 동시에 여러 번 눌러도 팬아웃이 겹치지 않게 직렬화.
+        self._load_refresh_lock = asyncio.Lock()
+        self._load_mono = 0.0         # 최소 간격 판정용(monotonic)
         # 생성 토큰 카운터 차분용 — 사이클 간 유지돼야 tok/s 가 나온다
         # (node_cache 와 같은 이유로 프로세스 수명).
         self._tput_cache = {}
@@ -126,8 +130,10 @@ class Refresher:
             # 비동기로 모아둔 '지금 부하'를 주입 — health 와 같은 이유로 별도
             # 주기다(Pod 팬아웃이라 수집 사이클에 넣으면 갱신이 늘어진다).
             async with self._load_lock:
-                loads, alias = self._load, self._load_alias
+                loads, alias, load_at = self._load, self._load_alias, self._load_at
             if loads:
+                snap["load_ts_epoch"] = load_at
+                snap["load_interval"] = self._load_period()
                 snap["litellm"]["deployments"] = attach_load_to_deployments(
                     snap["litellm"]["deployments"], loads,
                     _strip_openai_suffix, alias)
@@ -301,14 +307,57 @@ class Refresher:
             v = 0
         return max(1.0, v) if v > 0 else self.interval
 
+    async def _store_load(self, got):
+        """수집 결과와 **수집 시각**을 함께 보관한다(화면이 신선도를 표시할 수 있게)."""
+        async with self._load_lock:
+            self._load, self._load_alias = got
+            self._load_at = time.time()
+        self._load_mono = time.monotonic()
+
+    # 수동 새로고침 최소 간격(초). 버튼 한 번 = 모든 Pod 에 GET 팬아웃이라
+    # 연타로 백엔드를 두들기지 않게 서버가 막는다.
+    _LOAD_REFRESH_MIN_GAP = 10.0
+
+    async def refresh_load_now(self):
+        """버튼용: 지금 즉시 부하 1회 수집 후 캐시 스냅샷에 반영.
+
+        -> {"ok": bool, "retry_after": float|None, "load_ts_epoch": float|None}
+        """
+        if self.demo or not self.settings.get("load", True):
+            return {"ok": False, "error": "부하 수집이 꺼져 있습니다."}
+        if self._load_refresh_lock.locked():
+            return {"ok": False, "error": "이미 조회 중입니다.", "retry_after": 2.0}
+        async with self._load_refresh_lock:
+            gap = time.monotonic() - (self._load_mono or 0.0)
+            if self._load_mono and gap < self._LOAD_REFRESH_MIN_GAP:
+                return {"ok": False, "retry_after": round(
+                    self._LOAD_REFRESH_MIN_GAP - gap, 1),
+                    "error": "너무 잦은 요청입니다(백엔드 보호)."}
+            got = await self._fetch_load()
+            if got is None:
+                return {"ok": False, "error": "부하를 읽지 못했습니다(직전 값 유지)."}
+            await self._store_load(got)
+        # 다음 폴링을 기다리지 않고 캐시 스냅샷에 바로 반영한다.
+        snap = await self.store.get()
+        if snap and snap.get("litellm"):
+            loads, alias = got
+            snap["litellm"]["deployments"] = attach_load_to_deployments(
+                snap["litellm"]["deployments"], loads, _strip_openai_suffix, alias)
+            snap["load_enabled"] = True
+            snap["load_routing"] = self.settings.get("load_routing", "least-busy")
+            snap["load_ts_epoch"] = self._load_at
+            snap["load_interval"] = self._load_period()
+            snap["summary"] = summarize(snap)
+            await self.store.set(snap, None)
+        return {"ok": True, "load_ts_epoch": self._load_at}
+
     async def _load_loop(self):
         """부하 수집 루프. 수집 -> 대기 순서라 첫 값은 시작 직후에 나온다."""
         while True:
             try:
                 got = await self._fetch_load()
                 if got is not None:
-                    async with self._load_lock:
-                        self._load, self._load_alias = got
+                    await self._store_load(got)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001

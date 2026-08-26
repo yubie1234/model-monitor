@@ -299,7 +299,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_BACKEND_COUNT` | LB 뒤 backend Pod 개수 수집 (true) |
 | `MONITOR_GPU_INFO` | GPU 개수/장치명 수집 (true; Pod·Node 읽기 권한 필요) |
 | `MONITOR_LOAD` | **지금 부하** 수집 (true; `MONITOR_BACKEND_COUNT` 필요) — 각 backend Pod 의 `/metrics`(vLLM/SGLang 게이지)를 읽어 처리 중/대기 요청·KV 캐시 사용률·tok/s 를 표시. Pod 주소는 GPU 집계가 이미 받아오는 Pod 목록에서 나오므로 **k8s 호출이 늘지 않는다**. Pod 주소를 못 얻는 백엔드(scale-to-zero·external)는 **조회하지 않고** 이유와 함께 `?` — LB 로 찌르면 activator 를 거쳐 모델을 깨우기 때문 |
-| `MONITOR_LOAD_INTERVAL` | 부하 조회 주기 초 (미설정=`MONITOR_INTERVAL` 과 동일) — Pod 마다 `/metrics` 를 읽는 팬아웃이라, 백엔드 부담만 줄이고 싶으면 여기만 늘린다 |
+| `MONITOR_LOAD_INTERVAL` | 부하 조회 주기 초 (**60**) — Pod 마다 `/metrics` 를 읽는 팬아웃이라 스냅샷 갱신(5초)과 분리했다. 화면에는 "N초 전"으로 신선도를 함께 표시하고, 급하면 대시보드의 **`⟳ 부하`** 버튼으로 즉시 당겨 읽는다(`POST /api/load/refresh`, 서버가 최소 10초 간격·진행 중 락으로 제한) |
 | `MONITOR_LOAD_TIMEOUT` | Pod `/metrics` 조회 타임아웃 초 (3) — 죽은 Pod 가 사이클을 잡아먹지 않게 짧게 |
 | `MONITOR_LOAD_ROUTING` | 한 `model_name` 에 backend 가 여러 개일 때 모델 등급 기준 (`least-busy` \| `shuffle`). **LiteLLM 의 `routing_strategy` 에 맞춘다** — least-busy 면 다음 요청이 갈 가장 한가한 backend 가 답이고, simple-shuffle 이면 포화된 backend 도 트래픽을 받으므로 가장 나쁜 쪽이 정직하다. 어느 쪽이든 화면에는 등급 분포(`FULL 1 · ok 1`)를 함께 표시 |
 | `MONITOR_PROMETHEUS_URL` | Pod 직접 조회가 막혔을 때(NetworkPolicy·mTLS) 같은 게이지를 대신 읽을 외부 Prometheus URL. 출처가 같아 정확도는 동일하고 스크레이프 주기만큼 늦다 |
@@ -316,6 +316,16 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 > `prometheus.labels`(스크레이프 라벨 이름 교정)는 설정 파일에서 받습니다.
 
 > 중첩 설정(`backends`, `namespace_overrides`, `user_view.*`, `metrics.*` 등)은 `MONITOR_CONFIG_FILE` 가 가리키는 설정 파일에서 받습니다.
+
+### 부하 조회 주기와 수동 새로고침
+
+- **백그라운드 루프 하나**가 60초마다 조회한다. **화면을 보는 세션 수와 무관**하다 — 대시보드
+  폴링(`GET /api/snapshot`)은 캐시된 스냅샷을 그대로 돌려줄 뿐 수집하지 않는다(이 프로젝트의
+  기본 규칙: 요청 경로에서 수집하지 않는다). 10명이 보고 있어도 백엔드로 나가는 조회는 그대로다.
+- 값의 나이는 화면에 `N초 전` 으로 표시하고, 주기의 2배를 넘으면 노란색으로 바뀐다.
+- 즉시 보고 싶으면 `⟳ 부하` 버튼 → `POST /api/load/refresh`. **이것만이 요청 경로에서 실제로
+  수집하는 예외**라, 서버가 최소 간격 10초 + 진행 중 락으로 직렬화한다(여러 명이 눌러도 팬아웃이
+  겹치지 않는다). 키 필수 모드에서는 admin 키가 있어야 한다.
 
 ## 운영 배포
 

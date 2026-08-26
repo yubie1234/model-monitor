@@ -164,6 +164,13 @@
   /* 모델 기준 그룹 뷰 */
   .pill.deg{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
   /* 지금 부하 — 등급 pill + 근거 */
+  .lrefresh{font-family:var(--sans);font-size:12px;color:var(--muted);cursor:pointer;
+    background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+    padding:3px 9px}
+  .lrefresh:hover:not(:disabled){color:var(--text);border-color:var(--accent)}
+  .lrefresh:disabled{opacity:.5;cursor:default}
+  .lage{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .lage.stale{color:var(--warn)}
   .load{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
   .load .lv{font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 8px;
     border-radius:20px;border:1px solid transparent}
@@ -324,6 +331,9 @@
                aria-label="모델·백엔드 검색"
                placeholder="🔍 모델·백엔드 검색  ( / )"
                title="model_name·service·api_base 로 필터 — 표·그래프에 함께 적용. 단축키 &quot;/&quot;, 지우기 Esc">
+        <button class="lrefresh" id="load-refresh" type="button" hidden
+                title="지금 부하만 즉시 다시 읽습니다 — 백엔드 Pod 마다 /metrics 를 한 번씩 조회하므로 최소 10초 간격으로 제한됩니다">⟳ 부하</button>
+        <span class="lage" id="load-age" hidden></span>
         <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
@@ -558,6 +568,45 @@ function downTip(d){
   if(d.status_detail) parts.push(d.status_detail);
   return parts.join("\n");
 }
+// 부하 값의 나이. 주기가 60초라 "지금"이 아니다 — 언제 읽은 값인지 항상 같이 보여준다.
+function renderLoadAge(snap){
+  const btn=$("#load-refresh"), lbl=$("#load-age");
+  if(!btn||!lbl) return;
+  const on = !!snap.load_enabled && !snap.demo;
+  btn.hidden = !on; lbl.hidden = !on;
+  if(!on) return;
+  const ts = snap.load_ts_epoch;
+  if(ts==null){ lbl.textContent="부하 수집 대기"; lbl.classList.remove("stale"); return; }
+  const age = Math.max(0, Math.round(Date.now()/1000 - ts));
+  lbl.textContent = age<60 ? (age+"초 전") : (Math.floor(age/60)+"분 "+(age%60)+"초 전");
+  // 주기(기본 60s)의 2배를 넘으면 수집이 밀리는 중 -> 눈에 띄게.
+  lbl.classList.toggle("stale", age > 2*(snap.load_interval||60));
+  lbl.title = "부하를 마지막으로 읽은 시각 기준. 주기 "
+    + (snap.load_interval||60) + "초 · 버튼으로 즉시 갱신";
+}
+
+async function refreshLoadNow(){
+  const btn=$("#load-refresh"), lbl=$("#load-age");
+  if(!btn || btn.disabled) return;
+  btn.disabled = true; const prev=btn.textContent; btn.textContent="⟳ 조회 중…";
+  try{
+    const key = (typeof uvKey==="function") ? uvKey() : "";
+    const r = await fetch(BASE_PATH+"/api/load/refresh",
+      {method:"POST", cache:"no-store",
+       headers: key ? {"X-LiteLLM-Key": key} : {}});
+    const j = await r.json().catch(()=>({}));
+    if(!j.ok && lbl){
+      lbl.textContent = j.retry_after ? (Math.ceil(j.retry_after)+"초 뒤 가능")
+                                      : (j.error||"실패");
+      lbl.classList.add("stale");
+    }
+    await tick();          // 갱신된 스냅샷을 바로 가져와 다시 그린다
+  }catch(e){ if(lbl){ lbl.textContent="새로고침 실패"; lbl.classList.add("stale"); } }
+  finally{ btn.textContent=prev;
+    // 서버 최소 간격(10s)과 맞춰 연타를 막는다.
+    setTimeout(()=>{ btn.disabled=false; }, 10000); }
+}
+
 function statusPill(s, d){
   const cls = statusPillCls(s);
   // PAUSED 는 'PAUSED(UP)' 처럼 원래 health 판정을 괄호로 덧붙인다 — 다시 켰을 때
@@ -1214,6 +1263,7 @@ function render(snap){
   // 쓸 수 있나"의 답이다. 리댁션은 평탄한 스칼라만 남기므로(Pod 주소 제외)
   // loadOf 가 같은 모양으로 되돌린다.
   const showLoad = !!snap.load_enabled;
+  renderLoadAge(snap);
   const leastBusy = String(snap.load_routing||"least-busy") !== "shuffle";
   const dt = $("#deployments");
   // status/net/engine 필터는 표와 그래프에 똑같이 적용한다(그래프도 필터된 집합만 그림).
@@ -1490,6 +1540,7 @@ $("#deployments").addEventListener("click", (e)=>{
     setTimeout(()=>td.classList.remove("copied"), 900); }).catch(()=>{});
 });
 // 📌 pin 칩 클릭 → pin 해제(표 전체 복원). 칩은 매 렌더마다 새로 그려지므로 위임으로 1회만.
+$("#load-refresh").addEventListener("click", refreshLoadNow);
 $("#dep-label").addEventListener("click", (e)=>{
   if(e.target.closest("#pin-badge") && graphPin){
     graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
