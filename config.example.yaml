@@ -31,6 +31,19 @@ load:
     kv_busy: 80        # KV 캐시 사용률(%)
     kv_saturated: 95
 
+# --- Prometheus 폴백 (선택) ---
+# Pod /metrics 를 직접 못 읽을 때(NetworkPolicy·mTLS·메트릭 비활성) 같은 게이지를
+# Prometheus 에서 대신 읽는다. 출처가 같아 정확도는 동일하고 스크레이프 주기만큼 늦다.
+# prometheus:
+#   url: "http://prometheus-operated.monitoring.svc:9090"
+#   first: false        # true 면 Pod 직접 조회를 건너뛰고 Prometheus 만 사용
+#   lookback: "2m"      # 이 구간 안에 샘플이 없으면 '모름'(옛날 값을 지금으로 쓰지 않음)
+#   timeout: 10
+#   labels:             # 스크레이프 설정에 따라 라벨 이름이 다르면 여기서 교정
+#     namespace: "namespace"
+#     pod: "pod"
+#     service: "service"
+
 # --- 누적 사용량(요청 수/토큰): 기본 꺼짐 ---
 # "지금 부하"와 다른 축이고, LiteLLM 에 DB(LiteLLM_SpendLogs)가 있어야 나온다.
 # 켜려면 enabled: true 또는 실행 시 --usage.

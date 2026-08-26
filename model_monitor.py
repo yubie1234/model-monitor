@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
@@ -104,6 +104,7 @@ def resolve_settings(args):
     bc = cfg.get("backend_count", {}) if isinstance(cfg.get("backend_count"), dict) else {}
     ug = cfg.get("usage", {}) if isinstance(cfg.get("usage"), dict) else {}
     ld = cfg.get("load", {}) if isinstance(cfg.get("load"), dict) else {}
+    pm = cfg.get("prometheus", {}) if isinstance(cfg.get("prometheus"), dict) else {}
 
     # backend 개수 수집(k8s API) 사용 여부:
     #   --no-backend-count 면 off, 기본은 auto(= in-cluster SA 토큰 있으면 자동 on)
@@ -150,6 +151,17 @@ def resolve_settings(args):
         "load_timeout": float(getattr(args, "load_timeout", None)
                               or ld.get("timeout") or 3.0),
         "load_thresholds": ld.get("thresholds") or {},
+        # Pod 를 직접 못 긁을 때(NetworkPolicy·mTLS·메트릭 비활성) 같은 게이지를
+        # Prometheus 에서 대신 읽는다. 출처가 같아 정확도는 같고 스크레이프 주기만큼 늦다.
+        "prometheus_url": (getattr(args, "prometheus_url", None)
+                           or os.environ.get("PROMETHEUS_URL") or pm.get("url")),
+        "prometheus_first": bool(getattr(args, "prometheus_first", False)
+                                 or pm.get("first")),
+        "prometheus_lookback": (getattr(args, "prometheus_lookback", None)
+                                or pm.get("lookback") or "2m"),
+        "prometheus_timeout": float(pm.get("timeout") or 10.0),
+        "prometheus_labels": pm.get("labels") or {},
+        "prometheus_api_key": pm.get("api_key"),
         # 동시 scrape 수. Pod 가 많고 응답 없는 Pod 가 섞이면(타임아웃 대기) 한 라운드가
         # 길어지므로 Pod 수에 맞춰 올린다. 한 라운드 최악 = ceil(Pod수/threads) * timeout.
         "load_threads": int(getattr(args, "load_threads", None)
@@ -690,7 +702,14 @@ def _sum_workers(series):
 
 def live_from_prom(text):
     """/metrics 본문 -> Pod 1개의 부하 dict (모르는 값은 None)."""
-    metrics = parse_prom_metrics(text)
+    return live_from_metrics(parse_prom_metrics(text))
+
+
+def live_from_metrics(metrics):
+    """{정규화 이름: [(labels, 값)]} -> 부하 dict.
+
+    Pod 를 직접 긁은 경우와 Prometheus 에서 받아온 경우가 **같은 추출 로직**을 쓴다.
+    """
     if not metrics:
         return None
     for engine, spec in _PROM_SPECS:
@@ -851,11 +870,13 @@ def load_targets(deployments):
         pods = d.get("backend_pods") or []
         urls = ["http://%s:%s" % (p["ip"], p["port"]) for p in pods
                 if p.get("ip") and p.get("port")]
+        meta = {"namespace": d.get("namespace"), "service": d.get("service"),
+                "pod_names": [p["pod"] for p in pods if p.get("pod")]}
         if urls:
-            targets[base] = {"urls": urls, "scope": "pods"}
+            targets[base] = dict(meta, urls=urls, scope="pods")
         else:
             # Pod 주소를 모른다(외부 주소·k8s 미사용·scale-to-zero) -> LB 로 1회
-            targets[base] = {"urls": [base], "scope": "lb-sample"}
+            targets[base] = dict(meta, urls=[base], scope="lb-sample")
     return targets
 
 
@@ -890,6 +911,141 @@ def collect_load(targets, timeout, api_key=None, max_threads=12, thresholds=None
         agg = aggregate_pod_loads(samples, spec["scope"])
         agg["state"], agg["state_reason"] = classify_load(agg, thresholds)
         out[base] = agg
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Prometheus 폴백: Pod 를 직접 못 긁을 때(NetworkPolicy·mTLS·메트릭 비활성)
+#   이미 Prometheus 가 같은 엔진 게이지를 수집 중이라면 그걸 대신 읽는다.
+#   출처가 같으므로 값의 정확도는 동일하고, 대신 스크레이프 주기만큼 지연된다.
+#   외부 패키지 없이 Prometheus HTTP API(/api/v1/query) 를 그대로 호출한다.
+# ----------------------------------------------------------------------------
+
+def _prom_metric_regex():
+    """_PROM_SPECS 가 쓰는 모든 이름(콜론/언더스코어 변형 포함)의 정규식."""
+    names = set()
+    for _engine, spec in _PROM_SPECS:
+        for group in spec.values():
+            for n in group:
+                names.add(n)
+                names.add(_norm_metric_name(n))
+    return "|".join(sorted(names))
+
+
+def build_prom_query(namespace, pods, service, labels=None):
+    """PromQL 셀렉터 생성. Pod 이름을 알면 Pod 로, 모르면 Service 로 좁힌다.
+
+    __name__ 정규식만으로도 되지만(빈 문자열을 매치하지 않으므로 유효), namespace/pod
+    라벨을 함께 걸어 **다른 모델의 시리즈가 섞이지 않게** 한다.
+    """
+    lab = {"namespace": "namespace", "pod": "pod", "service": "service"}
+    lab.update(labels or {})
+    parts = ['__name__=~"%s"' % _prom_metric_regex()]
+    if namespace:
+        parts.append('%s="%s"' % (lab["namespace"], namespace))
+    if pods:
+        parts.append('%s=~"%s"' % (lab["pod"], "|".join(sorted(pods))))
+    elif service:
+        parts.append('%s="%s"' % (lab["service"], service))
+    return "{%s}" % ",".join(parts)
+
+
+def prom_instant_query(base, query, timeout, lookback="2m", api_key=None):
+    """GET /api/v1/query -> ([(labels, value)], error).
+
+    lookback_delta 로 조회 구간을 좁힌다(기본 5분). 이게 없으면 몇 분 전 값이
+    '지금 부하'로 둔갑할 수 있다 — 스크레이프가 멈춘 걸 모르고 옛날 값을 읽는다.
+    """
+    url = ("%s/api/v1/query?query=%s&lookback_delta=%s"
+           % (base.rstrip("/"), urllib.parse.quote(query), lookback))
+    ok, data, err = http_get_json(url, api_key, timeout)
+    if not ok:
+        return None, err
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return None, "prometheus: %s" % (
+            (data or {}).get("error") or "unexpected response")
+    result = ((data.get("data") or {}).get("result")) or []
+    series = []
+    for item in result:
+        metric = dict(item.get("metric") or {})
+        name = metric.pop("__name__", None)
+        val = _num((item.get("value") or [None, None])[1])
+        if name and val is not None:
+            series.append((name, metric, val))
+    return series, None
+
+
+def load_from_prom_series(series, labels=None):
+    """Prometheus 시리즈 -> Pod 별 샘플 목록 (직접 긁은 것과 같은 모양)."""
+    lab = {"pod": "pod", "instance": "instance"}
+    lab.update(labels or {})
+    by_pod = {}
+    for name, metric, val in series:
+        key = metric.get(lab["pod"]) or metric.get(lab["instance"]) or "-"
+        by_pod.setdefault(key, {}).setdefault(
+            _norm_metric_name(name), []).append((metric, val))
+    samples = []
+    for pod, metrics in sorted(by_pod.items()):
+        live = live_from_metrics(metrics)
+        url = "prom:%s" % pod
+        if live is None:
+            samples.append({"url": url, "error": "엔진 게이지 없음(Prometheus)"})
+            continue
+        live["url"] = url
+        if live.get("throughput") is None:
+            live["throughput"] = _throughput_from_counter(url, live.get("gen_tokens"))
+        samples.append(live)
+    return samples
+
+
+def collect_load_via_prometheus(targets, settings, only=None):
+    """Prometheus 에서 부하를 받아온다. only 를 주면 그 base 들만(폴백 모드)."""
+    base_url = settings.get("prometheus_url")
+    if not base_url:
+        return {}
+    timeout = float(settings.get("prometheus_timeout") or settings.get("timeout") or 10)
+    lookback = settings.get("prometheus_lookback") or "2m"
+    labels = settings.get("prometheus_labels") or {}
+    out = {}
+    for base, spec in targets.items():
+        if only is not None and base not in only:
+            continue
+        query = build_prom_query(spec.get("namespace"), spec.get("pod_names"),
+                                 spec.get("service"), labels)
+        series, err = prom_instant_query(base_url, query, timeout, lookback,
+                                         settings.get("prometheus_api_key"))
+        if series is None:
+            out[base] = {"scope": "prometheus", "pods_sampled": 0, "pods_failed": 1,
+                         "engine": None, "running": None, "waiting": None,
+                         "kv_cache_pct": None, "kv_cache_avg_pct": None,
+                         "throughput": None, "per_pod": [],
+                         "error": "prometheus: %s" % err}
+        elif not series:
+            out[base] = {"scope": "prometheus", "pods_sampled": 0, "pods_failed": 0,
+                         "engine": None, "running": None, "waiting": None,
+                         "kv_cache_pct": None, "kv_cache_avg_pct": None,
+                         "throughput": None, "per_pod": [],
+                         "error": "prometheus: 최근 %s 안에 샘플 없음(스크레이프 중단?)"
+                                  % lookback}
+        else:
+            out[base] = aggregate_pod_loads(
+                load_from_prom_series(series, labels), "prometheus")
+        out[base]["state"], out[base]["state_reason"] = classify_load(
+            out[base], settings.get("load_thresholds"))
+    return out
+
+
+def merge_load_sources(direct, prom):
+    """직접 조회 결과에 Prometheus 결과를 **표본이 더 많을 때만** 덮어쓴다.
+
+    폴백이 원래 값을 더 나쁘게 만들면 안 된다: Pod 3개를 직접 읽었는데 Prometheus 가
+    1개만 알고 있으면 직접 읽은 쪽이 낫다.
+    """
+    out = dict(direct)
+    for base, pl in (prom or {}).items():
+        cur = out.get(base) or {}
+        if (pl.get("pods_sampled") or 0) > (cur.get("pods_sampled") or 0):
+            out[base] = pl
     return out
 
 
@@ -1402,9 +1558,21 @@ def build_snapshot(settings, with_health=True):
         deps = snap["litellm"].get("deployments") or []
         try:
             targets = load_targets(deps)
-            loads = collect_load(targets, settings.get("load_timeout", 3.0),
-                                 max_threads=settings.get("load_threads", 12),
-                                 thresholds=settings.get("load_thresholds"))
+            if settings.get("prometheus_url") and settings.get("prometheus_first"):
+                # Pod 직접 접근이 아예 막힌 환경: 매번 타임아웃을 기다리지 않는다
+                loads = collect_load_via_prometheus(targets, settings)
+            else:
+                loads = collect_load(targets, settings.get("load_timeout", 3.0),
+                                     max_threads=settings.get("load_threads", 12),
+                                     thresholds=settings.get("load_thresholds"))
+                if settings.get("prometheus_url"):
+                    # 실패했거나 표본이 빠진 Service 만 Prometheus 로 보강하고,
+                    # **표본이 더 많을 때만** 교체한다(더 나쁜 값으로 덮지 않기).
+                    weak = set(b for b, l in loads.items()
+                               if l.get("state") == "unknown"
+                               or (l.get("pods_failed") or 0) > 0)
+                    loads = merge_load_sources(loads, collect_load_via_prometheus(
+                        targets, settings, only=weak))
             snap["load_enabled"] = True
             snap["litellm"]["deployments"] = attach_load_to_deployments(deps, loads)
         except Exception as e:  # noqa: BLE001  (부하 수집 실패가 전체를 막지 않게)
@@ -1755,6 +1923,8 @@ def _fmt_pods(d):
     load = d.get("load") or {}
     if not load:
         return c("-", "dim")
+    if load.get("scope") == "prometheus":
+        return c("PROM", "cyan")     # Prometheus 경유(스크레이프 주기만큼 지연)
     if load.get("scope") == "lb-sample":
         return c("LB", "yellow")     # Pod 주소를 몰라 LB 로 1개만 샘플링
     n, bad = load.get("pods_sampled") or 0, load.get("pods_failed") or 0
@@ -2466,6 +2636,8 @@ function podTip(l){
   if(!l) return "";
   const scope = l.scope==="pods"
     ? ("Pod "+(l.pods_sampled||0)+"개 직접 조회")
+    : l.scope==="prometheus"
+    ? ("Prometheus 경유 — Pod "+(l.pods_sampled||0)+"개 (스크레이프 주기만큼 지연)")
     : "LB 경유 1개 샘플 (Pod 주소 미확인)";
   const rows=(l.per_pod||[]).map(p=> p.error
     ? ((p.url||"")+" — "+p.error)
@@ -2527,6 +2699,9 @@ function tputCell(d){
 function podsCell(d){
   const l=d.load;
   if(!l) return '<span class="srccol">-</span>';
+  if(l.scope==="prometheus")
+    return '<span class="srccol" style="color:var(--accent)" title="'+esc(podTip(l))
+      +'">PROM</span>';
   if(l.scope!=="pods")
     return '<span class="srccol" style="color:var(--warn)" title="'+esc(podTip(l))
       +'">LB</span>';
@@ -2933,6 +3108,13 @@ def main():
                    help="현재 부하(백엔드 엔진 게이지) 수집 안 함")
     p.add_argument("--load-timeout", type=float,
                    help="Pod /metrics 조회 타임아웃(초, 기본 3)")
+    p.add_argument("--prometheus-url",
+                   help="Pod /metrics 를 못 읽을 때 대신 조회할 Prometheus URL "
+                        "(예: http://prometheus.monitoring.svc:9090)")
+    p.add_argument("--prometheus-first", action="store_true",
+                   help="Pod 직접 조회를 건너뛰고 Prometheus 만 사용")
+    p.add_argument("--prometheus-lookback",
+                   help="Prometheus 조회 구간(기본 2m — 이보다 오래된 샘플은 무시)")
     p.add_argument("--load-threads", type=int,
                    help="Pod /metrics 동시 조회 수(기본 12 — Pod 많으면 올리기)")
     p.add_argument("--sort", choices=("load", "name"), default="load",

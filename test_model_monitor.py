@@ -683,6 +683,124 @@ class TestMetricsFailureDisplay(unittest.TestCase):
         self.assertEqual(s["pods_failed"], 2)   # 카드/배너가 과소 집계를 경고할 근거
 
 
+class TestPrometheusFallback(unittest.TestCase):
+    """Pod 를 직접 못 긁을 때 Prometheus 에서 같은 게이지를 받아온다."""
+
+    TARGETS = {"http://qwen-predictor.kserve.svc:8080": {
+        "urls": ["http://10.0.0.1:8080"], "scope": "pods",
+        "namespace": "kserve", "service": "qwen-predictor",
+        "pod_names": ["qwen-0", "qwen-1"]}}
+    BASE = "http://qwen-predictor.kserve.svc:8080"
+    SETTINGS = {"prometheus_url": "http://prom:9090", "timeout": 5,
+                "prometheus_lookback": "2m", "load_thresholds": {}}
+
+    def _vector(self, rows):
+        return {"status": "success", "data": {"resultType": "vector", "result": [
+            {"metric": dict(labels, __name__=name), "value": [1787000000.0, str(val)]}
+            for name, labels, val in rows]}}
+
+    def _fake(self, response):
+        seen = {}
+
+        def fake(url, api_key=None, timeout=10):
+            seen["url"] = url
+            return (True, response, None) if response is not None else (
+                False, None, "HTTP 503 Service Unavailable")
+        return fake, seen
+
+    def _run(self, response):
+        fake, seen = self._fake(response)
+        orig = m.http_get_json
+        m.http_get_json = fake
+        try:
+            out = m.collect_load_via_prometheus(self.TARGETS, self.SETTINGS)
+        finally:
+            m.http_get_json = orig
+        return out[self.BASE], seen
+
+    def test_query_scopes_to_namespace_and_pods(self):
+        q = m.build_prom_query("kserve", ["qwen-0", "qwen-1"], "qwen-predictor")
+        self.assertIn('namespace="kserve"', q)
+        self.assertIn('pod=~"qwen-0|qwen-1"', q)
+        self.assertIn('vllm:num_requests_running', q)
+        self.assertIn('sglang_num_running_reqs', q)   # 언더스코어 변형도 포함
+
+    def test_query_falls_back_to_service_when_pods_unknown(self):
+        q = m.build_prom_query("kserve", [], "qwen-predictor")
+        self.assertIn('service="qwen-predictor"', q)
+        self.assertNotIn("pod=~", q)
+
+    def test_label_names_are_overridable(self):
+        q = m.build_prom_query("ns", ["p"], "svc",
+                               {"namespace": "k8s_namespace", "pod": "pod_name"})
+        self.assertIn('k8s_namespace="ns"', q)
+        self.assertIn('pod_name=~"p"', q)
+
+    def test_aggregates_across_pods_like_direct_scrape(self):
+        load, seen = self._run(self._vector([
+            ("vllm:num_requests_running", {"pod": "qwen-0"}, 5),
+            ("vllm:num_requests_waiting", {"pod": "qwen-0"}, 3),
+            ("vllm:kv_cache_usage_perc", {"pod": "qwen-0"}, 0.88),
+            ("vllm:num_requests_running", {"pod": "qwen-1"}, 4),
+            ("vllm:num_requests_waiting", {"pod": "qwen-1"}, 2),
+            ("vllm:kv_cache_usage_perc", {"pod": "qwen-1"}, 0.94),
+        ]))
+        self.assertEqual(load["scope"], "prometheus")
+        self.assertEqual(load["running"], 9)          # Pod 별 합
+        self.assertEqual(load["waiting"], 5)
+        self.assertEqual(load["kv_cache_pct"], 94.0)  # 최댓값
+        self.assertEqual(load["kv_cache_avg_pct"], 91.0)
+        self.assertEqual(load["pods_sampled"], 2)
+        self.assertEqual(load["state"], "saturated")
+        self.assertIn("lookback_delta=2m", seen["url"])   # stale 샘플 차단
+
+    def test_empty_result_is_unknown_not_zero(self):
+        # 스크레이프가 멈췄으면 옛날 값을 '지금'으로 보여주면 안 된다
+        load, _ = self._run(self._vector([]))
+        self.assertEqual(load["state"], "unknown")
+        self.assertIsNone(load["running"])
+        self.assertIn("샘플 없음", load["error"])
+
+    def test_prometheus_down_is_unknown_with_reason(self):
+        load, _ = self._run(None)
+        self.assertEqual(load["state"], "unknown")
+        self.assertIn("503", load["error"])
+
+    def test_prometheus_error_status_surfaces(self):
+        load, _ = self._run({"status": "error", "errorType": "bad_data",
+                             "error": "invalid parameter"})
+        self.assertEqual(load["state"], "unknown")
+        self.assertIn("invalid parameter", load["error"])
+
+    def test_groups_by_instance_when_pod_label_missing(self):
+        load, _ = self._run(self._vector([
+            ("vllm:num_requests_running", {"instance": "10.0.0.1:8080"}, 2),
+            ("vllm:num_requests_running", {"instance": "10.0.0.2:8080"}, 3),
+        ]))
+        self.assertEqual(load["running"], 5)
+        self.assertEqual(load["pods_sampled"], 2)
+
+    def test_sglang_series_work_too(self):
+        load, _ = self._run(self._vector([
+            ("sglang:num_running_reqs", {"pod": "s-0", "tp_rank": "0"}, 6),
+            ("sglang:num_running_reqs", {"pod": "s-0", "tp_rank": "1"}, 6),  # 복제
+            ("sglang:num_queue_reqs", {"pod": "s-0", "tp_rank": "0"}, 0),
+            ("sglang:token_usage", {"pod": "s-0", "tp_rank": "0"}, 0.42),
+        ]))
+        self.assertEqual(load["engine"], "sglang")
+        self.assertEqual(load["running"], 6)      # tp_rank 복제는 접는다(12 아님)
+        self.assertEqual(load["kv_cache_pct"], 42.0)
+
+    def test_merge_only_replaces_when_sample_is_better(self):
+        direct = {"a": {"pods_sampled": 3, "state": "ok", "scope": "pods"},
+                  "b": {"pods_sampled": 0, "state": "unknown", "scope": "pods"}}
+        prom = {"a": {"pods_sampled": 1, "state": "idle", "scope": "prometheus"},
+                "b": {"pods_sampled": 2, "state": "busy", "scope": "prometheus"}}
+        out = m.merge_load_sources(direct, prom)
+        self.assertEqual(out["a"]["scope"], "pods")        # 직접 3개 > prom 1개
+        self.assertEqual(out["b"]["scope"], "prometheus")  # 0개 -> 2개로 보강
+
+
 class TestLoadTargets(unittest.TestCase):
     def test_pods_preferred_over_lb(self):
         deps = [{"model_name": "A", "api_base": "http://a.ns.svc:8080/v1",

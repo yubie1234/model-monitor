@@ -64,6 +64,11 @@ The core pipeline is `build_snapshot(settings)` → a single `snap` dict consume
    `gpu_cache_usage_perc` 가 둘 다 있으면 2배가 된다), (c) `tp_rank`/`pp_rank`/`moe_ep_rank` 는
    같은 상태의 복제 보고라 그룹 안에서 max 로 접고 `dp_rank`·`engine` 만 합산한다(TP=4 에서
    4배 부풀림 방지). 아는 게이지가 하나도 없으면 엔진을 추측하지 않고 `unknown`.
+   **Prometheus 폴백**(`--prometheus-url`): Pod 직접 조회가 막힌 환경에서 같은 게이지를
+   `/api/v1/query` 로 읽는다. 직접 조회가 우선이고 실패·부분 표본인 Service 만 보강하되
+   `merge_load_sources` 가 **표본이 더 많을 때만** 교체한다(폴백이 값을 더 나쁘게 만들지 않게).
+   `lookback_delta` 로 stale 샘플을 차단한다 — 없으면 스크레이프가 멈춘 몇 분 전 값이 "지금
+   부하"로 둔갑한다. 집계는 `live_from_metrics` 로 직접 조회와 같은 코드를 공유한다.
 
 4. **누적 사용량** (`collect_usage` + `attach_usage_to_deployments`) — 모델별 요청 수/토큰. **기본 OFF**
    (`--usage` 로 켬) — "지금 바쁜가"와 다른 축이고 LiteLLM DB 가 있어야 한다. LiteLLM 은 버전마다

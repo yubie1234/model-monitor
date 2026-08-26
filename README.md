@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.3.0**
+**버전: v0.4.0**
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 모니터. 터미널(TUI)과 웹 대시보드(`--serve`)를 모두 제공합니다.
 
@@ -223,6 +223,9 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 | `--no-load` | 현재 부하(엔진 게이지) 수집 끄기 |
 | `--load-timeout N` | Pod `/metrics` 조회 타임아웃(초, 기본 3) |
 | `--load-threads N` | Pod `/metrics` 동시 조회 수(기본 12) |
+| `--prometheus-url URL` | Pod 조회 실패 시 대신 읽을 Prometheus (`PROMETHEUS_URL` 환경변수도 가능) |
+| `--prometheus-first` | Pod 직접 조회를 건너뛰고 Prometheus 만 사용 |
+| `--prometheus-lookback` | Prometheus 조회 구간(기본 `2m`) |
 | `--sort load\|name` | 터미널 표 정렬 (기본 `load` = 바쁜 순) |
 | `--usage` | 누적 요청 수/토큰 열 추가 (LiteLLM DB 필요) |
 | `--usage-window N` | 누적 집계 구간(시간, 기본 24) |
@@ -283,11 +286,38 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 | 200 인데 엔진 게이지 없음 | `? no gauge` | 전부 `?` | `0/1` |
 | **일부 Pod 만 응답** | `BUSY 대기 2건 (1/3 Pod)` | 응답한 Pod 합계 | `1/3` |
 | Pod 주소 미확인 | 정상 표시 | LB 응답 1개 값 | `LB` |
+| Prometheus 폴백으로 채움 | 정상 표시 | Prometheus 값 | `PROM` |
 
 - **타임아웃과 연결 거부를 구분**합니다. 타임아웃은 "엔진이 너무 바빠서 `/metrics` 조차 못
   돌려주는 중"일 수 있어 뜻이 다릅니다(연결 거부는 죽었거나 막힌 것).
 - **부분 표본이면 등급 옆에 `(1/3 Pod)` 를 적고 색을 낮춥니다.** 3개 중 1개만 답했는데 숫자만
   보여주면 확정된 값처럼 보이기 때문입니다. 상단 배너로도 과소 집계 가능성을 경고합니다.
+#### Prometheus 폴백 (`--prometheus-url`)
+
+Pod 직접 조회가 막힌 환경(NetworkPolicy, mTLS, 메트릭 비활성)에서 **이미 Prometheus 가 같은
+엔진 게이지를 수집 중이라면** 그걸 대신 읽습니다. 출처가 같으므로 값의 정확도는 동일하고,
+대신 스크레이프 주기만큼(보통 15~30초) 늦습니다. 이 행은 `PODS` 열에 **`PROM`** 으로 표시됩니다.
+
+```bash
+# 직접 조회 -> 실패한 Service 만 Prometheus 로 보강
+python3 model_monitor.py --config config.yaml --prometheus-url http://prometheus.monitoring.svc:9090
+
+# Pod 접근이 아예 막힌 환경: 매번 타임아웃을 기다리지 않고 Prometheus 만 사용
+python3 model_monitor.py --config config.yaml --prometheus-url http://prometheus:9090 --prometheus-first
+```
+
+동작 규칙:
+
+- **직접 조회가 우선**입니다(더 신선함). 실패했거나 표본이 빠진 Service 만 Prometheus 로 채웁니다.
+- **표본이 더 많을 때만 교체합니다.** Pod 3개를 직접 읽었는데 Prometheus 가 1개만 알고 있으면
+  직접 읽은 값을 유지합니다 — 폴백이 원래 값을 더 나쁘게 만들면 안 됩니다.
+- **`lookback_delta=2m`** 으로 조회 구간을 좁힙니다(Prometheus 기본 5분). 스크레이프가 멈췄는데
+  몇 분 전 값이 "지금 부하"로 둔갑하는 걸 막습니다. 그 구간에 샘플이 없으면 `?` 입니다.
+  `--prometheus-lookback` 으로 조정하세요(스크레이프 주기의 2~4배 권장).
+- 쿼리는 `namespace` + `pod` 라벨로 좁힙니다(Pod 이름을 모르면 `service`). 라벨 이름이 다르면
+  config 의 `prometheus.labels` 로 바꿉니다. 집계는 직접 조회와 **완전히 같은 코드**를 씁니다
+  (Pod 별 합, KV 는 최댓값, tp_rank 복제는 접기).
+
 - 부하를 못 읽어도 **STATUS(UP/DOWN)와 backend Pod 수는 그대로 나옵니다** — 서로 다른 소스라서
   하나가 죽어도 나머지는 살아 있습니다(`/health` + k8s).
 
