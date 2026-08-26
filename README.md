@@ -79,6 +79,27 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 - Pod IP 로 직접 접속하므로 **모니터 Pod → 백엔드 Pod 네트워크가 열려 있어야** 합니다.
   (RBAC 은 기존 `endpointslices` 읽기 권한 그대로면 됩니다.)
 
+### 이 조회가 백엔드에 주는 부하
+
+측정값 (모델 10개 · Service 10개 · Pod 30개 · loopback 기준):
+
+| 항목 | 갱신 1회 | 5초 주기 환산 |
+|------|---------|--------------|
+| Pod `/metrics` | Pod 당 1회 (≈15 KB) | **Pod 당 0.2 req/s**, 전체 ≈87 KB/s |
+| k8s API | 30회 (Service 당 3: ISVC·EndpointSlice·Deployment) | 6 req/s |
+| LiteLLM | 3회 (`/model_group/info`·`/model/info`·`/v1/models`) | 0.6 req/s |
+| 모니터 CPU | 파싱 0.26 ms/scrape, fan-out 45 ms/라운드 | 1코어의 ≈0.2% |
+
+`/metrics` 는 엔진이 메모리에 들고 있는 카운터를 텍스트로 뽑는 것이라 **GPU·추론 배치와는
+무관**합니다. 다만 vLLM 의 API 서버와 같은 이벤트 루프에서 처리되므로, **모델이 바쁠 때는
+scrape 응답도 같이 느려집니다**(그래서 타임아웃이 짧고, 실패는 0 이 아니라 `?`로 표시).
+
+- Pod 가 많으면 `--interval` 을 10~15초로 올리는 게 가장 효과적입니다(모든 비용이 주기에 반비례).
+- 응답 없는 Pod 가 섞이면 한 라운드 최악 시간 = `ceil(Pod수 / --load-threads) × --load-timeout`
+  입니다. Pod 100개 규모면 `--load-threads 32` 정도로 올리세요.
+- 이미 Prometheus 가 vLLM 을 스크레이프 중이라면 **같은 출처**입니다. 이 도구는 스크레이퍼가
+  하나 더 붙는 셈이고, 대신 Prometheus 없이도 즉시 동작합니다.
+
 터미널 표는 **바쁜 순으로 정렬**됩니다(`--sort name` 으로 이름순 고정). 웹은 헤더의 `load` 필터로
 바쁜 모델만 골라볼 수 있고, `sort` 를 이름순으로 바꿀 수 있습니다.
 
@@ -174,6 +195,7 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 | `--no-backend-count` | LB 뒤 backend Pod 개수 수집 끄기 |
 | `--no-load` | 현재 부하(엔진 게이지) 수집 끄기 |
 | `--load-timeout N` | Pod `/metrics` 조회 타임아웃(초, 기본 3) |
+| `--load-threads N` | Pod `/metrics` 동시 조회 수(기본 12) |
 | `--sort load\|name` | 터미널 표 정렬 (기본 `load` = 바쁜 순) |
 | `--usage` | 누적 요청 수/토큰 열 추가 (LiteLLM DB 필요) |
 | `--usage-window N` | 누적 집계 구간(시간, 기본 24) |

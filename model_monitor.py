@@ -150,6 +150,10 @@ def resolve_settings(args):
         "load_timeout": float(getattr(args, "load_timeout", None)
                               or ld.get("timeout") or 3.0),
         "load_thresholds": ld.get("thresholds") or {},
+        # 동시 scrape 수. Pod 가 많고 응답 없는 Pod 가 섞이면(타임아웃 대기) 한 라운드가
+        # 길어지므로 Pod 수에 맞춰 올린다. 한 라운드 최악 = ceil(Pod수/threads) * timeout.
+        "load_threads": int(getattr(args, "load_threads", None)
+                            or ld.get("threads") or 12),
         "sort": getattr(args, "sort", "load"),
         # --- 누적 사용량(요청 수/토큰): opt-in ---
         #  "지금 부하"와는 다른 축이고 LiteLLM DB 가 있어야 나온다 -> 기본 off.
@@ -1353,6 +1357,7 @@ def build_snapshot(settings, with_health=True):
         try:
             targets = load_targets(deps)
             loads = collect_load(targets, settings.get("load_timeout", 3.0),
+                                 max_threads=settings.get("load_threads", 12),
                                  thresholds=settings.get("load_thresholds"))
             snap["load_enabled"] = True
             snap["litellm"]["deployments"] = attach_load_to_deployments(deps, loads)
@@ -2856,6 +2861,8 @@ def main():
                    help="현재 부하(백엔드 엔진 게이지) 수집 안 함")
     p.add_argument("--load-timeout", type=float,
                    help="Pod /metrics 조회 타임아웃(초, 기본 3)")
+    p.add_argument("--load-threads", type=int,
+                   help="Pod /metrics 동시 조회 수(기본 12 — Pod 많으면 올리기)")
     p.add_argument("--sort", choices=("load", "name"), default="load",
                    help="터미널 표 정렬: load(바쁜 순, 기본) | name")
     p.add_argument("--usage", action="store_true",

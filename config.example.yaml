@@ -24,6 +24,7 @@ backends:
 load:
   enabled: true
   timeout: 3           # Pod /metrics 조회 타임아웃(초). 죽은 Pod 가 갱신을 막지 않게 짧게.
+  threads: 12          # 동시 scrape 수. 한 라운드 최악 = ceil(Pod수/threads) * timeout.
   thresholds:          # 부하 등급 판정 기준
     queue_busy: 1      # 대기 요청이 1개라도 있으면 BUSY (이미 밀리는 중)
     queue_saturated: 5 # 큐가 이만큼 쌓이면 FULL
