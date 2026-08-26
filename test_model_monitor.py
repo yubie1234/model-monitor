@@ -632,6 +632,57 @@ class TestAggregatePodLoads(unittest.TestCase):
         self.assertEqual(m.classify_load(agg)[0], "unknown")
 
 
+class TestMetricsFailureDisplay(unittest.TestCase):
+    """/metrics 를 못 읽었을 때 화면이 거짓말하지 않는지."""
+
+    def _cell(self, samples, scope="pods"):
+        agg = m.aggregate_pod_loads(samples, scope)
+        agg["state"], agg["state_reason"] = m.classify_load(agg)
+        return m._plain(m._fmt_load({"load": agg})), agg
+
+    def test_timeout_and_refused_are_distinguished(self):
+        # 타임아웃 = 엔진이 바빠서 못 돌려주는 중일 수 있다. 연결 거부 = 죽었거나 막힘.
+        self.assertEqual(m._short_reason("connection error: timed out"), "timeout")
+        self.assertEqual(
+            m._short_reason("connection error: [Errno 111] Connection refused"),
+            "unreachable")
+        self.assertEqual(m._short_reason("엔진 게이지 없음 — ..."), "no gauge")
+
+    def test_all_pods_failed_is_unknown_never_zero(self):
+        cell, agg = self._cell([{"url": "a", "error": "connection error: refused"},
+                                {"url": "b", "error": "connection error: refused"}])
+        self.assertEqual(agg["state"], "unknown")
+        self.assertIsNone(agg["running"])      # 0 이 아니라 모름
+        self.assertIsNone(agg["waiting"])
+        self.assertIn("?", cell)
+
+    def test_partial_sample_is_marked_in_the_cell(self):
+        # 3개 중 1개만 응답했는데 숫자만 보여주면 확정된 값처럼 보인다
+        cell, agg = self._cell([
+            {"url": "a", "engine": "vllm", "running": 4, "waiting": 2,
+             "kv_cache_pct": 88.0},
+            {"url": "b", "error": "connection error: timed out"},
+            {"url": "c", "error": "connection error: timed out"}])
+        self.assertEqual(agg["pods_sampled"], 1)
+        self.assertEqual(agg["pods_failed"], 2)
+        self.assertIn("1/3 Pod", cell)         # 근거를 셀 안에 드러낸다
+        self.assertIn("BUSY", cell)
+
+    def test_full_sample_has_no_partial_marker(self):
+        cell, _ = self._cell([{"url": "a", "engine": "vllm", "running": 1,
+                               "waiting": 0, "kv_cache_pct": 10.0}])
+        self.assertNotIn("Pod)", cell)
+
+    def test_summary_surfaces_failed_pod_count(self):
+        ll = {"groups": [], "health": None, "deployments": [
+            {"model_name": "A", "api_base": "http://a/v1", "load": {
+                "state": "busy", "state_reason": "대기 2건", "running": 4,
+                "waiting": 2, "kv_cache_pct": 88.0, "pods_sampled": 1,
+                "pods_failed": 2, "per_pod": [{"url": "http://a"}]}}]}
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertEqual(s["pods_failed"], 2)   # 카드/배너가 과소 집계를 경고할 근거
+
+
 class TestLoadTargets(unittest.TestCase):
     def test_pods_preferred_over_lb(self):
         deps = [{"model_name": "A", "api_base": "http://a.ns.svc:8080/v1",

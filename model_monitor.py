@@ -1673,15 +1673,30 @@ _LOAD_LABEL = {"saturated": ("FULL", "red"), "busy": ("BUSY", "yellow"),
 
 
 def _short_reason(reason):
-    """긴 에러 문자열을 표에 넣을 짧은 사유로. 원문은 JSON/웹 툴팁에 남는다."""
+    """긴 에러 문자열을 표에 넣을 짧은 사유로. 원문은 JSON/웹 툴팁에 남는다.
+
+    타임아웃과 연결 거부를 구분한다 — 타임아웃은 "엔진이 너무 바빠서 /metrics 도
+    못 돌려주는 중"일 수 있어서 연결 거부(죽었거나 막힘)와 뜻이 다르다.
+    """
     r = (reason or "").lower()
-    if "connection" in r or "timed out" in r or "timeout" in r:
+    if "timed out" in r or "timeout" in r:
+        return "timeout"
+    if "connection" in r or "refused" in r or "unreachable" in r:
         return "unreachable"
     if "게이지" in r or "metric" in r:
         return "no gauge"
     if "http 4" in r or "http 5" in r:
         return r.split()[0] + " " + r.split()[1] if len(r.split()) > 1 else "http err"
     return (reason or "?")[:14]
+
+
+def _partial_note(load):
+    """일부 Pod 만 응답했으면 그 사실을 등급 옆에 붙인다 — 숫자의 근거를 숨기지 않는다."""
+    bad = (load or {}).get("pods_failed") or 0
+    if not bad:
+        return ""
+    ok = load.get("pods_sampled") or 0
+    return " (%d/%d Pod)" % (ok, ok + bad)
 
 
 def _fmt_load(d):
@@ -1693,7 +1708,11 @@ def _fmt_load(d):
     label, color = _LOAD_LABEL.get(state, ("?", "dim"))
     if state == "unknown":
         return c("? %s" % _short_reason(load.get("state_reason")), "dim")
-    return "%s %s" % (c(label, color), c(load.get("state_reason") or "", "dim"))
+    note = _partial_note(load)
+    body = (load.get("state_reason") or "") + note
+    # 표본이 일부뿐이면 등급 자체도 확정이 아니다 -> 노란색으로 낮춰 표시
+    return "%s %s" % (c(label, "yellow" if note and color == "green" else color),
+                      c(body, "yellow" if note else "dim"))
 
 
 def _fmt_running(d):
@@ -2462,9 +2481,13 @@ function loadCell(d){
   let why = l.state_reason||"";
   if(l.state==="unknown"){                    // 긴 에러는 줄이고 원문은 툴팁으로
     const r=why.toLowerCase();
-    why = (r.includes("connection")||r.includes("timed out")) ? "연결 안 됨"
+    why = (r.includes("timed out")||r.includes("timeout")) ? "응답 없음(타임아웃)"
+        : (r.includes("connection")||r.includes("refused")) ? "연결 안 됨"
         : (r.includes("게이지")||r.includes("metric")) ? "게이지 없음" : why.slice(0,28);
   }
+  const bad = l.pods_failed||0;
+  if(bad && l.pods_sampled)                   // 부분 표본이면 근거를 같이 적는다
+    why += " ("+l.pods_sampled+"/"+(l.pods_sampled+bad)+" Pod)";
   const tip = (l.state==="unknown" && l.state_reason ? l.state_reason+"\n" : "")+podTip(l);
   return '<div class="load" title="'+esc(tip)+'">'
     +'<span class="lv '+cls+'">'+label+'</span>'

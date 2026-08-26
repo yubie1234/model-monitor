@@ -272,6 +272,25 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
   **LiteLLM 에 DB 가 안 붙어 있는 것**(`Database not connected`)이고, 그 다음이 버전 차이로 경로가
   없는 경우입니다. 표 아래에 시도한 엔드포인트와 사유가 그대로 나옵니다.
   `--json` 의 `usage.errors` 에서도 확인할 수 있습니다.
+### 못 읽었을 때 무엇을 보여주나
+
+수집 실패는 **0 이 아니라 `?`** 입니다. 상황별로 다르게 표시합니다:
+
+| 상황 | LOAD | 숫자 | 표본(PODS) |
+|------|------|------|-----------|
+| Pod 연결 거부 (죽음·NetworkPolicy) | `? unreachable` | 전부 `?` | `0/2` |
+| **응답 타임아웃** | `? timeout` | 전부 `?` | `0/1` |
+| 200 인데 엔진 게이지 없음 | `? no gauge` | 전부 `?` | `0/1` |
+| **일부 Pod 만 응답** | `BUSY 대기 2건 (1/3 Pod)` | 응답한 Pod 합계 | `1/3` |
+| Pod 주소 미확인 | 정상 표시 | LB 응답 1개 값 | `LB` |
+
+- **타임아웃과 연결 거부를 구분**합니다. 타임아웃은 "엔진이 너무 바빠서 `/metrics` 조차 못
+  돌려주는 중"일 수 있어 뜻이 다릅니다(연결 거부는 죽었거나 막힌 것).
+- **부분 표본이면 등급 옆에 `(1/3 Pod)` 를 적고 색을 낮춥니다.** 3개 중 1개만 답했는데 숫자만
+  보여주면 확정된 값처럼 보이기 때문입니다. 상단 배너로도 과소 집계 가능성을 경고합니다.
+- 부하를 못 읽어도 **STATUS(UP/DOWN)와 backend Pod 수는 그대로 나옵니다** — 서로 다른 소스라서
+  하나가 죽어도 나머지는 살아 있습니다(`/health` + k8s).
+
 - **LOAD 가 `?`**: 백엔드 `/metrics` 를 못 읽은 경우입니다 — 엔진이 메트릭을 끄고 떴거나, Pod IP 로
   가는 네트워크가 막혔거나, 포트가 다릅니다. vLLM 은 `vllm:num_requests_running` /
   `vllm:gpu_cache_usage_perc`, SGLang 은 `sglang:num_running_reqs` / `sglang:token_usage` 를 읽습니다.
