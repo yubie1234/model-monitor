@@ -4,6 +4,11 @@
     "api_key": "sk-1234"
   },
   "probe_backends": true,
+  "probe_metrics": false,
+  "usage": {
+    "enabled": true,
+    "window_hours": 24
+  },
   "backends": [
     {
       "name": "llama-3.1-8b",

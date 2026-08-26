@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v0.1.3**
+**버전: v0.2.0**
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 모니터. 터미널(TUI)과 웹 대시보드(`--serve`)를 모두 제공합니다.
 
@@ -17,6 +17,9 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 | running(healthy) / unhealthy | LiteLLM `GET /health` (api_base 기준으로 위 매핑과 join) |
 | **LB 뒤 backend Pod 개수 (ready/desired)** | Kubernetes API (EndpointSlice / Knative PodAutoscaler / Deployment) |
 | OpenAI 호환 모델 이름 목록 | LiteLLM `GET /v1/models` (이름만, **api_base 없음**) |
+| **모델별 요청 수 / 토큰 / 분당 요청(rpm)** | LiteLLM 분석 엔드포인트 (`GET /global/activity/model` → `/global/daily/activity` → `/model/metrics` 순으로 시도) |
+| **rpm/tpm 한도 대비 사용률** | 위 사용량 ÷ `GET /model_group/info` 의 `rpm`·`tpm` |
+| **현재 실행/대기 요청, KV 캐시 사용률** (옵션) | 백엔드 `GET /metrics` (vLLM/SGLang Prometheus 게이지, `--probe-metrics`) |
 | backends up (옵션) | 각 백엔드 `GET /v1/models`, `/health` 직접 probe |
 
 > 주의: `/v1/models` 는 OpenAI 호환 스펙이라 `id`(model_name)만 줍니다. **api_base 는 `/model/info` 에서** 나옵니다.
@@ -37,6 +40,33 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 
 > in-cluster 에서 ServiceAccount 토큰이 있으면 **자동으로 켜집니다**(`--no-backend-count` 로 끔).
 > 필요한 RBAC 는 [deploy/k8s.yaml](deploy/k8s.yaml) 의 ClusterRole 참고 — 최소한 `endpointslices` 읽기.
+
+## 모델별 사용량 (요청 수 · 사용률)
+
+두 가지 다른 질문에 각각 다른 소스로 답합니다 — **둘을 섞지 않습니다.**
+
+| 보이는 값 | 뜻 | 출처 |
+|-----------|----|------|
+| `REQ (24h)` | 집계 구간 누적 **요청 수**(+툴팁에 토큰 수) | LiteLLM 분석 엔드포인트 |
+| `RPM` | 그 구간의 **분당 평균 요청 수**. `rpm` 한도가 설정돼 있으면 한도 대비 **사용률 %** 와 막대 | 위 값 ÷ 구간 길이, 한도는 `/model_group/info` |
+| `IN-FLIGHT` | **지금** 처리 중인 요청 수(+대기 큐) | 백엔드 `/metrics` (`--probe-metrics`) |
+| `KV CACHE` | **지금** GPU KV 캐시가 얼마나 찼는지(%) = 실질 포화도 | 백엔드 `/metrics` (`--probe-metrics`) |
+
+- **누적(LiteLLM) 과 실시간(엔진 게이지)은 다른 것**입니다. LiteLLM 은 "지난 24시간에 몇 번 불렸나"만
+  알고, "지금 몇 개가 물려 있나"는 vLLM/SGLang 이 직접 노출하는 게이지에서만 나옵니다.
+- LiteLLM 은 버전마다 분석 엔드포인트가 달라져서, 후보를 **우선순위로 시도하고 처음 데이터가 나온
+  응답만** 씁니다(`usage.source` 에 어떤 엔드포인트였는지 기록). 전부 실패하면 요청 수 열 자체가
+  사라지고 사유가 표시됩니다 — **추정값을 채우지 않습니다.**
+- 사용량은 **`model_name`(그룹) 단위**라 같은 이름의 deployment 가 여러 개면 각 행에 같은 값이 붙습니다.
+  카드/합계는 행을 더하지 않고 집계 원본(`usage.totals`)을 씁니다(중복 합산 방지 — 테스트로 고정).
+- `--probe-metrics` 의 `/metrics` 요청은 `api_base`(=LB)로 나가므로 **뒤에 있는 Pod 중 하나**의 값입니다.
+  Pod 별 정확한 값이 필요하면 Prometheus/ServiceMonitor 로 봐야 합니다(툴팁에도 표기).
+- 끄기: `--no-usage` (분석 엔드포인트 호출 안 함). 집계 구간 변경: `--usage-window 6` (시간 단위).
+
+```bash
+# 최근 6시간 사용량 + 현재 부하까지
+python3 model_monitor.py --config config.yaml --usage-window 6 --probe-metrics --watch
+```
 
 ## 사용법
 
@@ -99,6 +129,9 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
 | `--timeout N` | HTTP 타임아웃(초, 기본 10) |
 | `--demo` | 샘플 데이터로 미리보기 |
 | `--no-backend-count` | LB 뒤 backend Pod 개수 수집 끄기 |
+| `--no-usage` | 모델별 사용량(요청 수/토큰) 수집 끄기 |
+| `--usage-window N` | 사용량 집계 구간(시간, 기본 24) |
+| `--probe-metrics` | 백엔드 `/metrics` 를 읽어 현재 실행/대기 요청·KV 캐시 사용률 표시 |
 | `--health-timeout N` | LiteLLM `/health` 타임아웃(초, 기본 90 — 모델 많으면 늘리기) |
 | `--no-health` | `/health` 호출 안 함 (status 는 k8s backend readiness 로만 판정) |
 | `--k8s-api-server` / `--k8s-token-file` / `--k8s-ca-file` | k8s 접근 오버라이드 |
@@ -141,6 +174,12 @@ CLI 인자 > 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`) > config 파일
   `/health` 가 도착하면 보강합니다. 그래도 부족하면 `--health-timeout`(기본 90s)을 늘리거나,
   k8s readiness 만으로 충분하면 `--no-health` 로 끄세요. (KServe 모델은 `/health` 없이도 backend
   Pod 가 ready 면 UP 으로 표시됩니다. 단 외부 IP 백엔드는 `/health` 가 있어야 status 가 나옵니다.)
+- **REQ/RPM 열이 안 보임**: LiteLLM 분석 엔드포인트가 전부 실패한 경우입니다(구버전이라 경로가 없거나,
+  admin 권한이 아니거나, 로그 DB 가 꺼져 있음). 표 아래에 시도한 엔드포인트와 사유가 나옵니다.
+  `--json` 의 `usage.errors` 에서도 확인할 수 있습니다.
+- **IN-FLIGHT/KV 가 `?`**: 백엔드 `/metrics` 가 없거나(엔진 옵션), 다른 포트로 떠 있거나, 라우팅이
+  막힌 경우입니다. vLLM 은 `vllm:num_requests_running`, SGLang 은 `sglang:num_running_reqs` 게이지를
+  읽습니다.
 - **backend 가 `?`(원인 보기)**: 셀에 마우스를 올리면 `k8s_error`(예: `deployments(label): no match`,
   `knative: HTTP 403`)가 뜹니다. RBAC([deploy/k8s.yaml](deploy/k8s.yaml) ClusterRole)나 라벨/네임스페이스를 점검하세요.
 - 웹 수집은 백그라운드 스레드에서 주기적으로 돌고 HTTP 는 마지막 스냅샷을 즉시 반환합니다

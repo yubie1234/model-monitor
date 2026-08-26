@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Default constraint: zero third-party dependencies — Python 3.6+ standard library only.** The whole point is that `model_monitor.py` runs on an air-gapped node with no `pip install`. Default to stdlib imports (`http.server`, `urllib`, `ssl`, `json`, `argparse`, `threading`, etc.). PyYAML is used *only if already present* (config loading degrades to JSON otherwise) — never make it a hard requirement. **If a task genuinely needs an external package, do not add it silently — ask the user first** and confirm it's acceptable given the air-gapped deployment target before introducing the dependency.
 
-Almost all code lives in **`model_monitor.py`** (~1650 lines). There is no package structure.
+Almost all code lives in **`model_monitor.py`** (~2450 lines). There is no package structure.
 
 ## Commands
 
@@ -51,9 +51,17 @@ The core pipeline is `build_snapshot(settings)` → a single `snap` dict consume
 
    `parse_api_base` turns an `api_base` URL into `(namespace, service)`; IPs/public domains classify as `external` and short-circuit (no k8s calls). A `(ns, svc)` cache dedupes k8s lookups across deployments sharing a Service. The k8s client auto-enables in-cluster via the ServiceAccount token (`--no-backend-count` disables).
 
-3. **`merge_deployments_with_health`** joins `/model/info` (api_base) with `/health` (status) by api_base. When `/health` is missing/timed out, status falls back to k8s backend readiness (`backends_ready > 0` → UP, `scale_to_zero` → `?`). Deployments are sorted by name so output order is stable across LiteLLM responses.
+3. **사용량** (`collect_usage` + `attach_usage_to_deployments`) — 모델별 요청 수/토큰. LiteLLM 은 버전마다
+   분석 엔드포인트가 달라서 후보(`/global/activity/model` → `/global/daily/activity` → `/model/metrics`)를
+   **우선순위로 시도하고 처음 데이터가 나온 응답만** 정규화한다(`usage["source"]` 에 기록). 전부 실패하면
+   비워 두고 UI 에서 열이 사라진다 — backend 개수와 같은 원칙으로 **추정값을 넣지 않는다**. 사용량은
+   `model_name`(그룹) 단위라 합계는 반드시 `usage["totals"]` 를 쓴다(행을 더하면 replica 만큼 중복 — 테스트로 고정).
+   `--probe-metrics` 를 켜면 백엔드 `/metrics`(vLLM/SGLang Prometheus 게이지)에서 현재 실행/대기 요청과
+   KV 캐시 사용률을 읽어 붙인다(LB 경유라 Pod 1개 샘플이라는 점을 UI 에 표기).
 
-4. **`summarize`** computes the headline counts. Invariant covered by tests: the dashboard cards (`deployments_healthy`/`unhealthy`) must always equal the UP/DOWN rows in the table, even when `/health` times out.
+4. **`merge_deployments_with_health`** joins `/model/info` (api_base) with `/health` (status) by api_base. When `/health` is missing/timed out, status falls back to k8s backend readiness (`backends_ready > 0` → UP, `scale_to_zero` → `?`). Deployments are sorted by name so output order is stable across LiteLLM responses.
+
+5. **`summarize`** computes the headline counts. Invariant covered by tests: the dashboard cards (`deployments_healthy`/`unhealthy`) must always equal the UP/DOWN rows in the table, even when `/health` times out.
 
 ### Web dashboard threading
 `--serve` does **not** collect on the request path. A background `refresh_loop` rebuilds the snapshot on an interval and `/health` is collected in a *separate* `health_loop` thread (because it's slow), then injected. HTTP handlers return the last cached snapshot immediately — no request ever blocks on collection. Endpoints: `/` (HTML), `/api/snapshot` (live JSON), `/snapshot.json` (download), `/snapshot.html` (self-contained frozen page).

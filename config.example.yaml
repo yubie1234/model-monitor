@@ -17,6 +17,18 @@ backends:
     type: sglang
     # api_key: "..."   # 백엔드가 키를 요구하면
 
+# --- 모델별 사용량(요청 수/토큰/사용률) ---
+# LiteLLM 분석 엔드포인트(/global/activity/model 등)를 우선순위로 시도한다.
+# 실패하면 요청 수 열이 빠질 뿐 나머지 수집은 그대로 동작한다. 끄려면 --no-usage.
+usage:
+  enabled: true
+  window_hours: 24     # 집계 구간(시간). --usage-window 로 덮어쓸 수 있다.
+
+# 백엔드 /metrics(Prometheus)를 직접 읽어 "지금" 실행/대기 중인 요청과
+# KV 캐시 사용률을 표시 (vLLM/SGLang 게이지). 실행 시 --probe-metrics 와 동일.
+# 주의: api_base 는 LB 라서 응답은 뒤에 있는 Pod 중 하나의 값이다.
+probe_metrics: false
+
 # --- LB(api_base) 뒤의 실제 backend Pod 개수 수집 ---
 # 기본은 auto: in-cluster ServiceAccount 토큰이 있으면 자동으로 켜짐.
 # 끄려면 실행 시 --no-backend-count.

@@ -8,7 +8,9 @@ model_monitor.py — LiteLLM -> KServe -> vLLM/SGLang 백엔드에서 실제로 
       * LiteLLM gateway:  GET /model_group/info  (등록된 모델 그룹)
                           GET /health             (백엔드 실제 health = "떠 있음"의 근거)
                           GET /v1/models          (OpenAI 호환 모델 목록)
+                          GET /global/activity/model 등 (모델별 요청 수/토큰 = 사용량)
       * (옵션) 백엔드 직접 probe: 각 vLLM/SGLang 엔드포인트의 GET /v1/models, /health
+      * (옵션) 백엔드 GET /metrics: 현재 실행/대기 요청, KV 캐시 사용률(--probe-metrics)
   - 출력: 1회 스냅샷 / --json / --watch(실시간) 지원
   - --demo: 라이브 엔드포인트 없이 샘플 데이터로 출력 미리보기
 
@@ -27,29 +29,25 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
 # ----------------------------------------------------------------------------
 
 
-def http_get_json(url, api_key=None, timeout=10):
-    """GET url -> (ok: bool, data: dict|list|None, error: str|None)."""
-    headers = {"Accept": "application/json"}
+def http_get_text(url, api_key=None, timeout=10, accept="application/json"):
+    """GET url -> (ok: bool, text: str|None, error: str|None). 본문을 그대로 반환."""
+    headers = {"Accept": accept}
     if api_key:
         headers["Authorization"] = "Bearer %s" % api_key
         headers["x-api-key"] = api_key  # LiteLLM accepts either
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-            try:
-                return True, json.loads(raw), None
-            except ValueError:
-                return False, None, "non-JSON response: %s" % raw[:200]
+            return True, resp.read().decode("utf-8", "replace"), None
     except urllib.error.HTTPError as e:
         body = ""
         try:
@@ -61,6 +59,17 @@ def http_get_json(url, api_key=None, timeout=10):
         return False, None, "connection error: %s" % e.reason
     except Exception as e:  # noqa: BLE001
         return False, None, "%s: %s" % (type(e).__name__, e)
+
+
+def http_get_json(url, api_key=None, timeout=10):
+    """GET url -> (ok: bool, data: dict|list|None, error: str|None)."""
+    ok, raw, err = http_get_text(url, api_key, timeout)
+    if not ok:
+        return False, None, err
+    try:
+        return True, json.loads(raw), None
+    except ValueError:
+        return False, None, "non-JSON response: %s" % raw[:200]
 
 
 # ----------------------------------------------------------------------------
@@ -92,6 +101,7 @@ def resolve_settings(args):
 
     litellm = cfg.get("litellm", {}) if isinstance(cfg.get("litellm"), dict) else {}
     bc = cfg.get("backend_count", {}) if isinstance(cfg.get("backend_count"), dict) else {}
+    ug = cfg.get("usage", {}) if isinstance(cfg.get("usage"), dict) else {}
 
     # backend 개수 수집(k8s API) 사용 여부:
     #   --no-backend-count 면 off, 기본은 auto(= in-cluster SA 토큰 있으면 자동 on)
@@ -130,6 +140,14 @@ def resolve_settings(args):
         "default_namespace": bc.get("default_namespace"),
         "namespace_overrides": bc.get("namespace_overrides", {}) or {},
         "activator_namespace": bc.get("activator_namespace", "knative-serving"),
+        # --- 사용량(요청 수/토큰/사용률) ---
+        #  LiteLLM 분석 엔드포인트 1~2회 호출. 권한/버전 문제로 실패해도 나머지는 그대로.
+        "usage": (not getattr(args, "no_usage", False)
+                  and ug.get("enabled", True)),
+        "usage_window": float(args.usage_window or ug.get("window_hours") or 24.0),
+        # 백엔드 /metrics(Prometheus) 직접 probe -> 현재 실행/대기 요청, KV 캐시 사용률
+        "probe_metrics": bool(getattr(args, "probe_metrics", False)
+                              or cfg.get("probe_metrics")),
     }
     return settings
 
@@ -291,6 +309,379 @@ def discover_backends(litellm_result):
         discovered[base] = {"name": model or base, "url": base, "type": btype}
     return list(discovered.values())
 
+
+# ----------------------------------------------------------------------------
+# 사용량: 모델별 요청 수 / 토큰 / 사용률
+#   LiteLLM 은 버전마다 분석(analytics) 엔드포인트가 달라진다(신설/폐기 반복).
+#   그래서 후보 엔드포인트를 우선순위로 시도하고, 처음으로 데이터가 나온 응답만
+#   정규화해서 쓴다. 전부 실패하면 usage 는 비어 있고 UI 는 '?' 로 표시한다
+#   — backend 개수와 같은 원칙으로 값을 지어내지 않는다.
+# ----------------------------------------------------------------------------
+
+# 같은 의미인데 버전마다 키 이름이 다른 필드들
+_USAGE_REQ_KEYS = ("api_requests", "total_requests", "sum_api_requests",
+                   "num_requests", "requests", "successful_requests")
+_USAGE_TOK_KEYS = ("total_tokens", "sum_total_tokens", "tokens")
+_USAGE_SPEND_KEYS = ("spend", "total_spend", "sum_spend")
+
+
+def _num(v):
+    """숫자로 해석되면 float, 아니면 None (bool 은 숫자로 보지 않는다)."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick_num(d, keys):
+    """dict 에서 후보 키들 중 처음으로 숫자인 값을 반환."""
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if k in d:
+            n = _num(d.get(k))
+            if n is not None:
+                return n
+    return None
+
+
+def _usage_acc(acc, name, requests=None, tokens=None, spend=None):
+    """모델별 누적기. 값이 없는(None) 항목은 건드리지 않는다."""
+    if not name:
+        return
+    row = acc.setdefault(str(name), {"requests": None, "tokens": None, "spend": None})
+    for key, val in (("requests", requests), ("tokens", tokens), ("spend", spend)):
+        if val is None:
+            continue
+        row[key] = (row[key] or 0) + val
+
+
+def _usage_from_activity_model(data):
+    """GET /global/activity/model -> [{model, total_requests, total_tokens, daily_data[]}]"""
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return {}
+    acc = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("model") or row.get("model_group")
+        if not name:
+            continue
+        req = _pick_num(row, _USAGE_REQ_KEYS)
+        tok = _pick_num(row, _USAGE_TOK_KEYS)
+        spend = _pick_num(row, _USAGE_SPEND_KEYS)
+        # 상단 합계가 없는 버전은 daily_data 를 직접 합산
+        if req is None and tok is None:
+            req_d = tok_d = None
+            for day in row.get("daily_data") or []:
+                if not isinstance(day, dict):
+                    continue
+                dr, dt = _pick_num(day, _USAGE_REQ_KEYS), _pick_num(day, _USAGE_TOK_KEYS)
+                if dr is not None:
+                    req_d = (req_d or 0) + dr
+                if dt is not None:
+                    tok_d = (tok_d or 0) + dt
+            req, tok = req if req is not None else req_d, tok if tok is not None else tok_d
+        _usage_acc(acc, name, req, tok, spend)
+    return acc
+
+
+def _usage_from_daily_activity(data):
+    """GET /global/daily/activity (신형) -> results[].breakdown.models{name: {metrics}}"""
+    results = data.get("results") if isinstance(data, dict) else None
+    if not isinstance(results, list):
+        return {}
+    acc = {}
+    for day in results:
+        models = ((day or {}).get("breakdown") or {}).get("models") or {}
+        if not isinstance(models, dict):
+            continue
+        for name, entry in models.items():
+            metrics = entry.get("metrics") if isinstance(entry, dict) else None
+            if not isinstance(metrics, dict):
+                metrics = entry if isinstance(entry, dict) else {}
+            _usage_acc(acc, name,
+                       _pick_num(metrics, _USAGE_REQ_KEYS),
+                       _pick_num(metrics, _USAGE_TOK_KEYS),
+                       _pick_num(metrics, _USAGE_SPEND_KEYS))
+    return acc
+
+
+def _usage_from_model_metrics(data):
+    """GET /model/metrics -> [{model, num_requests, ...}] (요청 수만 있는 경우가 많다)"""
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return {}
+    acc = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("model") or row.get("model_group") or row.get("model_name")
+        req = _pick_num(row, _USAGE_REQ_KEYS)
+        if not name or req is None:
+            continue
+        _usage_acc(acc, name, req, _pick_num(row, _USAGE_TOK_KEYS),
+                   _pick_num(row, _USAGE_SPEND_KEYS))
+    return acc
+
+
+def usage_candidates(now, window_hours):
+    """(path, parser, granularity) 후보 목록 — 앞에 있는 것부터 시도한다.
+
+    granularity="day" 인 소스는 날짜 단위라 실제로 커버하는 구간이 요청한
+    window 보다 넓다(그 날 00:00 부터). rate 계산 시 이를 반영한다.
+    """
+    start = now - timedelta(hours=window_hours)
+    d0, d1 = start.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")
+    t0, t1 = start.strftime("%Y-%m-%dT%H:%M:%S"), now.strftime("%Y-%m-%dT%H:%M:%S")
+    return [
+        ("/global/activity/model?start_date=%s&end_date=%s" % (d0, d1),
+         _usage_from_activity_model, "day"),
+        ("/global/daily/activity?start_date=%s&end_date=%s&page_size=1000" % (d0, d1),
+         _usage_from_daily_activity, "day"),
+        ("/model/metrics?startTime=%s&endTime=%s" % (t0, t1),
+         _usage_from_model_metrics, "exact"),
+    ]
+
+
+def collect_usage(url, api_key, timeout, window_hours=24.0, now=None):
+    """LiteLLM 분석 엔드포인트에서 모델별 요청 수/토큰/비용 수집 -> 정규화 dict.
+
+    반환: {"source": 성공한 엔드포인트|None, "window_hours", "window_minutes",
+           "models": {model_name: {requests, tokens, spend, requests_per_min,
+                                   tokens_per_min}},
+           "totals": {...}, "errors": [...]}
+    """
+    now = now or datetime.now()
+    start = now - timedelta(hours=window_hours)
+    base = url.rstrip("/")
+    out = {
+        "source": None,
+        "granularity": None,
+        "window_hours": window_hours,
+        "window_minutes": None,
+        "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "end": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "models": {},
+        "totals": {"requests": 0, "tokens": 0, "spend": 0.0,
+                   "requests_per_min": 0.0, "models_used": 0},
+        "errors": [],
+    }
+
+    models = {}
+    for path, parser, granularity in usage_candidates(now, window_hours):
+        ok, data, err = http_get_json(base + path, api_key, timeout)
+        if not ok:
+            out["errors"].append("%s: %s" % (path.split("?")[0], err))
+            continue
+        try:
+            parsed = parser(data)
+        except Exception as e:  # noqa: BLE001  (응답 형태가 예상 밖이어도 계속)
+            out["errors"].append("%s: parse %s: %s"
+                                 % (path.split("?")[0], type(e).__name__, e))
+            continue
+        if parsed:
+            models = parsed
+            out["source"] = path.split("?")[0]
+            out["granularity"] = granularity
+            break
+        out["errors"].append("%s: 데이터 없음" % path.split("?")[0])
+
+    # rate 기준 구간: 날짜 단위 소스는 그 날 00:00 부터 지금까지가 실제 커버 구간
+    if out["granularity"] == "day":
+        covered_start = datetime(start.year, start.month, start.day)
+    else:
+        covered_start = start
+    minutes = max(1.0, (now - covered_start).total_seconds() / 60.0)
+    out["window_minutes"] = round(minutes, 1)
+
+    for name, row in models.items():
+        req, tok = row.get("requests"), row.get("tokens")
+        row["requests_per_min"] = round(req / minutes, 3) if req is not None else None
+        row["tokens_per_min"] = round(tok / minutes, 1) if tok is not None else None
+        for key in ("requests", "tokens"):
+            if row.get(key) is not None:
+                row[key] = int(row[key])
+        out["totals"]["requests"] += row.get("requests") or 0
+        out["totals"]["tokens"] += row.get("tokens") or 0
+        out["totals"]["spend"] += row.get("spend") or 0.0
+        if (row.get("requests") or 0) > 0:
+            out["totals"]["models_used"] += 1
+    out["models"] = models
+    out["totals"]["requests_per_min"] = round(out["totals"]["requests"] / minutes, 3)
+    out["totals"]["spend"] = round(out["totals"]["spend"], 6)
+    return out
+
+
+def _usage_key(s):
+    return str(s or "").strip().lower()
+
+
+def attach_usage_to_deployments(ll, usage):
+    """usage(model_name 단위)를 deployment 행에 join + 한도 대비 사용률 계산.
+
+    주의: 사용량은 **model_name(그룹) 단위**라 같은 이름의 deployment 가 여러 개면
+    같은 값이 붙는다(행별로 쪼갤 근거가 없다). 합계는 반드시 usage["totals"] 를 쓴다.
+    """
+    deps = ll.get("deployments") or []
+    models = (usage or {}).get("models") or {}
+    if not models:
+        return deps
+
+    idx = {}
+    for name, row in models.items():
+        idx.setdefault(_usage_key(name), row)
+        if "/" in str(name):   # provider prefix 제거본도 색인 (openai/Qwen -> qwen)
+            idx.setdefault(_usage_key(str(name).split("/")[-1]), row)
+
+    # /model_group/info 의 rpm/tpm 한도가 있으면 "사용률"의 분모로 쓴다.
+    limits = {}
+    for g in ll.get("groups") or []:
+        rpm, tpm = _num(g.get("rpm")), _num(g.get("tpm"))
+        if rpm or tpm:
+            limits[_usage_key(g.get("model_group"))] = (rpm, tpm)
+
+    out = []
+    for d in deps:
+        under = str(d.get("underlying") or "")
+        row = None
+        for cand in (d.get("model_name"), under, under.split("/")[-1]):
+            if cand and _usage_key(cand) in idx:
+                row = idx[_usage_key(cand)]
+                break
+        if row is None:
+            out.append(d)
+            continue
+        u = dict(row)
+        rpm_lim, tpm_lim = limits.get(_usage_key(d.get("model_name")), (None, None))
+        if rpm_lim:
+            u["rpm_limit"] = rpm_lim
+            if u.get("requests_per_min") is not None:
+                u["rpm_util"] = round(u["requests_per_min"] / rpm_lim, 4)
+        if tpm_lim:
+            u["tpm_limit"] = tpm_lim
+            if u.get("tokens_per_min") is not None:
+                u["tpm_util"] = round(u["tokens_per_min"] / tpm_lim, 4)
+        out.append(dict(d, usage=u))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 현재 부하(live): 백엔드 Prometheus /metrics 에서 실행/대기 요청 + KV 캐시 사용률
+#   LiteLLM 집계는 "지난 N시간 누적"이라 지금 얼마나 물려 있는지는 알 수 없다.
+#   그건 vLLM/SGLang 이 직접 노출하는 게이지에서만 나온다.
+#   주의: api_base 는 LB 라서 /metrics 응답은 **뒤에 있는 Pod 중 하나**의 값이다.
+# ----------------------------------------------------------------------------
+
+_PROM_SPECS = [
+    ("vllm", {
+        "running": ("vllm:num_requests_running",),
+        "waiting": ("vllm:num_requests_waiting",),
+        "kv_cache": ("vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc"),
+    }),
+    ("sglang", {
+        "running": ("sglang:num_running_reqs",),
+        "waiting": ("sglang:num_queue_reqs",),
+        "kv_cache": ("sglang:token_usage", "sglang:kv_cache_usage",),
+    }),
+]
+
+
+def parse_prom_metrics(text):
+    """Prometheus 텍스트 -> {metric_name: [값, ...]} (라벨은 무시, 값만 모은다)."""
+    out = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "{" in line:
+            name = line.split("{", 1)[0].strip()
+            rest = line.rsplit("}", 1)[-1].split()
+        else:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name, rest = parts[0], parts[1:]
+        if not rest:
+            continue
+        val = _num(rest[0])
+        if val is None:
+            continue
+        out.setdefault(name, []).append(val)
+    return out
+
+
+def live_from_prom(text):
+    """/metrics 본문 -> {"engine","running","waiting","kv_cache_pct"} (모르면 None)."""
+    metrics = parse_prom_metrics(text)
+    if not metrics:
+        return None
+    for engine, spec in _PROM_SPECS:
+        if not any(n in metrics for names in spec.values() for n in names):
+            continue
+        live = {"engine": engine, "running": None, "waiting": None,
+                "kv_cache_pct": None}
+        for field, names in spec.items():
+            vals = []
+            for n in names:
+                vals.extend(metrics.get(n) or [])
+            if not vals:
+                continue
+            if field == "kv_cache":
+                # 0~1 비율로 나오는 게 보통 -> % 로. 여러 라벨이면 최댓값(가장 붐비는 쪽).
+                pct = max(vals)
+                live["kv_cache_pct"] = round(pct * 100.0 if pct <= 1.0 else pct, 1)
+            else:
+                live[field] = int(sum(vals))   # 라벨(모델)별로 나뉘어 있으면 합
+        return live
+    return None
+
+
+def collect_live_metrics(bases, timeout, api_key=None, max_threads=8):
+    """백엔드 base URL 목록 -> {base: live dict}. 스레드로 병렬 probe."""
+    bases = [b for b in dict.fromkeys(bases) if b]
+    out, lock = {}, threading.Lock()
+
+    def work(queue):
+        while True:
+            with lock:
+                if not queue:
+                    return
+                base = queue.pop()
+            ok, text, err = http_get_text(base + "/metrics", api_key, timeout,
+                                          accept="text/plain")
+            live = live_from_prom(text) if ok else None
+            if live is None:
+                live = {"engine": None, "running": None, "waiting": None,
+                        "kv_cache_pct": None,
+                        "error": err or "metrics 파싱 실패(엔진 게이지 없음)"}
+            live["url"] = base + "/metrics"
+            with lock:
+                out[base] = live
+
+    queue = list(bases)
+    threads = [threading.Thread(target=work, args=(queue,), daemon=True)
+               for _ in range(min(max_threads, len(queue)) or 1)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+def attach_live_to_deployments(deployments, live_by_base):
+    """base URL 기준으로 live 지표를 deployment 행에 붙인다."""
+    out = []
+    for d in deployments or []:
+        base = _strip_openai_suffix(d["api_base"]) if d.get("api_base") else None
+        live = live_by_base.get(base) if base else None
+        out.append(dict(d, live=live) if live else d)
+    return out
 
 # ----------------------------------------------------------------------------
 # Backend 개수: api_base(LB) 뒤의 실제 Pod/replica 수
@@ -707,6 +1098,7 @@ def build_snapshot(settings, with_health=True):
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "litellm": None,
         "backends": [],
+        "usage": None,
         "summary": {},
     }
 
@@ -739,6 +1131,30 @@ def build_snapshot(settings, with_health=True):
     # (TUI/웹/JSON 모두 동일한 status 를 쓰도록 여기서 한 번에 적용)
     if snap["litellm"]:
         snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
+
+    # 모델별 사용량(요청 수/토큰/사용률) — LiteLLM 분석 엔드포인트
+    if settings.get("usage") and settings.get("litellm_url") and snap["litellm"]:
+        try:
+            snap["usage"] = collect_usage(
+                settings["litellm_url"], settings["api_key"], settings["timeout"],
+                settings.get("usage_window", 24.0))
+            snap["litellm"]["deployments"] = attach_usage_to_deployments(
+                snap["litellm"], snap["usage"])
+        except Exception as e:  # noqa: BLE001  (사용량 실패가 전체를 막지 않게)
+            snap["usage"] = {"models": {}, "totals": {}, "source": None,
+                             "errors": ["%s: %s" % (type(e).__name__, e)]}
+
+    # 현재 부하(live): 백엔드 /metrics 직접 probe (엔진 게이지)
+    if settings.get("probe_metrics") and snap["litellm"]:
+        deps = snap["litellm"].get("deployments") or []
+        bases = [_strip_openai_suffix(d["api_base"]) for d in deps if d.get("api_base")]
+        try:
+            live = collect_live_metrics(bases, settings["timeout"],
+                                        max_threads=settings.get("metrics_threads", 8))
+            snap["live_metrics_enabled"] = True
+            snap["litellm"]["deployments"] = attach_live_to_deployments(deps, live)
+        except Exception as e:  # noqa: BLE001
+            snap["live_metrics_error"] = "%s: %s" % (type(e).__name__, e)
 
     snap["summary"] = summarize(snap)
     return snap
@@ -793,6 +1209,18 @@ def summarize(snap):
         "backend_pods_ready": 0,     # 모든 LB 뒤 ready Pod 합계
         "backend_pods_desired": 0,   # 목표 replica 합계
         "backend_pods_known": False,
+        # 사용량(LiteLLM 분석 엔드포인트, window 누적)
+        "usage_known": False,
+        "usage_requests": 0,
+        "usage_tokens": 0,
+        "usage_spend": 0.0,
+        "usage_rpm": 0.0,
+        "usage_models_used": 0,
+        "usage_window_hours": None,
+        # 현재 부하(백엔드 /metrics 게이지)
+        "live_known": False,
+        "live_running": 0,
+        "live_waiting": 0,
     }
     ll = snap.get("litellm")
     if ll:
@@ -826,6 +1254,36 @@ def summarize(snap):
                 s["backend_pods_known"] = True
             if d.get("backends_desired") is not None:
                 s["backend_pods_desired"] += d["backends_desired"]
+
+    # 사용량 합계는 usage["totals"] 에서 온다. deployment 행을 더하면 안 된다
+    # — 사용량은 model_name(그룹) 단위라 같은 이름의 replica 행에 같은 값이 붙는다.
+    usage = snap.get("usage") or {}
+    totals = usage.get("totals") or {}
+    if usage.get("source"):
+        s["usage_known"] = True
+        s["usage_requests"] = int(totals.get("requests") or 0)
+        s["usage_tokens"] = int(totals.get("tokens") or 0)
+        s["usage_spend"] = round(float(totals.get("spend") or 0.0), 6)
+        s["usage_rpm"] = totals.get("requests_per_min") or 0.0
+        s["usage_models_used"] = int(totals.get("models_used") or 0)
+        s["usage_window_hours"] = usage.get("window_hours")
+
+    # 현재 부하: 같은 api_base(LB)를 공유하는 행이 있으면 한 번만 센다
+    seen_live = set()
+    for d in (ll.get("deployments") or []) if ll else []:
+        live = d.get("live")
+        if not live or live.get("error"):
+            continue
+        key = live.get("url") or d.get("api_base")
+        if key in seen_live:
+            continue
+        seen_live.add(key)
+        if live.get("running") is not None:
+            s["live_running"] += live["running"]
+            s["live_known"] = True
+        if live.get("waiting") is not None:
+            s["live_waiting"] += live["waiting"]
+            s["live_known"] = True
 
     backends = snap.get("backends") or []
     s["backends_total"] = len(backends)
@@ -877,6 +1335,76 @@ def _fmt_backends(d):
     else:
         color = "green"
     return c(body, color)
+
+
+def _fmt_num(n):
+    """1234567 -> '1.2M' / 12840 -> '12.8k' (표 폭 절약)."""
+    if n is None:
+        return "?"
+    n = float(n)
+    for unit, div in (("G", 1e9), ("M", 1e6), ("k", 1e3)):
+        if abs(n) >= div:
+            return "%.1f%s" % (n / div, unit)
+    return "%d" % int(n)
+
+
+def _util_color(ratio):
+    """사용률(0~1) -> 색. 한도에 가까울수록 경고."""
+    if ratio is None:
+        return "dim"
+    if ratio >= 0.9:
+        return "red"
+    if ratio >= 0.7:
+        return "yellow"
+    return "green"
+
+
+def _fmt_requests(d):
+    """window 누적 요청 수 셀."""
+    u = d.get("usage") or {}
+    req = u.get("requests")
+    if req is None:
+        return c("?", "dim")
+    return c(_fmt_num(req), "cyan" if req else "dim")
+
+
+def _fmt_rate(d):
+    """분당 요청(rpm) + 한도가 있으면 사용률 %."""
+    u = d.get("usage") or {}
+    rpm = u.get("requests_per_min")
+    if rpm is None:
+        return c("?", "dim")
+    body = "%.2f/m" % rpm
+    util = u.get("rpm_util")
+    if util is None:
+        return c(body, "dim" if not rpm else "cyan")
+    return "%s %s" % (c(body, "dim" if not rpm else "cyan"),
+                      c("(%.0f%%)" % (util * 100), _util_color(util)))
+
+
+def _fmt_live(d):
+    """현재 실행/대기 요청 (백엔드 /metrics 게이지). 'run+wait' 표기."""
+    live = d.get("live")
+    if not live:
+        return c("-", "dim")
+    if live.get("error"):
+        return c("?", "dim")
+    run, wait = live.get("running"), live.get("waiting")
+    if run is None and wait is None:
+        return c("?", "dim")
+    body = "%s" % (run if run is not None else "?")
+    if wait:
+        return "%s %s" % (c(body, "green"), c("+%d wait" % wait, "yellow"))
+    return c(body, "green" if run else "dim")
+
+
+def _fmt_kv(d):
+    """KV 캐시 사용률(%) — GPU 메모리가 얼마나 물려 있는지 = 진짜 '사용률'."""
+    live = d.get("live") or {}
+    pct = live.get("kv_cache_pct")
+    if pct is None:
+        return c("?", "dim") if live else c("-", "dim")
+    return c("%.0f%%" % pct, _util_color(pct / 100.0))
 
 
 def _table(headers, rows, aligns=None):
@@ -947,6 +1475,16 @@ def render(snap, settings):
                 c(str(s["backend_pods_ready"]), "green"),
                 s["backend_pods_desired"] or "?")
         )
+    if s.get("usage_known"):
+        win = s.get("usage_window_hours") or 24
+        summary_bits.append(
+            "requests(%gh): %s" % (win, c(_fmt_num(s["usage_requests"]), "cyan")))
+        summary_bits.append("rpm: %s" % c("%.1f" % s["usage_rpm"], "cyan"))
+    if s.get("live_known"):
+        live_bit = c(str(s["live_running"]), "green")
+        if s["live_waiting"]:
+            live_bit += c(" +%d wait" % s["live_waiting"], "yellow")
+        summary_bits.append("in-flight: %s" % live_bit)
     if settings["probe_backends"]:
         summary_bits.append(
             "backends up: %s/%s" % (
@@ -983,6 +1521,10 @@ def render(snap, settings):
             #              + LB 뒤 backend Pod 개수
             merged = merge_deployments_with_health(ll)
             show_backends = snap.get("backend_count_enabled")
+            usage = snap.get("usage") or {}
+            show_usage = bool(usage.get("models"))
+            show_live = bool(snap.get("live_metrics_enabled"))
+            win = usage.get("window_hours") or 24
             if merged:
                 drows = []
                 for d in merged:
@@ -994,15 +1536,30 @@ def render(snap, settings):
                     ]
                     if show_backends:
                         row.append(_fmt_backends(d))
+                    if show_usage:
+                        row.append(_fmt_requests(d))
+                        row.append(_fmt_rate(d))
+                    if show_live:
+                        row.append(_fmt_live(d))
+                        row.append(_fmt_kv(d))
+                    if show_backends:
                         row.append(c(d.get("backend_source", "-"), "dim"))
                     row.append(d.get("api_base") or "-")
                     drows.append(row)
                 hdr = ["STATUS", "MODEL_NAME", "TYPE"]
                 if show_backends:
-                    hdr += ["BACKENDS", "SRC"]
+                    hdr.append("BACKENDS")
+                if show_usage:
+                    hdr += ["REQ/%gH" % win, "RPM"]
+                if show_live:
+                    hdr += ["IN-FLIGHT", "KV%"]
+                if show_backends:
+                    hdr.append("SRC")
                 hdr.append("API_BASE")
                 title = ("  [Deployments] (/model/info api_base + /health status"
-                         + (" + LB backend pods)" if show_backends else ")"))
+                         + (" + LB backend pods" if show_backends else "")
+                         + (" + usage" if show_usage else "")
+                         + (" + live" if show_live else "") + ")")
                 lines.append(c(title, "bold"))
                 lines.append(indent(_table(hdr, drows), 2))
                 lines.append("")
@@ -1021,6 +1578,15 @@ def render(snap, settings):
                     lines.append(indent(_table(
                         ["STATUS", "MODEL", "API_BASE"], hrows), 2))
                     lines.append("")
+            if show_usage:
+                lines.append(c("  usage 출처: %s · 집계구간 %s ~ %s (모델 이름 단위 합계)"
+                               % (usage.get("source"), usage.get("start"),
+                                  usage.get("end")), "dim"))
+                lines.append("")
+            elif snap.get("usage") and snap["usage"].get("errors"):
+                lines.append(c("  ! 사용량 수집 실패(요청 수 열 생략): %s"
+                               % "; ".join(snap["usage"]["errors"][:2]), "yellow"))
+                lines.append("")
             if ll["errors"]:
                 for e in ll["errors"]:
                     lines.append(c("  ! %s" % e, "yellow"))
@@ -1058,9 +1624,10 @@ def demo_snapshot():
             "reachable": True,
             "groups": [
                 {"model_group": "KServe-Qwen3.6-35B-A3B-FP8",
-                 "providers": ["openai"], "mode": "chat"},
+                 "providers": ["openai"], "mode": "chat",
+                 "rpm": 600, "tpm": 400000},
                 {"model_group": "SGlang-Qwen3.6-27B-FP8",
-                 "providers": ["openai"], "mode": "chat"},
+                 "providers": ["openai"], "mode": "chat", "rpm": 120},
                 {"model_group": "Qwen3-Embedding-8B",
                  "providers": ["openai"], "mode": "embedding"},
             ],
@@ -1138,9 +1705,59 @@ def demo_snapshot():
          "url": "http://qwen3-32b-vllm.serving.svc:8000",
          "type": "vllm", "up": False, "models": [], "error": "connection error"},
     ]
+    # 사용량(요청 수/토큰) — 실제로는 LiteLLM /global/activity/model 등에서 온다.
+    minutes = 24 * 60.0
+    demo_usage = {
+        "KServe-Qwen3.6-35B-A3B-FP8": (12840, 4820000, 0.0),
+        "SGlang-Qwen3.6-27B-FP8": (4321, 1205400, 0.0),
+        "Qwen3-Embedding-8B": (30219, 812000, 0.0),
+        "vLLM-Stack-Qwen3-32B-AWQ": (152, 41300, 0.0),
+    }
+    models = {}
+    for name, (req, tok, spend) in demo_usage.items():
+        models[name] = {
+            "requests": req, "tokens": tok, "spend": spend,
+            "requests_per_min": round(req / minutes, 3),
+            "tokens_per_min": round(tok / minutes, 1),
+        }
+    snap["usage"] = {
+        "source": "/global/activity/model (demo)",
+        "granularity": "day",
+        "window_hours": 24.0,
+        "window_minutes": minutes,
+        "start": "(demo)", "end": snap["ts"],
+        "models": models,
+        "totals": {
+            "requests": sum(v[0] for v in demo_usage.values()),
+            "tokens": sum(v[1] for v in demo_usage.values()),
+            "spend": 0.0,
+            "requests_per_min": round(
+                sum(v[0] for v in demo_usage.values()) / minutes, 3),
+            "models_used": len(demo_usage),
+        },
+        "errors": [],
+    }
+    # 현재 부하(live) — 실제로는 백엔드 /metrics(vLLM/SGLang 게이지)에서 온다.
+    demo_live = {
+        "http://qwen36-35b-predictor.kserve.svc:8080": {
+            "engine": "vllm", "running": 7, "waiting": 2, "kv_cache_pct": 63.4},
+        "http://qwen36-27b-sglang.serving.svc:30000": {
+            "engine": "sglang", "running": 3, "waiting": 0, "kv_cache_pct": 28.9},
+        "http://qwen3-32b-vllm.serving.svc:8000": {
+            "engine": None, "running": None, "waiting": None, "kv_cache_pct": None,
+            "error": "connection error: [Errno 111] Connection refused"},
+    }
+    for base, live in demo_live.items():
+        live["url"] = base + "/metrics"
+
     snap["litellm"]["groups"].sort(
         key=lambda g: str(g.get("model_group") or "").lower())
     snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
+    snap["litellm"]["deployments"] = attach_usage_to_deployments(
+        snap["litellm"], snap["usage"])
+    snap["litellm"]["deployments"] = attach_live_to_deployments(
+        snap["litellm"]["deployments"], demo_live)
+    snap["live_metrics_enabled"] = True
     snap["summary"] = summarize(snap)
     return snap
 
@@ -1233,7 +1850,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
   td.mono,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
   td.api{font-family:var(--mono);font-size:12px;color:var(--muted);max-width:340px;
     overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  td.name{font-weight:550}
+  td.name{font-weight:550;white-space:nowrap}
 
   .pill{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);
     font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px;
@@ -1258,6 +1875,20 @@ _DASHBOARD_HTML = r"""<!doctype html>
   .bk.zero .num{color:var(--warn)}
   .bk .note{font-size:10.5px;color:var(--faint)}
   .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
+
+  /* 사용량/부하 셀 */
+  .use{display:flex;align-items:center;gap:8px;white-space:nowrap}
+  .use .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px}
+  .use .pct{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .use.good .pct{color:var(--up)} .use.warn .pct{color:var(--warn)}
+  .use.bad .pct{color:var(--down)}
+  .use .bar{width:52px;height:5px;border-radius:3px;background:var(--surface2);
+    overflow:hidden;border:1px solid var(--border)}
+  .use .bar i{display:block;height:100%}
+  .use.good .bar i{background:var(--up)} .use.warn .bar i{background:var(--warn)}
+  .use.bad .bar i{background:var(--down)}
+  .wait{font-family:var(--mono);font-size:11px;color:var(--warn)}
+  .idle{color:var(--faint)}
 
   .empty{color:var(--muted);padding:18px;text-align:center;font-style:italic}
   .err{color:var(--down);font-family:var(--mono);font-size:12px;
@@ -1292,7 +1923,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
 
   <section id="deployments-sec">
     <div class="sec-title">Deployments
-      <span class="src">/model/info api_base · /health status · k8s backend pods</span>
+      <span class="src" id="dep-src">/model/info api_base · /health status · k8s backend pods</span>
       <span class="filters">
         <label for="f-status">status</label>
         <select id="f-status">
@@ -1352,6 +1983,66 @@ function backendCell(d){
     +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
 }
 
+function fmtNum(n){
+  if(n==null) return "?";
+  n=Number(n);
+  const u=[["G",1e9],["M",1e6],["k",1e3]];
+  for(const [s,d] of u){ if(Math.abs(n)>=d) return (n/d).toFixed(1)+s; }
+  return String(Math.round(n));
+}
+function utilCls(r){ return r==null?"":(r>=0.9?"bad":(r>=0.7?"warn":"good")); }
+
+// window 누적 요청 수
+function reqCell(d){
+  const u=d.usage;
+  if(!u || u.requests==null) return '<span class="srccol">?</span>';
+  const tip = u.tokens!=null ? ' title="tokens '+fmtNum(u.tokens)+'"' : '';
+  return '<span class="use'+(u.requests?'':' idle')+'"'+tip+'>'
+    +'<span class="num">'+fmtNum(u.requests)+'</span></span>';
+}
+
+// 분당 요청 + (한도가 있으면) 사용률 바
+function rateCell(d){
+  const u=d.usage;
+  if(!u || u.requests_per_min==null) return '<span class="srccol">?</span>';
+  const rpm=Number(u.requests_per_min);
+  let html='<span class="num">'+rpm.toFixed(2)+'</span>';
+  if(u.rpm_util!=null){
+    const cls=utilCls(u.rpm_util);
+    const pct=Math.min(100, Math.round(u.rpm_util*100));
+    html='<span class="num">'+rpm.toFixed(2)+'</span>'
+      +'<span class="bar"><i style="width:'+pct+'%"></i></span>'
+      +'<span class="pct">'+pct+'%</span>';
+    return '<div class="use '+cls+'" title="rpm 한도 '+esc(u.rpm_limit)
+      +' 대비 사용률">'+html+'</div>';
+  }
+  return '<div class="use'+(rpm?'':' idle')+'" title="분당 요청(집계 구간 평균)">'
+    +html+'</div>';
+}
+
+// 지금 처리 중/대기 중인 요청 (백엔드 /metrics 게이지)
+function liveCell(d){
+  const l=d.live;
+  if(!l) return '<span class="srccol">-</span>';
+  if(l.error) return '<span class="srccol" title="'+esc(l.error)+'">? ⚠</span>';
+  if(l.running==null && l.waiting==null) return '<span class="srccol">?</span>';
+  let html='<span class="num">'+(l.running==null?"?":l.running)+'</span>';
+  if(l.waiting) html+='<span class="wait">+'+l.waiting+' wait</span>';
+  return '<div class="use '+(l.waiting?"warn":(l.running?"good":""))
+    +'" title="engine '+esc(l.engine||"?")+' · LB 뒤 Pod 1개 샘플">'+html+'</div>';
+}
+
+// KV 캐시 사용률 = GPU 메모리가 실제로 얼마나 물려 있는지
+function kvCell(d){
+  const l=d.live;
+  if(!l) return '<span class="srccol">-</span>';
+  if(l.kv_cache_pct==null) return '<span class="srccol">?</span>';
+  const pct=Math.min(100, Math.round(l.kv_cache_pct));
+  return '<div class="use '+utilCls(pct/100)+'" title="KV cache 사용률">'
+    +'<span class="num">'+pct+'%</span>'
+    +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
+}
+
 function statusPill(s){
   const cls = s==="UP"?"up":(s==="DOWN"?"down":"unk");
   return '<span class="pill '+cls+'">'+esc(s)+'</span>';
@@ -1391,10 +2082,31 @@ function render(snap){
       +'<span style="color:var(--faint);font-size:16px"> / '
       +(s.backend_pods_desired||"?")+'</span>', "",
       "LB 뒤 ready / desired");
+  if(s.usage_known)
+    cards += card("Requests ("+(s.usage_window_hours||24)+"h)",
+      fmtNum(s.usage_requests), "accent",
+      Number(s.usage_rpm||0).toFixed(1)+" req/min · "
+      +(s.usage_models_used||0)+" model 사용");
+  if(s.usage_known && s.usage_tokens)
+    cards += card("Tokens ("+(s.usage_window_hours||24)+"h)",
+      fmtNum(s.usage_tokens), "", "누적 total tokens");
+  if(s.live_known)
+    cards += card("In-flight", s.live_running||0,
+      (s.live_waiting?"warn":"good"),
+      (s.live_waiting||0)+" 대기 · 백엔드 /metrics");
   $("#cards").innerHTML = cards;
 
   // deployments
   const showBk = !!snap.backend_count_enabled;
+  const usage = snap.usage||{};
+  const showUse = !!(usage.models && Object.keys(usage.models).length);
+  const showLive = !!snap.live_metrics_enabled;
+  const win = usage.window_hours||24;
+  const srcEl=$("#dep-src");
+  if(srcEl) srcEl.textContent = "/model/info api_base · /health status"
+    + (showBk ? " · k8s backend pods" : "")
+    + (showUse ? " · usage "+(usage.source||"") : "")
+    + (showLive ? " · live /metrics" : "");
   const dt = $("#deployments");
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
@@ -1404,35 +2116,56 @@ function render(snap){
     $("#f-count").textContent = (fS||fT)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
-    if(showBk) head += '<th>BACKENDS (ready/desired)</th><th>MODE</th><th>SRC</th>';
+    if(showBk) head += '<th>BACKENDS (ready/desired)</th>';
+    if(showUse) head += '<th class="num">REQ ('+win+'h)</th><th class="num">RPM</th>';
+    if(showLive) head += '<th class="num">IN-FLIGHT</th><th class="num">KV CACHE</th>';
+    if(showBk) head += '<th>MODE</th><th>SRC</th>';
     head += "<th>API_BASE</th></tr>";
     dt.querySelector("thead").innerHTML = head;
     dt.querySelector("tbody").innerHTML = merged.length ? merged.map(d=>{
       let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
         +'<td class="name">'+esc(d.model_name)+"</td>"
         +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
-      if(showBk) row += "<td>"+backendCell(d)+"</td>"
-        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
+      if(showBk) row += "<td>"+backendCell(d)+"</td>";
+      if(showUse) row += "<td>"+reqCell(d)+"</td><td>"+rateCell(d)+"</td>";
+      if(showLive) row += "<td>"+liveCell(d)+"</td><td>"+kvCell(d)+"</td>";
+      if(showBk) row +=
+        '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
         +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
       row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
       return row;
-    }).join("") : '<tr><td class="empty" colspan="7">필터 결과 없음</td></tr>';
+    }).join("") : '<tr><td class="empty" colspan="11">필터 결과 없음</td></tr>';
   } else {
     $("#f-count").textContent="";
     dt.querySelector("thead").innerHTML="";
     dt.querySelector("tbody").innerHTML='<tr><td class="empty">deployment 없음 (LiteLLM /model/info 응답 비어있음 또는 미연결)</td></tr>';
   }
-  $("#dep-err").innerHTML = (ll && ll.errors && ll.errors.length)
+  let depErr = (ll && ll.errors && ll.errors.length)
     ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
+  if(!showUse && usage.errors && usage.errors.length)
+    depErr += '<div class="note-banner" style="margin-top:8px">사용량(요청 수) 수집 실패 — '
+      +'LiteLLM 분석 엔드포인트 응답 없음/권한 부족: '+esc(usage.errors.slice(0,2).join("; "))
+      +'</div>';
+  $("#dep-err").innerHTML = depErr;
 
   // groups
   const gt = $("#groups");
   if(ll && ll.groups && ll.groups.length){
-    gt.querySelector("thead").innerHTML="<tr><th>MODEL_GROUP</th><th>PROVIDERS</th><th>MODE</th></tr>";
-    gt.querySelector("tbody").innerHTML = ll.groups.map(g=>
-      '<tr><td class="name">'+esc(g.model_group)+"</td>"
+    gt.querySelector("thead").innerHTML="<tr><th>MODEL_GROUP</th><th>PROVIDERS</th><th>MODE</th>"
+      +(showUse?'<th class="num">REQ ('+win+'h)</th><th class="num">TOKENS</th>':"")
+      +'<th class="num">RPM / TPM 한도</th></tr>';
+    const um = usage.models||{};
+    gt.querySelector("tbody").innerHTML = ll.groups.map(g=>{
+      const u = um[g.model_group];
+      let r='<tr><td class="name">'+esc(g.model_group)+"</td>"
       +'<td class="mono" style="color:var(--muted)">'+esc((g.providers||[]).join(", ")||"-")+"</td>"
-      +"<td>"+esc(g.mode||"-")+"</td></tr>").join("");
+      +"<td>"+esc(g.mode||"-")+"</td>";
+      if(showUse) r+='<td class="mono">'+(u?fmtNum(u.requests):'<span class="srccol">?</span>')+"</td>"
+        +'<td class="mono">'+(u&&u.tokens!=null?fmtNum(u.tokens):'<span class="srccol">?</span>')+"</td>";
+      r+='<td class="mono" style="color:var(--muted)">'
+        +((g.rpm||g.tpm)?((g.rpm||"-")+" / "+(g.tpm||"-")):'<span class="srccol">무제한</span>')+"</td></tr>";
+      return r;
+    }).join("");
   } else {
     gt.querySelector("thead").innerHTML="";
     gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
@@ -1657,6 +2390,13 @@ def main():
     p.add_argument("--no-health", action="store_true",
                    help="LiteLLM /health 호출 안 함 (status 는 k8s backend readiness 로 판정)")
     p.add_argument("--demo", action="store_true", help="샘플 데이터로 미리보기")
+    # 사용량 / 현재 부하
+    p.add_argument("--no-usage", action="store_true",
+                   help="모델별 사용량(요청 수/토큰) 수집 안 함")
+    p.add_argument("--usage-window", type=float,
+                   help="사용량 집계 구간(시간, 기본 24)")
+    p.add_argument("--probe-metrics", action="store_true",
+                   help="백엔드 /metrics 를 직접 읽어 현재 실행/대기 요청·KV 캐시 사용률 표시")
     # 웹 UI
     p.add_argument("--serve", action="store_true",
                    help="웹 대시보드 모드 (브라우저로 조회)")
