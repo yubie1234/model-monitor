@@ -62,6 +62,7 @@ m = types.SimpleNamespace(
     AccessCache=_ua.AccessCache,
     filter_snapshot_for_user=_ua.filter_snapshot_for_user,
     _backend_ref=_ua._backend_ref,
+    _redact_deployment_for_user=_ua._redact_deployment_for_user,
     render_prometheus_metrics=_prom.render_prometheus_metrics,
     is_admin_key=_auth.is_admin_key,
     request_key=_auth.request_key,
@@ -1878,6 +1879,52 @@ class TestFilterSnapshotForUser(unittest.TestCase):
                 v["backends"].append({"url": "침입"})
             self.assertEqual(json.dumps(g, sort_keys=True, default=str), before,
                              "hide_internal=%s 뷰 변형이 global 로 새어나갔다" % hide)
+
+    def test_redaction_emits_only_scalars(self):
+        """리댁션 출력에 컨테이너가 없어야 한다 — filter 가 이 불변식에 기댄다.
+
+        회귀: hide_internal=True(기본 per-user 모드)는 리댁션된 행을 deepcopy
+        하지 않는다. `_redact_deployment_for_user` 가 스칼라만 낸다는 전제이기
+        때문이다. allowlist 에 컨테이너 필드(예: gpu_products)를 하나 추가하면
+        그 전제가 깨지고, 뷰는 공유 스냅샷과 **같은 객체**를 가리킨다 — 사용자
+        한 명이 자기 뷰를 변형하면 모든 사용자가 읽는 global 스냅샷이 오염된다.
+        예전 구현(전체 deepcopy)은 allowlist 내용과 무관하게 안전했으므로, 이
+        불변식은 성능 최적화가 새로 들여온 것이다. 발생 지점에서 고정한다.
+
+        컨테이너를 정말 노출해야 한다면 이 테스트를 고치는 게 아니라
+        filter_snapshot_for_user 의 리댁션 분기에서 deepcopy 를 해야 한다.
+        """
+        src = {
+            "model_name": "m", "namespace": "ns", "service": "svc",
+            "api_base": "http://x/v1", "status": "UP", "status_source": "health",
+            "type": "vllm", "network_type": "service", "backend_type": "vllm",
+            "backends_ready": 1, "backends_desired": 1, "backend_source": "eps",
+            "scale_to_zero": False, "mode": "RawDeployment",
+            "blocked": True, "health_status": "UP", "health_status_source": "k8s",
+            # 컨테이너 값들 — 리댁션이 이들을 통과시키면 안 된다.
+            "gpu_products": {"H100": 2}, "tags": ["a", "b"],
+            "nested": {"deep": {"x": 1}},
+        }
+        out = m._redact_deployment_for_user(src, "seed")
+        containers = {k: type(v).__name__ for k, v in out.items()
+                      if isinstance(v, (dict, list, set, tuple))}
+        self.assertEqual(
+            containers, {},
+            "리댁션이 컨테이너를 노출한다: %s — hide_internal=True 경로는 이 값을 "
+            "deepcopy 하지 않으므로 global 스냅샷과 객체를 공유하게 된다" % containers)
+
+    def test_nested_containers_are_not_shared_in_redacted_view(self):
+        # 위 불변식의 결과를 filter 수준에서도 확인한다: 리댁션 뷰가 global 의
+        # 중첩 컨테이너를 참조로 물고 있지 않은지(현재는 아예 노출 안 하므로
+        # 키 부재로 통과 — 노출로 바뀌면 위 테스트가 먼저 깨진다).
+        g = self._global()
+        for d in g["litellm"]["deployments"]:
+            d["gpu_products"] = {"H100": 2}
+        v = m.filter_snapshot_for_user(
+            g, {"accessible": ["gpt-x", "gpt-y"]}, hide_internal=True)
+        for vd, gd in zip(v["litellm"]["deployments"], g["litellm"]["deployments"]):
+            if "gpu_products" in vd:
+                self.assertIsNot(vd["gpu_products"], gd["gpu_products"])
 
     def test_nested_containers_are_not_shared_with_global(self):
         # gpu_products 처럼 행 안의 중첩 dict 까지 복사돼야 한다 — 얕은 복사면

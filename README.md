@@ -104,15 +104,16 @@ Admin UI 의 토글 스위치). 꺼진 deployment 는 라우팅 풀에서 빠져
 
 | 조회 | 성질 | 사이클 간 캐시 |
 |------|------|----------------|
-| `inferenceservices/<isvc>` | ISVC 존재 여부 + deploymentMode + revision | **부재(404)만** TTL 5분 |
-| `services/<svc>` (`spec.selector`) | 라벨 셀렉터 | TTL 5분 + 자기치유 |
+| `inferenceservices/<isvc>` | ISVC 존재 여부 + deploymentMode + revision | **부재(404)만** TTL 60초 |
+| `services/<svc>` (`spec.selector`) | 라벨 셀렉터 | TTL 60초 + 자기치유 |
 | `endpointslices?…` | ready endpoint | 없음 (동적) |
 | `deployments/<name>` | readyReplicas / replicas | 없음 (동적) |
 | `pods?labelSelector=…` | GPU 수 · 엔진 | 없음 (동적) |
 | `nodes/<name>` | GPU 장치명 라벨 | 프로세스 수명 (노드 수명 동안 불변) |
 
 **v1.1.0 에서 위 두 항목을 캐시**해 정상 상태 호출을 Service 당 5회 → 3회로 줄였습니다
-(Service 12개·5초 주기 실측: 하루 약 103만 → 62만 회, **41만 회 절감**).
+(Service 12개·5초 주기 실측: 하루 약 103만 → 66만 회, **38만 회 절감**. TTL 주기마다 콜드 1회는
+전체 5회를 조회하므로 평균 3.17회입니다).
 
 캐시하지 **않는** 것이 안전장치입니다:
 
@@ -125,8 +126,16 @@ Admin UI 의 토글 스위치). 꺼진 deployment 는 라우팅 풀에서 빠져
   버려 다음 사이클에 다시 읽습니다(라벨을 바꾼 재배포 대응). 실제로 0 replica 인 Service 가
   매 사이클 selector 를 다시 받는 것이 대가인데, 그쪽은 어차피 호출 예산이 남습니다.
 
-TTL 은 [app/services/gpu.py](app/services/gpu.py) 의 `META_TTL`(기본 300초). 전환 인지가 더 빨라야
-하면 줄이고, 호출을 더 줄이려면 늘리세요 — 5분이면 사이클 60회 중 59회를 회피합니다.
+TTL 은 [app/services/gpu.py](app/services/gpu.py) 의 `META_TTL`(기본 **60초**).
+
+> ⚠️ **TTL 을 늘리기 전에 읽어주세요 — 호출량이 아니라 각성 안전 문제입니다.** ISVC 부재를
+> 캐시하면 그동안 `network_type` 이 `service` 로 남습니다. 그런데 KServe 판별은 "이름 규약
+> (`-predictor`) **또는** `network_type==kserve`" 이라, 이름 규약을 따르지 않는 Service 에는
+> ISVC 조회가 **유일한 KServe 신호**입니다. 그런 Service 에 Serverless ISVC 가 새로 생기면
+> TTL 동안 health check 대상에 들어가 LiteLLM 이 그 백엔드를 ping 해 **깨웁니다**. 이름 규약을
+> 지키면 캐시와 무관하게 막히지만, 그 보장 하나에 각성 방지를 걸지 않으려고 60초로 뒀습니다 —
+> 위험 창이 캐시 없을 때의 5초에서 12배로만 늘고 절감은 41만 → 38만 회로 8% 만 줍니다.
+> 300초로 올리면 창이 60배가 되고 절감은 41만 회가 됩니다(+8%). 이 절충을 보고 정하세요.
 
 ## 사용법
 

@@ -124,6 +124,12 @@ def detect_mode_and_revision(client, ns, svc, meta_cache=None):
 
     404 가 아닌 실패(RBAC/타임아웃/프록시)도 캐시하지 않는다 — 일시적 실패를
     굳히면 network_type 이 TTL 동안 '-' 로 고정된다(node 라벨 캐시와 같은 원칙).
+
+    ⚠️ 부재를 캐시하면 network_type 이 TTL 동안 'service' 로 남는다. 이름 규약
+    (-predictor)을 따르지 않는 Service 에는 이 조회가 유일한 KServe 신호라,
+    그런 Service 에 Serverless ISVC 가 새로 생기면 TTL 동안 health check 대상에
+    들어가 백엔드를 깨울 수 있다. 그래서 META_TTL 은 짧게(60s) 잡혀 있다 —
+    자세한 절충은 gpu.META_TTL 주석 참고. TTL 을 늘리려면 그 계산을 다시 할 것.
     """
     isvc = svc
     for suffix in ("-predictor", "-transformer", "-explainer"):

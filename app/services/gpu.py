@@ -14,15 +14,26 @@ GPU_PRODUCT_LABEL = "nvidia.com/gpu.product"
 # --- 사이클 간 메타 캐시 (거의 변하지 않는 k8s 조회 결과) -------------------
 # 실측(배포 35 / 고유 Service 12 / 5초 주기): 사이클당 Service 마다 k8s 5회 =
 # 하루 약 103만 회. 그중 2회는 매번 같은 답을 준다 — ISVC 부재(=이 Service 는
-# KServe 가 아니다)와 Service.spec.selector. 이 둘만 TTL 캐시해 하루 약 41만
+# KServe 가 아니다)와 Service.spec.selector. 이 둘만 TTL 캐시해 하루 약 38만
 # 회를 없앤다. 나머지 3회(EndpointSlice / Deployment status / Pod 목록)는 진짜
 # 동적이라 캐시하지 않는다.
 #
 # node_cache(장치 라벨)와 달리 **TTL 이 필요하다**: 노드 라벨은 노드 수명 동안
 # 불변이지만, Service 는 나중에 KServe 로 이관될 수 있고 selector 도 라벨을 바꾼
-# 재배포로 변할 수 있다. TTL 5분이면 사이클 60회 중 59회를 회피하면서 전환
-# 인지 지연은 5분 이내로 묶인다.
-META_TTL = 300.0
+# 재배포로 변할 수 있다.
+#
+# ⚠️ TTL 이 짧아야 하는 진짜 이유는 호출량이 아니라 **scale-to-zero 각성 안전**
+# 이다. ISVC 부재를 캐시하면 network_type 이 그동안 "service" 로 남는데,
+# litellm._looks_kserve 는 "이름 규약(-predictor) **또는** network_type==kserve"
+# 로 판별한다. 즉 이름 규약을 따르지 않는 Service 에는 ISVC 조회가 **유일한
+# KServe 신호**다. 그런 Service 에 Serverless ISVC 가 새로 생기면 TTL 동안
+# _deployment_health_safe 가 True 를 돌려주고, LiteLLM /health?model= 이 그
+# 백엔드를 ping 해 깨운다(직접 검증: 캐시된 판정 True / 최신 판정 False).
+# 이름 규약을 지키면 캐시와 무관하게 막히지만(규약은 ops 보장 사항), 그 보장
+# 하나에 각성 방지를 걸어두지 않으려고 TTL 을 60초로 둔다 — 위험 창이 캐시
+# 없을 때의 5초(1사이클)에서 12배로만 늘고, 절감은 41만 -> 38만 회로 8% 만
+# 준다. 늘리려면 이 절충을 다시 계산할 것.
+META_TTL = 60.0
 _META_MAX = 4096      # (ns,svc) 단위라 클러스터 Service 수로 이미 유계지만 상한을 둔다
 
 
