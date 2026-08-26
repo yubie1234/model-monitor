@@ -78,6 +78,27 @@ class Settings(BaseSettings):
         False, validation_alias=AliasChoices("MONITOR_K8S_INSECURE"))
     k8s_timeout: float = Field(5.0, validation_alias=AliasChoices("MONITOR_K8S_TIMEOUT"))
 
+    # --- 지금 부하(백엔드 엔진 게이지) ---
+    # vLLM/SGLang 이 노출하는 /metrics 를 Pod 마다 읽어 "지금 바쁜가"를 판정한다.
+    # Pod 주소는 GPU 집계가 이미 받아오는 Pod 목록에서 나오므로 k8s 호출이 늘지 않고,
+    # 백엔드에는 Pod 당 사이클마다 1회 GET 이 추가된다(응답은 보통 수십 KB).
+    load: bool = Field(True, validation_alias=AliasChoices("MONITOR_LOAD"))
+    # 죽은 Pod 하나가 사이클을 잡아먹지 않게 짧게. 한 라운드 최악 =
+    # ceil(Pod수/load_threads) * load_timeout.
+    load_timeout: float = Field(
+        3.0, validation_alias=AliasChoices("MONITOR_LOAD_TIMEOUT"))
+    load_threads: int = Field(
+        12, validation_alias=AliasChoices("MONITOR_LOAD_THREADS"))
+    # Pod 직접 조회가 막힌 환경(NetworkPolicy·mTLS)에서 같은 게이지를 대신 읽을
+    # 외부 Prometheus. 출처가 같아 정확도는 동일하고 스크레이프 주기만큼 늦다.
+    prometheus_url: Optional[str] = Field(
+        None, validation_alias=AliasChoices("MONITOR_PROMETHEUS_URL",
+                                            "PROMETHEUS_URL"))
+    prometheus_first: bool = Field(
+        False, validation_alias=AliasChoices("MONITOR_PROMETHEUS_FIRST"))
+    prometheus_lookback: str = Field(
+        "2m", validation_alias=AliasChoices("MONITOR_PROMETHEUS_LOOKBACK"))
+
     # --- per-user(키별) 뷰 ---
     user_view: bool = Field(
         False, validation_alias=AliasChoices("MONITOR_USER_VIEW"))
@@ -154,6 +175,8 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
     bc = cfg.get("backend_count") if isinstance(cfg.get("backend_count"), dict) else {}
     uv = cfg.get("user_view") if isinstance(cfg.get("user_view"), dict) else {}
     mt = cfg.get("metrics") if isinstance(cfg.get("metrics"), dict) else {}
+    ld = cfg.get("load") if isinstance(cfg.get("load"), dict) else {}
+    pm = cfg.get("prometheus") if isinstance(cfg.get("prometheus"), dict) else {}
 
     backend_count = _pick(
         _env_set("MONITOR_BACKEND_COUNT"),
@@ -162,6 +185,11 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
     gpu_info = backend_count and _pick(
         _env_set("MONITOR_GPU_INFO"),
         settings.gpu_info, bc.get("gpu_info"), True)
+    # 부하 수집은 Pod 주소(=k8s 조회)에 기댄다. backend_count 가 꺼지면 Pod 주소를
+    # 못 얻어 LB 폴백만 남는데, 그건 scale-to-zero 를 깨울 수 있어 허용하지 않는다.
+    # -> gpu_info 와 같은 종속 규칙.
+    load_enabled = backend_count and _pick(
+        _env_set("MONITOR_LOAD"), settings.load, ld.get("enabled"), True)
     user_view = _pick(
         _env_set("MONITOR_USER_VIEW"),
         settings.user_view, uv.get("enabled"), False)
@@ -215,6 +243,27 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
         "namespace_overrides": bc.get("namespace_overrides", {}) or {},
         "activator_namespace": bc.get("activator_namespace", "knative-serving"),
         # --- per-user(키별) 뷰 ---
+        # --- 지금 부하 ---
+        "load": load_enabled,
+        "load_timeout": float(_pick(
+            _env_set("MONITOR_LOAD_TIMEOUT"),
+            settings.load_timeout, ld.get("timeout"), 3.0)),
+        "load_threads": int(_pick(
+            _env_set("MONITOR_LOAD_THREADS"),
+            settings.load_threads, ld.get("threads"), 12)),
+        "load_thresholds": ld.get("thresholds") or {},
+        "prometheus_url": _pick(
+            _env_set("MONITOR_PROMETHEUS_URL", "PROMETHEUS_URL"),
+            settings.prometheus_url, pm.get("url"), None),
+        "prometheus_first": _pick(
+            _env_set("MONITOR_PROMETHEUS_FIRST"),
+            settings.prometheus_first, pm.get("first"), False),
+        "prometheus_lookback": _pick(
+            _env_set("MONITOR_PROMETHEUS_LOOKBACK"),
+            settings.prometheus_lookback, pm.get("lookback"), "2m"),
+        "prometheus_timeout": float(pm.get("timeout") or 10.0),
+        "prometheus_labels": pm.get("labels") or {},
+        "prometheus_api_key": pm.get("api_key"),
         "user_view": user_view,
         "user_view_hide_internal": not show_internal,
         "user_view_cache_ttl": float(_pick(

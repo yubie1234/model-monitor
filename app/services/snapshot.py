@@ -10,6 +10,7 @@ from datetime import datetime
 from app import __version__
 from app.core.k8s import K8sClient
 from app.services.backend_count import resolve_backend_count
+from app.services.load import LOAD_RANK
 from app.services.litellm import (
     collect_backend,
     collect_litellm,
@@ -27,6 +28,9 @@ def build_snapshot(settings, with_health=True, node_cache=None, meta_cache=None)
     meta_cache 는 같은 취지의 TTL 캐시로, 거의 변하지 않는 k8s 조회(ISVC 부재 ·
     Service selector)를 사이클 간 재사용한다 — 자세한 규칙은 gpu.META_TTL 참고.
     둘 다 미지정이면 캐시 없이 종전대로 매 사이클 조회한다(CLI/테스트 경로).
+    지금 부하(load)는 여기서 수집하지 않는다 — Pod 마다 HTTP 를 찌르는 팬아웃이라
+    수집 사이클을 늘린다. 리프레셔가 자체 주기로 모아 collect_once 에서 주입한다
+    (느린 /health 와 같은 방식).
     """
     snap = {
         "version": __version__,
@@ -237,6 +241,17 @@ def summarize(snap):
         "gpu_known": False,
         "k8s_errors": 0,             # backend Pod 수 수집 실패 deployment 수
         "gpu_errors": 0,             # GPU 정보 수집 실패 deployment 수
+        # --- 지금 부하 ("바쁜가") ---
+        "load_known": False,
+        "running": 0,                # 지금 처리 중인 요청 합
+        "queued": 0,                 # 지금 대기 중인 요청 합
+        "models_busy": 0,            # busy + saturated 인 model_name 수
+        "models_saturated": 0,
+        "models_load_total": 0,      # 부하를 아는 model_name 수(분모)
+        "kv_max_pct": None,          # 가장 붐비는 Pod 의 KV 사용률
+        "busiest": None,             # {model_name, state, reason}
+        "load_pods_sampled": 0,
+        "load_pods_failed": 0,
     }
     ll = snap.get("litellm")
     if ll:
@@ -299,6 +314,60 @@ def summarize(snap):
                 s["gpu_known"] = True
                 for prod, n in (d.get("gpu_products") or {}).items():
                     s["gpu_products"][prod] = s["gpu_products"].get(prod, 0) + n
+
+        # --- 지금 부하 집계 ---
+        # 두 축을 구분한다:
+        #  - 요청 수(running/queued)·Pod 표본은 **물리 백엔드** 단위라 (ns,svc)
+        #    로 dedup 한다(위 backend_pods 와 같은 이유).
+        #  - "지금 바쁜 모델" 카드는 **model_name** 단위다. 한 model_name 이
+        #    여러 backend 로 로드밸런싱될 수 있으므로 행을 세면 모델 수가 부풀려진다.
+        # 모델 등급 = 그 모델의 backend 중 **가장 나쁜 것**. LiteLLM 기본 라우팅은
+        # simple-shuffle 이라 여유 있는 backend 가 하나 있어도 요청 일부는 포화된
+        # backend 로 간다 — "하나가 한가하니 괜찮다"는 보장이 없다. 대신 화면에는
+        # 등급 분포를 함께 보여 과잉 경보가 되지 않게 한다.
+        seen_load = set()
+        by_model = {}
+        for d in ll.get("deployments") or []:
+            load = d.get("load")
+            if not load:
+                continue
+            state = load.get("state", "unknown")
+            name = d.get("model_name") or "?"
+            cur = by_model.setdefault(name, {"rank": -1, "state": "unknown",
+                                             "reason": None})
+            rank = LOAD_RANK.get(state, -1)
+            if rank > cur["rank"]:
+                cur.update(rank=rank, state=state,
+                           reason=load.get("state_reason"))
+            key = (d.get("namespace"), d.get("service"))
+            if key == (None, None):
+                key = ("", d.get("backend_ref") or d.get("api_base"))
+            if key in seen_load:
+                continue
+            seen_load.add(key)
+            s["load_pods_sampled"] += load.get("pods_sampled") or 0
+            s["load_pods_failed"] += load.get("pods_failed") or 0
+            if load.get("running") is not None:
+                s["running"] += load["running"]
+                s["load_known"] = True
+            if load.get("waiting") is not None:
+                s["queued"] += load["waiting"]
+                s["load_known"] = True
+            kv = load.get("kv_cache_pct")
+            if kv is not None:
+                s["kv_max_pct"] = kv if s["kv_max_pct"] is None else max(
+                    s["kv_max_pct"], kv)
+                s["load_known"] = True
+        known = {n: v for n, v in by_model.items() if v["rank"] >= 0}
+        s["models_load_total"] = len(known)
+        s["models_saturated"] = sum(1 for v in known.values()
+                                    if v["state"] == "saturated")
+        s["models_busy"] = sum(1 for v in known.values()
+                               if v["state"] in ("busy", "saturated"))
+        worst = max(known.items(), key=lambda kv: kv[1]["rank"], default=None)
+        if worst and worst[1]["rank"] >= LOAD_RANK["busy"]:
+            s["busiest"] = {"model_name": worst[0], "state": worst[1]["state"],
+                            "reason": worst[1]["reason"]}
 
     backends = snap.get("backends") or []
     s["backends_total"] = len(backends)

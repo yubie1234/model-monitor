@@ -28,6 +28,7 @@ from app.services import backend_count as _bc
 from app.services import demo as _demo
 from app.services import gpu as _gpu
 from app.services import litellm as _ll
+from app.services import load as _load
 from app.services import prometheus as _prom
 from app.services import snapshot as _snap
 from app.services import state as _state
@@ -58,6 +59,22 @@ m = types.SimpleNamespace(
     _pod_gpu=_gpu._pod_gpu,
     _pod_ready=_gpu._pod_ready,
     _pod_engine=_gpu._pod_engine,
+    _pod_port=_gpu._pod_port,
+    # --- 지금 부하(엔진 게이지) ---
+    parse_prom_metrics=_load.parse_prom_metrics,
+    live_from_prom=_load.live_from_prom,
+    live_from_metrics=_load.live_from_metrics,
+    aggregate_pod_loads=_load.aggregate_pod_loads,
+    classify_load=_load.classify_load,
+    load_targets=_load.load_targets,
+    skipped_load=_load.skipped_load,
+    aggregate_targets=_load.aggregate_targets,
+    collect_load=_load.collect_load,
+    throughput_from_counter=_load.throughput_from_counter,
+    build_prom_query=_load.build_prom_query,
+    collect_load_via_prometheus=_load.collect_load_via_prometheus,
+    merge_load_sources=_load.merge_load_sources,
+    attach_load_to_deployments=_load.attach_load_to_deployments,
     collect_user_access=_ua.collect_user_access,
     AccessCache=_ua.AccessCache,
     filter_snapshot_for_user=_ua.filter_snapshot_for_user,
@@ -2437,6 +2454,8 @@ def _settings_ns(**over):
         k8s_insecure=False, k8s_timeout=5.0,
         user_view=False, user_view_show_internal=False,
         user_view_cache_ttl=30.0, metrics=True, metrics_token=None,
+        load=True, load_timeout=3.0, load_threads=12,
+        prometheus_url=None, prometheus_first=False, prometheus_lookback="2m",
         config_file=None,
     )
     base.update(over)
@@ -2811,6 +2830,380 @@ class TestVersionConsistency(unittest.TestCase):
         for v in labels:
             self.assertEqual(v, app.__version__,
                              "deploy/k8s.yaml 의 버전 라벨이 __version__ 과 불일치")
+
+
+# ---------------------------------------------------------------------------
+# 지금 부하(엔진 게이지) — vLLM/SGLang 이름·라벨 차이 흡수와 정직성 규칙
+# ---------------------------------------------------------------------------
+class TestEngineMetricDifferences(unittest.TestCase):
+    """엔진 소스에서 확인한 형태를 고정한다.
+
+    - vLLM V0: vllm:gpu_cache_usage_perc / V1: vllm:kv_cache_usage_perc
+    - SGLang : 선언은 sglang:xxx 인데 prometheus_client 버전에 따라 노출이
+               sglang_xxx (언더스코어) — 양쪽 다 받아야 한다.
+    - 라벨: vLLM(model_name, engine) vs SGLang(model_name, engine_type, tp_rank, ...)
+    """
+
+    def test_operator_real_sglang_line(self):
+        # 운영 중인 SGLang pod 의 실제 /metrics 출력(그대로 붙여넣음).
+        real = (
+            '# HELP sglang:num_running_reqs The number of running requests.\n'
+            '# TYPE sglang:num_running_reqs gauge\n'
+            'sglang:num_running_reqs{engine_type="unified",'
+            'model_name="sglang-gemma-4-31B-it-fp8-dynamic",'
+            'moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0\n')
+        live = m.live_from_prom(real)
+        self.assertEqual(live["engine"], "sglang")
+        self.assertEqual(live["running"], 0)
+        self.assertIsNone(live["waiting"])          # 이 줄만으론 큐를 모른다
+        agg = m.aggregate_pod_loads([dict(live, url="http://10.0.0.1:8000")], "pods")
+        self.assertEqual(m.classify_load(agg)[0], "idle")   # 0건 = 놀고 있음(모름 아님)
+
+    def test_vllm_v0_and_v1_cache_names(self):
+        v0 = m.live_from_prom('vllm:num_requests_running{model_name="a"} 3\n'
+                              'vllm:gpu_cache_usage_perc{model_name="a"} 0.55\n')
+        v1 = m.live_from_prom('vllm:num_requests_running{model_name="a",engine="0"} 3\n'
+                              'vllm:kv_cache_usage_perc{model_name="a",engine="0"} 0.81\n')
+        self.assertEqual(v0["kv_cache_pct"], 55.0)
+        self.assertEqual(v1["kv_cache_pct"], 81.0)
+
+    def test_sglang_underscore_prefix(self):
+        live = m.live_from_prom(
+            'sglang_num_running_reqs{model_name="q",engine_type="unified"} 5.0\n'
+            'sglang_num_queue_reqs{model_name="q",engine_type="unified"} 2.0\n'
+            'sglang_token_usage{model_name="q"} 0.62\n'
+            'sglang_gen_throughput{model_name="q"} 812.0\n')
+        self.assertEqual(live["engine"], "sglang")
+        self.assertEqual((live["running"], live["waiting"]), (5, 2))
+        self.assertEqual(live["kv_cache_pct"], 62.0)
+        self.assertEqual(live["throughput"], 812.0)   # SGLang 은 tok/s 를 직접 준다
+
+    def test_colon_and_underscore_are_equivalent(self):
+        a = m.live_from_prom('sglang:num_running_reqs{model_name="q"} 5.0\n'
+                             'sglang:token_usage{model_name="q"} 0.62\n')
+        b = m.live_from_prom('sglang_num_running_reqs{model_name="q"} 5.0\n'
+                             'sglang_token_usage{model_name="q"} 0.62\n')
+        self.assertEqual(a, b)
+
+    def test_tp_ranks_not_double_counted_but_dp_summed(self):
+        # tp_rank 는 같은 스케줄러 상태의 복제 보고 -> 접는다. dp_rank 는 다른 워커 -> 합.
+        live = m.live_from_prom(
+            'sglang_num_running_reqs{model_name="q",dp_rank="0",tp_rank="0"} 3\n'
+            'sglang_num_running_reqs{model_name="q",dp_rank="0",tp_rank="1"} 3\n'
+            'sglang_num_running_reqs{model_name="q",dp_rank="1",tp_rank="0"} 5\n'
+            'sglang_num_running_reqs{model_name="q",dp_rank="1",tp_rank="1"} 5\n')
+        self.assertEqual(live["running"], 8)
+        vllm = m.live_from_prom('vllm:num_requests_running{model_name="a",engine="0"} 3\n'
+                                'vllm:num_requests_running{model_name="a",engine="1"} 4\n')
+        self.assertEqual(vllm["running"], 7)
+
+    def test_alias_names_are_alternatives_not_additive(self):
+        live = m.live_from_prom('vllm:num_requests_running{model_name="a"} 2\n'
+                                'vllm:kv_cache_usage_perc{model_name="a"} 0.40\n'
+                                'vllm:gpu_cache_usage_perc{model_name="a"} 0.40\n')
+        self.assertEqual(live["kv_cache_pct"], 40.0)   # 80 이 되면 안 된다
+
+    def test_percent_scale_not_doubled_and_unknown_engine_ignored(self):
+        self.assertEqual(
+            m.live_from_prom('vllm:num_requests_running 1\n'
+                             'vllm:kv_cache_usage_perc 73.0\n')["kv_cache_pct"], 73.0)
+        self.assertIsNone(m.live_from_prom('tgi_queue_size 3\n'))
+
+
+class TestClassifyLoad(unittest.TestCase):
+    def test_states(self):
+        cases = [
+            ({"running": 0, "waiting": 0, "kv_cache_pct": 2.0}, "idle"),
+            ({"running": 3, "waiting": 0, "kv_cache_pct": 40.0}, "ok"),
+            ({"running": 3, "waiting": 1, "kv_cache_pct": 40.0}, "busy"),
+            ({"running": 3, "waiting": 0, "kv_cache_pct": 85.0}, "busy"),
+            ({"running": 9, "waiting": 5, "kv_cache_pct": 50.0}, "saturated"),
+            ({"running": 9, "waiting": 0, "kv_cache_pct": 96.0}, "saturated"),
+        ]
+        for load, expected in cases:
+            self.assertEqual(m.classify_load(load)[0], expected, load)
+
+    def test_unknown_is_not_zero(self):
+        self.assertEqual(m.classify_load(None)[0], "unknown")
+        self.assertEqual(m.classify_load({"error": "connection refused"})[0], "unknown")
+
+    def test_thresholds_overridable(self):
+        load = {"running": 2, "waiting": 0, "kv_cache_pct": 60.0}
+        self.assertEqual(m.classify_load(load)[0], "ok")
+        self.assertEqual(m.classify_load(load, {"kv_busy": 50.0})[0], "busy")
+
+
+class TestAggregatePodLoads(unittest.TestCase):
+    def test_sum_requests_max_kv(self):
+        agg = m.aggregate_pod_loads([
+            {"url": "a", "engine": "vllm", "running": 5, "waiting": 3,
+             "kv_cache_pct": 88.0, "throughput": 100.0},
+            {"url": "b", "engine": "vllm", "running": 4, "waiting": 2,
+             "kv_cache_pct": 94.0, "throughput": 150.0}], "pods")
+        self.assertEqual((agg["running"], agg["waiting"]), (9, 5))
+        self.assertEqual(agg["kv_cache_pct"], 94.0)       # 최댓값
+        self.assertEqual(agg["kv_cache_avg_pct"], 91.0)
+        self.assertEqual(agg["throughput"], 250.0)
+
+    def test_partial_failure_is_visible(self):
+        agg = m.aggregate_pod_loads([
+            {"url": "a", "engine": "vllm", "running": 5, "waiting": 0,
+             "kv_cache_pct": 10.0},
+            {"url": "b", "error": "connection error: timed out"}], "pods")
+        self.assertEqual(agg["running"], 5)
+        self.assertEqual((agg["pods_sampled"], agg["pods_failed"]), (1, 1))
+
+    def test_all_failed_reports_error(self):
+        agg = m.aggregate_pod_loads([{"url": "x", "error": "refused"}], "lb-sample")
+        self.assertIsNone(agg["running"])
+        self.assertEqual(m.classify_load(agg)[0], "unknown")
+
+
+class TestThroughputCounter(unittest.TestCase):
+    def test_needs_two_samples_and_survives_restart(self):
+        cache = {}
+        self.assertIsNone(m.throughput_from_counter(cache, "p", 1000, 100.0))
+        self.assertEqual(m.throughput_from_counter(cache, "p", 2000, 110.0), 100.0)
+        self.assertIsNone(m.throughput_from_counter(cache, "p", 5, 120.0))  # 재시작
+        self.assertIsNone(m.throughput_from_counter(None, "p", 6000, 130.0))
+
+
+class TestLoadTargets(unittest.TestCase):
+    """조회 대상 선정 — 여기서 잘못 고르면 모델을 깨우거나 남의 서버를 찌른다."""
+
+    def _safe(self, d):
+        return _ll._deployment_health_safe(d)
+
+    def test_pods_preferred_and_lb_fallback(self):
+        deps = [{"model_name": "A", "api_base": "http://a.ns.svc:8080/v1",
+                 "namespace": "ns", "service": "a",
+                 "backend_pods": [{"ip": "10.0.0.1", "port": 8080, "pod": "p0"},
+                                  {"ip": "10.0.0.2", "port": 8080, "pod": "p1"}]},
+                # Pod 주소가 없지만 일반 Service(안전) -> LB 1회 샘플
+                {"model_name": "B", "api_base": "http://b.ns.svc:8080/openai/v1",
+                 "namespace": "ns", "service": "b", "network_type": "service"}]
+        t, alias = m.load_targets(deps, m._strip_openai_suffix, self._safe)
+        self.assertEqual(t["http://a.ns.svc:8080"]["scope"], "pods")
+        self.assertEqual(t["http://a.ns.svc:8080"]["urls"],
+                         ["http://10.0.0.1:8080", "http://10.0.0.2:8080"])
+        self.assertEqual(t["http://b.ns.svc:8080"]["scope"], "lb-sample")
+        self.assertEqual(alias, {})
+
+    def test_scale_to_zero_is_never_probed(self):
+        # LB 로 찌르면 activator 를 거쳐 **모델을 깨운다** — 전량 /health 를 기본
+        # off 로 둔 것과 같은 이유로, Pod 주소가 없으면 조회하지 않는다.
+        deps = [{"model_name": "S", "api_base": "http://s.kserve.svc:8080/v1",
+                 "namespace": "kserve", "service": "s-predictor",
+                 "scale_to_zero": True, "mode": "Serverless",
+                 "backend_source": "knative-pa"}]
+        t, _ = m.load_targets(deps, m._strip_openai_suffix, self._safe)
+        spec = t["http://s.kserve.svc:8080"]
+        self.assertEqual(spec["scope"], "skipped")
+        self.assertEqual(spec["urls"], [])
+        load = m.skipped_load(spec)
+        state, reason = m.classify_load(load)
+        self.assertEqual(state, "unknown")      # 0 이 아니라 '모름'
+        self.assertIn("깨울 위험", reason)       # 이유를 들고 다닌다
+
+    def test_external_backend_is_never_probed(self):
+        deps = [{"model_name": "E", "api_base": "https://api.example.com/v1",
+                 "network_type": "external", "backend_source": "external"}]
+        t, _ = m.load_targets(deps, m._strip_openai_suffix, self._safe)
+        spec = t["https://api.example.com"]
+        self.assertEqual(spec["scope"], "skipped")
+        self.assertIn("external", spec["skip_reason"])
+
+    def test_shared_service_probed_once_via_alias(self):
+        deps = [{"model_name": "A", "api_base": "http://a.ns.svc:8080/v1",
+                 "namespace": "ns", "service": "svc", "network_type": "service"},
+                # 같은 (ns,svc) 를 가리키는 다른 주소 -> 재조회 없이 별칭
+                {"model_name": "B", "api_base": "http://a2.ns.svc:8080/v1",
+                 "namespace": "ns", "service": "svc", "network_type": "service"},
+                {"model_name": "C"}]                      # api_base 없음 -> 제외
+        t, alias = m.load_targets(deps, m._strip_openai_suffix, self._safe)
+        self.assertEqual(list(t), ["http://a.ns.svc:8080"])
+        self.assertEqual(alias, {"http://a2.ns.svc:8080": "http://a.ns.svc:8080"})
+        # 두 행 모두 같은 부하 값을 받는다
+        rows = m.attach_load_to_deployments(
+            deps, {"http://a.ns.svc:8080": {"state": "busy"}},
+            m._strip_openai_suffix, alias)
+        self.assertEqual(rows[0]["load"]["state"], "busy")
+        self.assertEqual(rows[1]["load"]["state"], "busy")
+
+    def test_skipped_targets_are_not_revived_by_prometheus(self):
+        targets = {"http://s:8080": {"scope": "skipped", "urls": [],
+                                     "skip_reason": "테스트"}}
+        with mock.patch.object(_load, "http_get_json",
+                               lambda *a, **k: self.fail("조회하면 안 된다")):
+            out = m.collect_load_via_prometheus(
+                targets, {"prometheus_url": "http://prom:9090"}, 100.0)
+        self.assertEqual(out, {})
+
+
+class TestPodPort(unittest.TestCase):
+    def test_prefers_named_http_then_first(self):
+        pod = {"spec": {"containers": [
+            {"resources": {"limits": {"nvidia.com/gpu": "1"}},
+             "ports": [{"name": "metrics", "containerPort": 9090},
+                       {"name": "http", "containerPort": 8000}]}]}}
+        self.assertEqual(m._pod_port(pod), 8000)
+        self.assertEqual(m._pod_port(
+            {"spec": {"containers": [{"ports": [{"containerPort": 30000}]}]}}), 30000)
+        self.assertIsNone(m._pod_port({"spec": {"containers": [{}]}}))
+
+
+class TestCollectLoad(unittest.TestCase):
+    def test_probes_every_pod(self):
+        pages = {
+            "http://10.0.0.1:8000/metrics":
+                'vllm:num_requests_running 6\nvllm:num_requests_waiting 4\n'
+                'vllm:gpu_cache_usage_perc 0.93\n',
+            "http://10.0.0.2:8000/metrics":
+                'vllm:num_requests_running 2\nvllm:num_requests_waiting 1\n'
+                'vllm:gpu_cache_usage_perc 0.40\n',
+        }
+        seen = []
+
+        def fake(url, api_key=None, timeout=10, accept="text/plain"):
+            seen.append(url)
+            return (True, pages[url], None) if url in pages else (
+                False, None, "connection error: refused")
+
+        with mock.patch.object(_load, "http_get_text", fake):
+            out = m.collect_load(
+                {"http://svc:8000": {"urls": ["http://10.0.0.1:8000",
+                                              "http://10.0.0.2:8000"],
+                                     "scope": "pods"}}, 3, 100.0)
+        load = out["http://svc:8000"]
+        self.assertEqual(sorted(seen), sorted(pages))
+        self.assertEqual((load["running"], load["waiting"]), (8, 5))
+        self.assertEqual(load["state"], "saturated")
+
+    def test_unreachable_is_unknown_not_zero(self):
+        with mock.patch.object(_load, "http_get_text",
+                               lambda *a, **k: (False, None, "connection error: refused")):
+            out = m.collect_load({"http://svc:8000": {"urls": ["http://svc:8000"],
+                                                      "scope": "lb-sample"}}, 3, 100.0)
+        self.assertEqual(out["http://svc:8000"]["state"], "unknown")
+        self.assertIsNone(out["http://svc:8000"]["running"])
+
+
+class TestPrometheusFallback(unittest.TestCase):
+    TARGETS = {"http://svc:8080": {"urls": ["http://10.0.0.1:8080"], "scope": "pods",
+                                   "namespace": "kserve", "service": "qwen",
+                                   "pod_names": ["qwen-0", "qwen-1"]}}
+    SETTINGS = {"prometheus_url": "http://prom:9090", "timeout": 5,
+                "prometheus_lookback": "2m", "load_thresholds": {}}
+
+    def _vector(self, rows):
+        return {"status": "success", "data": {"resultType": "vector", "result": [
+            {"metric": dict(lb, __name__=name), "value": [1787000000.0, str(v)]}
+            for name, lb, v in rows]}}
+
+    def _run(self, response):
+        seen = {}
+
+        def fake(url, api_key=None, timeout=10):
+            seen["url"] = url
+            return ((True, response, None) if response is not None
+                    else (False, None, "HTTP 503 Service Unavailable"))
+
+        with mock.patch.object(_load, "http_get_json", fake):
+            out = m.collect_load_via_prometheus(self.TARGETS, self.SETTINGS, 100.0)
+        return out["http://svc:8080"], seen
+
+    def test_query_scopes_and_covers_both_prefixes(self):
+        q = m.build_prom_query("kserve", ["qwen-0"], "qwen")
+        self.assertIn('namespace="kserve"', q)
+        self.assertIn('pod=~"qwen-0"', q)
+        self.assertIn("vllm:num_requests_running", q)
+        self.assertIn("sglang_num_running_reqs", q)
+
+    def test_aggregates_like_direct_scrape(self):
+        load, seen = self._run(self._vector([
+            ("vllm:num_requests_running", {"pod": "qwen-0"}, 5),
+            ("vllm:num_requests_waiting", {"pod": "qwen-0"}, 3),
+            ("vllm:kv_cache_usage_perc", {"pod": "qwen-0"}, 0.88),
+            ("vllm:num_requests_running", {"pod": "qwen-1"}, 4),
+            ("vllm:num_requests_waiting", {"pod": "qwen-1"}, 2),
+            ("vllm:kv_cache_usage_perc", {"pod": "qwen-1"}, 0.94)]))
+        self.assertEqual(load["scope"], "prometheus")
+        self.assertEqual((load["running"], load["waiting"]), (9, 5))
+        self.assertEqual(load["kv_cache_pct"], 94.0)
+        self.assertEqual(load["state"], "saturated")
+        self.assertIn("lookback_delta=2m", seen["url"])   # stale 샘플 차단
+
+    def test_empty_and_error_are_unknown(self):
+        empty, _ = self._run(self._vector([]))
+        self.assertEqual(empty["state"], "unknown")
+        self.assertIn("샘플 없음", empty["error"])
+        down, _ = self._run(None)
+        self.assertEqual(down["state"], "unknown")
+        self.assertIn("503", down["error"])
+
+    def test_merge_only_replaces_when_sample_is_better(self):
+        direct = {"a": {"pods_sampled": 3, "scope": "pods"},
+                  "b": {"pods_sampled": 0, "scope": "pods"}}
+        prom = {"a": {"pods_sampled": 1, "scope": "prometheus"},
+                "b": {"pods_sampled": 2, "scope": "prometheus"}}
+        out = m.merge_load_sources(direct, prom)
+        self.assertEqual(out["a"]["scope"], "pods")
+        self.assertEqual(out["b"]["scope"], "prometheus")
+
+
+class TestSummarizeLoad(unittest.TestCase):
+    """카드 수치: 모델 단위 등급 vs 물리 백엔드 단위 요청 수."""
+
+    def _dep(self, name, ns, svc, state, running, waiting, kv):
+        return {"model_name": name, "namespace": ns, "service": svc,
+                "api_base": "http://%s/v1" % svc,
+                "load": {"state": state, "state_reason": "t", "running": running,
+                         "waiting": waiting, "kv_cache_pct": kv,
+                         "pods_sampled": 1, "pods_failed": 0, "per_pod": []}}
+
+    def test_model_grade_is_worst_backend(self):
+        # 한 모델의 backend 2개: 하나는 포화, 하나는 여유 -> 모델은 saturated
+        ll = {"groups": [], "health": None, "deployments": [
+            self._dep("A", "ns", "a1", "saturated", 15, 9, 94.0),
+            self._dep("A", "ns", "a2", "ok", 4, 0, 41.0),
+            self._dep("B", "ns", "b1", "idle", 0, 0, 1.0)]}
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertEqual(s["models_load_total"], 2)      # 모델 2개(행 3개 아님)
+        self.assertEqual(s["models_saturated"], 1)
+        self.assertEqual(s["models_busy"], 1)
+        self.assertEqual(s["running"], 19)               # 15+4+0
+        self.assertEqual(s["queued"], 9)
+        self.assertEqual(s["kv_max_pct"], 94.0)
+        self.assertEqual(s["busiest"]["model_name"], "A")
+
+    def test_shared_service_counted_once_but_both_models_graded(self):
+        # 서로 다른 model_name 이 같은 Service 를 공유 -> 요청 수는 한 번만,
+        # 등급은 두 모델 모두에 적용된다(둘 다 그 백엔드로 라우팅되므로).
+        shared = self._dep("A", "ns", "svc", "busy", 4, 2, 70.0)
+        twin = dict(shared, model_name="B")
+        s = m.summarize({"litellm": {"groups": [], "health": None,
+                                     "deployments": [shared, twin]},
+                         "backends": []})
+        self.assertEqual(s["running"], 4)
+        self.assertEqual(s["queued"], 2)
+        self.assertEqual(s["models_busy"], 2)
+
+
+class TestDemoLoad(unittest.TestCase):
+    def test_demo_has_load_and_multi_backend_model(self):
+        snap = m.demo_snapshot()
+        self.assertTrue(snap.get("load_enabled"))
+        s = snap["summary"]
+        self.assertTrue(s["load_known"])
+        self.assertGreater(s["models_saturated"], 0)
+        deps = snap["litellm"]["deployments"]
+        names = [d["model_name"] for d in deps]
+        multi = [n for n in set(names) if names.count(n) > 1]
+        self.assertTrue(multi, "데모에 backend 여러 개인 모델이 있어야 한다")
+        # 그 모델의 backend 들이 서로 다른 등급을 갖는지(그룹 롤업 렌더 경로 확인)
+        states = {d["load"]["state"] for d in deps
+                  if d["model_name"] == multi[0] and d.get("load")}
+        self.assertGreaterEqual(len(states), 2)
 
 
 if __name__ == "__main__":

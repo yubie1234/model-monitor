@@ -4,7 +4,60 @@ import time
 from datetime import datetime
 
 from app import __version__
+from app.services.load import aggregate_pod_loads, classify_load
 from app.services.snapshot import merge_deployments_with_health, summarize
+
+
+def _pod(url, run, wait, kv, tput=None, engine="vllm"):
+    return {"url": url, "engine": engine, "running": run, "waiting": wait,
+            "kv_cache_pct": kv, "throughput": tput}
+
+
+def _skipped(reason):
+    """조회하지 않기로 한 대상(깨울 위험/external) — 0 이 아니라 '모름'."""
+    agg = aggregate_pod_loads([], "skipped")
+    agg["error"] = reason
+    agg["state"], agg["state_reason"] = classify_load(agg)
+    return agg
+
+
+def _load(samples, scope="pods"):
+    """데모도 실제 집계·판정 함수를 통과시킨다(화면과 로직이 어긋나지 않게)."""
+    agg = aggregate_pod_loads(samples, scope)
+    agg["state"], agg["state_reason"] = classify_load(agg)
+    return agg
+
+
+# api_base(Service) -> 지금 부하. 같은 Service 를 공유하는 model_name 은 같은 값을
+# 받는다(물리 백엔드가 하나이므로) — Router-Qwen3.6-35B 가 그 예다.
+def _demo_loads():
+    return {
+        # 3 Pod 모두 붐비고 큐까지 쌓임 -> FULL
+        "http://qwen36-35b-predictor.kserve.svc:8080/v1": _load([
+            _pod("http://10.42.1.11:8080", 5, 3, 88.0, 410),
+            _pod("http://10.42.1.12:8080", 4, 2, 91.5, 380),
+            _pod("http://10.42.2.7:8080", 6, 4, 94.0, 445)]),
+        # 같은 모델의 두 번째 backend 는 여유 -> 모델 전체로는 FULL·ok 가 섞인다
+        "http://qwen36-35b-predictor-2.kserve.svc:8080/v1": _load([
+            _pod("http://10.42.3.4:8080", 2, 0, 41.0, 150),
+            _pod("http://10.42.3.5:8080", 2, 0, 38.0, 140)]),
+        # SGLang: 1 Pod 만 ready(1/3) — 처리 중이지만 큐는 없음
+        "http://qwen36-27b-sglang.serving.svc:30000/v1": _load([
+            _pod("http://10.42.4.2:30000", 3, 0, 29.0, 120, "sglang")]),
+        # DOWN 인 모델 -> 게이지를 못 읽는다. 0 이 아니라 '모름'.
+        "http://qwen3-32b-vllm.serving.svc:8000/v1": _load([
+            {"url": "http://10.42.5.1:8000",
+             "error": "connection error: [Errno 111] Connection refused"}]),
+        # scale-to-zero: Pod 가 없다. LB 로 찌르면 activator 를 거쳐 **모델을
+        # 깨우므로** 아예 조회하지 않고, 그 사실을 이유와 함께 '모름'으로 둔다.
+        "http://qwen3-embd-predictor.kserve.svc:8080/v1": _skipped(
+            "Pod 주소 미확인 + 깨울 위험(serverless/scale-to-zero) — LB 조회 생략"),
+        # 일시중지(PAUSED): Pod 는 멀쩡하고 게이지도 읽히는데 트래픽이 0 이다.
+        # "거짓 정상"을 부하 쪽에서도 보여주는 예 — idle 이지 장애가 아니다.
+        "http://llama33-70b-vllm.serving.svc:8000/v1": _load([
+            _pod("http://10.42.6.1:8000", 0, 0, 1.0, 0),
+            _pod("http://10.42.6.2:8000", 0, 0, 1.0, 0)]),
+    }
 
 
 def demo_snapshot():
@@ -172,6 +225,13 @@ def demo_snapshot():
         key=lambda g: (str(g.get("model_group") or "").lower(),
                        str(g.get("model_group") or "")))
     snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
+    # 지금 부하 — api_base 기준으로 붙인다(같은 Service 를 공유하면 같은 값).
+    loads = _demo_loads()
+    for d in snap["litellm"]["deployments"]:
+        lo = loads.get(d.get("api_base"))
+        if lo:
+            d["load"] = lo
+    snap["load_enabled"] = True
     snap["summary"] = summarize(snap)
     snap["demo"] = True
     return snap

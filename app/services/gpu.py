@@ -110,6 +110,33 @@ def _pod_engine(pod):
     return None
 
 
+def _serving_container(pod):
+    """서빙 컨테이너 추정 — GPU 를 점유한 컨테이너 우선(사이드카 배제)."""
+    ctrs = (pod.get("spec") or {}).get("containers") or []
+    gpu_ctrs = [c for c in ctrs if _ctr_gpu(c) > 0]
+    return (gpu_ctrs or ctrs or [None])[0]
+
+
+def _pod_port(pod):
+    """서빙 컨테이너의 HTTP 포트 -> /metrics 를 찌를 포트.
+
+    vLLM·SGLang 은 OpenAI API 와 /metrics 를 같은 포트로 서빙한다. 이름이 붙어
+    있으면 http 계열을 우선하고(사이드카/메트릭 전용 포트 오인 방지), 없으면 첫
+    containerPort. 포트를 못 찾으면 None -> 호출측이 그 Pod 을 건너뛴다(추측 금지).
+    """
+    ctr = _serving_container(pod)
+    ports = (ctr or {}).get("ports") or []
+    for pt in ports:
+        if (pt.get("name") or "").lower() in ("http", "http1", "user-port",
+                                              "http-usermetric"):
+            if pt.get("containerPort"):
+                return pt["containerPort"]
+    for pt in ports:
+        if pt.get("containerPort"):
+            return pt["containerPort"]
+    return None
+
+
 def _pod_ready(pod):
     """Running + Ready condition True 인 Pod 만 '서빙 중'으로 본다(backends_ready 와 동일 기준)."""
     st = pod.get("status") or {}
@@ -188,7 +215,9 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache,
     """(ns,svc) 뒤 ready Pod 들의 GPU 수 합 + 장치별 집계 + 서빙 엔진 판별.
 
     -> {"gpu_ready": int|None, "gpu_products": {short: count}, "gpu_error": str|None,
-        "engine": "vllm"|"sglang"|None}
+        "engine": "vllm"|"sglang"|None, "pod_targets": [{ip, port, pod, engine}]}
+       pod_targets 는 부하(load) 수집이 Pod 마다 /metrics 를 읽기 위한 주소다.
+       이 Pod 목록은 GPU 집계를 위해 어차피 받아오므로 **k8s 추가 호출이 없다**.
        gpu_ready=None 은 조회 실패(?), 0 은 GPU 없음/scale-to-zero.
        engine 은 이미 받아온 Pod 컨테이너(image/command/args)에서 추가 API 호출
        없이 판별한다 — 미상/Pod 없음(scale-to-zero)이면 None(호출측 휴리스틱 폴백).
@@ -198,7 +227,7 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache,
     아니면 Service 의 spec.selector 로 labelSelector 를 만든다.
     """
     out = {"gpu_ready": None, "gpu_products": {}, "gpu_error": None,
-           "engine": None}
+           "engine": None, "pod_targets": []}
     if found:
         sel = "serving.kserve.io/inferenceservice=%s" % isvc
     else:
@@ -229,6 +258,14 @@ def collect_gpu_for_service(client, ns, svc, isvc, found, node_cache,
         eng = _pod_engine(pod)
         if eng:
             engines.add(eng)
+        # 부하 수집용 Pod 주소 — 이 Pod 목록은 이미 받아온 것이라 추가 호출이 없다.
+        # LB(api_base)로 /metrics 를 찌르면 뒤에 있는 Pod 중 하나만 응답하므로,
+        # "지금 바쁜가"를 제대로 보려면 Pod 주소가 필요하다.
+        ip, port = (pod.get("status") or {}).get("podIP"), _pod_port(pod)
+        if ip and port:
+            out["pod_targets"].append(
+                {"ip": ip, "port": port,
+                 "pod": (pod.get("metadata") or {}).get("name"), "engine": eng})
         g = _pod_gpu(pod)
         if g <= 0:
             continue

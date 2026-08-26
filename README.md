@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v1.1.0** — 관리자 일시중지(`model_info.blocked`) 를 `PAUSED` 로 구분 · 장애 원인·수집 신뢰도 가시화 · 대시보드 UX · 시스템 부하 개선
+**버전: v1.2.0** — 관리자 일시중지(`model_info.blocked`) 를 `PAUSED` 로 구분 · 장애 원인·수집 신뢰도 가시화 · 대시보드 UX · 시스템 부하 개선
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -298,6 +298,10 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_PROBE_BACKENDS` | 백엔드 직접 probe (false) |
 | `MONITOR_BACKEND_COUNT` | LB 뒤 backend Pod 개수 수집 (true) |
 | `MONITOR_GPU_INFO` | GPU 개수/장치명 수집 (true; Pod·Node 읽기 권한 필요) |
+| `MONITOR_LOAD` | **지금 부하** 수집 (true; `MONITOR_BACKEND_COUNT` 필요) — 각 backend Pod 의 `/metrics`(vLLM/SGLang 게이지)를 읽어 처리 중/대기 요청·KV 캐시 사용률·tok/s 를 표시. Pod 주소는 GPU 집계가 이미 받아오는 Pod 목록에서 나오므로 **k8s 호출이 늘지 않는다**. Pod 주소를 못 얻는 백엔드(scale-to-zero·external)는 **조회하지 않고** 이유와 함께 `?` — LB 로 찌르면 activator 를 거쳐 모델을 깨우기 때문 |
+| `MONITOR_LOAD_TIMEOUT` | Pod `/metrics` 조회 타임아웃 초 (3) — 죽은 Pod 가 사이클을 잡아먹지 않게 짧게 |
+| `MONITOR_PROMETHEUS_URL` | Pod 직접 조회가 막혔을 때(NetworkPolicy·mTLS) 같은 게이지를 대신 읽을 외부 Prometheus URL. 출처가 같아 정확도는 동일하고 스크레이프 주기만큼 늦다 |
+| `MONITOR_PROMETHEUS_FIRST` / `MONITOR_PROMETHEUS_LOOKBACK` | Pod 조회를 건너뛰고 Prometheus 만 사용 (false) / 조회 구간 (`2m` — 이보다 오래된 샘플은 '모름'으로 둔다) |
 | `MONITOR_METRICS` | Prometheus `/metrics` (true) |
 | `MONITOR_METRICS_TOKEN` | 키 필수 모드에서 `/metrics` 스크레이프용 Bearer 토큰 (미설정=admin 키만) |
 | `MONITOR_USER_VIEW` | 키 필수(per-user) 모드 — 키 입력해야 조회, admin 키는 전체 뷰 (false) |
@@ -305,6 +309,9 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_USER_VIEW_CACHE_TTL` | 키별 접근(/v1/models) 캐시 TTL 초 (30) |
 | `MONITOR_K8S_API_SERVER` / `MONITOR_K8S_TOKEN_FILE` / `MONITOR_K8S_CA_FILE` | k8s 접근 오버라이드 |
 | `MONITOR_K8S_INSECURE` / `MONITOR_K8S_TIMEOUT` | k8s API TLS 검증 비활성 / 타임아웃 초 (false / 5) |
+
+> `load.thresholds`(등급 판정 기준: `queue_busy`/`queue_saturated`/`kv_busy`/`kv_saturated`)와
+> `prometheus.labels`(스크레이프 라벨 이름 교정)는 설정 파일에서 받습니다.
 
 > 중첩 설정(`backends`, `namespace_overrides`, `user_view.*`, `metrics.*` 등)은 `MONITOR_CONFIG_FILE` 가 가리키는 설정 파일에서 받습니다.
 

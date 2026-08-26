@@ -11,6 +11,34 @@ import urllib.error
 import urllib.request
 
 
+def http_get_text(url, api_key=None, timeout=10, accept="text/plain"):
+    """GET url -> (ok: bool, text: str|None, error: str|None). 본문을 그대로 반환.
+
+    Prometheus text exposition(백엔드 엔진의 /metrics)처럼 JSON 이 아닌 본문을
+    읽을 때 쓴다. 에러 문자열 형식은 http_get_json 과 동일하게 맞춘다
+    (호출측이 'timed out' / 'connection error' 를 구분해서 표시하기 때문).
+    """
+    headers = {"Accept": accept}
+    if api_key:
+        headers["Authorization"] = "Bearer %s" % api_key
+        headers["x-api-key"] = api_key
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return True, resp.read().decode("utf-8", "replace"), None
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        return False, None, "HTTP %s %s %s" % (e.code, e.reason, body[:200])
+    except urllib.error.URLError as e:
+        return False, None, "connection error: %s" % e.reason
+    except Exception as e:  # noqa: BLE001
+        return False, None, "%s: %s" % (type(e).__name__, e)
+
+
 def http_get_json(url, api_key=None, timeout=10):
     """GET url -> (ok: bool, data: dict|list|None, error: str|None)."""
     headers = {"Accept": "application/json"}

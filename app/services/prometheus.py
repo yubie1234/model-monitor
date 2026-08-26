@@ -179,7 +179,11 @@ def render_prometheus_metrics(snap):
             lab["service"] = d["service"]
         return lab
 
+    # 부하 등급 -> 게이지. unknown 은 값을 만들지 않는다(None -> 샘플 제외).
+    _LOAD_GAUGE = {"idle": 0, "ok": 1, "busy": 2, "saturated": 3}
+
     up_s, ready_s, desired_s, s2z_s, gpu_s, blk_s = [], [], [], [], [], []
+    run_s, wait_s, kv_s, tps_s, lstate_s, lpods_s, lfail_s = [], [], [], [], [], [], []
     for d in deps:
         lab = base_labels(d)
         up_lab = dict(lab)
@@ -203,6 +207,17 @@ def render_prometheus_metrics(snap):
         #   model_monitor_model_up == 0
         #     unless on(model, namespace, service) model_monitor_model_blocked == 1
         blk_s.append((dict(lab), 1 if d.get("status") == "PAUSED" else 0))
+        # --- 지금 부하(백엔드 엔진 게이지) ---
+        # 값이 없으면(조회 실패·생략) None -> _dedup_samples 가 버린다. 0 으로
+        # 채우면 "한가함"과 "모름"이 알림에서 구분되지 않는다.
+        lo = d.get("load") or {}
+        run_s.append((dict(lab), lo.get("running")))
+        wait_s.append((dict(lab), lo.get("waiting")))
+        kv_s.append((dict(lab), lo.get("kv_cache_pct")))
+        tps_s.append((dict(lab), lo.get("throughput")))
+        lstate_s.append((dict(lab), _LOAD_GAUGE.get(lo.get("state"))))
+        lpods_s.append((dict(lab), lo.get("pods_sampled") if lo else None))
+        lfail_s.append((dict(lab), lo.get("pods_failed") if lo else None))
 
     emit("model_monitor_model_up",
          "모델 상태: UP=1, DOWN=0, 미상/idle/일시중지=-1. "
@@ -226,6 +241,32 @@ def render_prometheus_metrics(snap):
          "이 모델 LB 뒤 ready Pod 가 점유한 GPU 수. 공유 Service 는 여러 모델에 같은 "
          "물리 GPU 가 잡히므로 단순 합산은 이중 집계 — 총합은 *_total 사용.", "gauge",
          _dedup_samples(gpu_s, max))
+    # --- 지금 부하 ---
+    # 공유 Service dedup 규칙은 pods/GPU 와 동일: 같은 물리 백엔드를 여러 모델이
+    # 가리키면 값이 중복되므로 max(합산 아님)로 접는다.
+    emit("model_monitor_model_requests_running",
+         "지금 처리 중인 요청 수(백엔드 엔진 게이지, Pod 합). 값이 없으면 "
+         "샘플이 없다 — 0 과 '모름'을 구분한다.", "gauge",
+         _dedup_samples(run_s, max))
+    emit("model_monitor_model_requests_waiting",
+         "지금 대기 중인 요청 수(큐). 0 보다 크면 이미 사용자가 기다리는 중.",
+         "gauge", _dedup_samples(wait_s, max))
+    emit("model_monitor_model_kv_cache_usage_percent",
+         "KV 캐시 사용률(%). 백엔드 Pod 중 최댓값 — 하나만 포화돼도 그 모델은 아프다.",
+         "gauge", _dedup_samples(kv_s, max))
+    emit("model_monitor_model_generation_tokens_per_second",
+         "지금 생성 속도(tok/s). vLLM 은 카운터 차분이라 두 번째 사이클부터 나온다.",
+         "gauge", _dedup_samples(tps_s, max))
+    emit("model_monitor_model_load_state",
+         "부하 등급: idle=0, ok=1, busy=2(대기 발생/KV 높음), saturated=3(큐 적체/KV 포화). "
+         "게이지를 못 읽으면 샘플 자체가 없다(모름 != 한가함).", "gauge",
+         _dedup_samples(lstate_s, max))
+    emit("model_monitor_model_load_pods_sampled",
+         "부하를 실제로 읽어온 Pod 수(표본). pods_failed 와 함께 보면 과소 집계를 알 수 있다.",
+         "gauge", _dedup_samples(lpods_s, max))
+    emit("model_monitor_model_load_pods_failed",
+         "부하 조회에 실패한 Pod 수. 0 보다 크면 위 수치는 일부 Pod 만의 합이다.",
+         "gauge", _dedup_samples(lfail_s, max))
     emit("model_monitor_model_scale_to_zero",
          "scale-to-zero 로 0 Pod 가 정상 idle 이면 1(장애 0 Pod 와 구분).", "gauge",
          _dedup_samples(s2z_s, max))

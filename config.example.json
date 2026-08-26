@@ -32,5 +32,26 @@
   },
   "metrics": {
     "enabled": true
+  },
+  "load": {
+    "enabled": true,
+    "timeout": 3,
+    "thresholds": {
+      "queue_busy": 1,
+      "queue_saturated": 5,
+      "kv_busy": 80,
+      "kv_saturated": 95
+    }
+  },
+  "prometheus": {
+    "url": "",
+    "first": false,
+    "lookback": "2m",
+    "timeout": 10,
+    "labels": {
+      "namespace": "namespace",
+      "pod": "pod",
+      "service": "service"
+    }
   }
 }
