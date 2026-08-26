@@ -504,6 +504,25 @@ class TestEngineMetricDifferences(unittest.TestCase):
         self.assertEqual(live["kv_cache_pct"], 62.0)
         self.assertEqual(live["throughput"], 812.0)   # SGLang 은 tok/s 를 직접 준다
 
+    def test_operator_real_sglang_line(self):
+        """운영 중인 SGLang pod 의 실제 /metrics 출력(그대로 붙여넣음).
+
+        확인 포인트: 이 빌드는 콜론 접두사를 쓰고, rank 라벨 3종이 모두 붙어 있으며,
+        값이 0.0 이다 -> '모름'(?)이 아니라 'idle'(요청 없음)로 판정돼야 한다.
+        """
+        real = (
+            '# HELP sglang:num_running_reqs The number of running requests.\n'
+            '# TYPE sglang:num_running_reqs gauge\n'
+            'sglang:num_running_reqs{engine_type="unified",'
+            'model_name="sglang-gemma-4-31B-it-fp8-dynamic",'
+            'moe_ep_rank="0",pp_rank="0",tp_rank="0"} 0.0\n')
+        live = m.live_from_prom(real)
+        self.assertEqual(live["engine"], "sglang")
+        self.assertEqual(live["running"], 0)
+        self.assertIsNone(live["waiting"])       # 이 줄만으론 큐를 모른다 -> None
+        agg = m.aggregate_pod_loads([dict(live, url="http://10.0.0.1:8000")], "pods")
+        self.assertEqual(m.classify_load(agg)[0], "idle")   # 0건 처리 중 = 놀고 있음
+
     def test_sglang_colon_prefix_same_result(self):
         colon = m.live_from_prom('sglang:num_running_reqs{model_name="q"} 5.0\n'
                                  'sglang:token_usage{model_name="q"} 0.62\n')
