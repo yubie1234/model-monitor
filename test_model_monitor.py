@@ -9,11 +9,14 @@ m.* 네임스페이스로 모아 노출한다. (web/route 계층은 별도이고
 """
 
 import asyncio
+import collections
 import copy
+import importlib
 import json
 import os
 import re
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -59,6 +62,7 @@ m = types.SimpleNamespace(
     AccessCache=_ua.AccessCache,
     filter_snapshot_for_user=_ua.filter_snapshot_for_user,
     _backend_ref=_ua._backend_ref,
+    _redact_deployment_for_user=_ua._redact_deployment_for_user,
     render_prometheus_metrics=_prom.render_prometheus_metrics,
     is_admin_key=_auth.is_admin_key,
     request_key=_auth.request_key,
@@ -70,10 +74,17 @@ m = types.SimpleNamespace(
     build_collector_settings=_build_cs,
     _deployment_health_safe=_ll._deployment_health_safe,
     select_health_check_models=_ll.select_health_check_models,
+    health_check_allowed_bases=_ll.health_check_allowed_bases,
+    detect_mode_and_revision=_bc.detect_mode_and_revision,
+    count_desired_via_selector=_bc.count_desired_via_selector,
+    service_pod_selector=_gpu.service_pod_selector,
+    collect_gpu_for_service=_gpu.collect_gpu_for_service,
+    selector_key=_gpu.selector_key,
     fetch_health=_ll.fetch_health,
     fetch_health_for_model=_ll.fetch_health_for_model,
     aggregate_selective_health=_ll.aggregate_selective_health,
     collect_litellm=_ll.collect_litellm,
+    discover_backends=_ll.discover_backends,
 )
 
 
@@ -188,6 +199,76 @@ class TestMergeWithHealth(unittest.TestCase):
         self.assertEqual(merged["C"]["status"], "UP")
         self.assertEqual(merged["D"]["status"], "?")
         self.assertEqual(merged["E"]["status"], "?")
+
+    def test_down_reason_from_health_error(self):
+        # /health unhealthy endpoint 의 error 를 소수 카테고리로 정규화하고
+        # 첫 줄만 status_detail 로 실어야 한다(스택트레이스 제거).
+        ll = {
+            "health": {
+                "healthy_endpoints": [],
+                "unhealthy_endpoints": [
+                    {"api_base": "http://b/v1", "exception_status": "500",
+                     "error": "litellm.InternalServerError: OpenAIException - "
+                              "Connection error.\nstack trace: Traceback ..."},
+                ],
+            },
+            "deployments": [{"model_name": "B", "api_base": "http://b/v1"}],
+        }
+        b = m.merge_deployments_with_health(ll)[0]
+        self.assertEqual(b["status"], "DOWN")
+        self.assertEqual(b["down_reason"], "connection")
+        # 첫 줄만 남고 stack trace 는 잘려야 한다.
+        self.assertIn("Connection error", b["status_detail"])
+        self.assertNotIn("Traceback", b["status_detail"])
+
+    def test_down_reason_http_code_fallback(self):
+        # 키워드로 못 잡으면 exception_status(HTTP 코드)로 버킷팅.
+        ll = {
+            "health": {"healthy_endpoints": [], "unhealthy_endpoints": [
+                {"api_base": "http://b/v1", "exception_status": 503,
+                 "error": "upstream returned bad gateway"}]},
+            "deployments": [{"model_name": "B", "api_base": "http://b/v1"}],
+        }
+        b = m.merge_deployments_with_health(ll)[0]
+        self.assertEqual(b["down_reason"], "server_error")
+
+    def test_down_reason_detail_length_cap(self):
+        # status_detail 은 200자 캡(...) — 폭주하는 error 문자열 방어.
+        ll = {
+            "health": {"healthy_endpoints": [], "unhealthy_endpoints": [
+                {"api_base": "http://b/v1", "error": "x" * 500}]},
+            "deployments": [{"model_name": "B", "api_base": "http://b/v1"}],
+        }
+        b = m.merge_deployments_with_health(ll)[0]
+        self.assertLessEqual(len(b["status_detail"]), 200)
+        self.assertTrue(b["status_detail"].endswith("..."))
+
+    def test_down_reason_no_ready_pods_via_k8s(self):
+        # /health 없이 k8s readiness 로 DOWN(ready 0, scale-to-zero 아님)이면
+        # 사유는 no_ready_pods 로 표면화.
+        ll = {"health": None, "deployments": [
+            {"model_name": "C", "api_base": "http://c/v1",
+             "backends_ready": 0, "backend_source": "deployment"}]}
+        c = m.merge_deployments_with_health(ll)[0]
+        self.assertEqual(c["status"], "DOWN")
+        self.assertEqual(c["down_reason"], "no_ready_pods")
+
+    def test_up_and_idle_have_no_down_reason(self):
+        # UP / '?'(idle·미상) 행에는 사유 필드를 붙이지 않는다.
+        ll = {
+            "health": {"healthy_endpoints": [{"api_base": "http://a/v1"}],
+                       "unhealthy_endpoints": []},
+            "deployments": [
+                {"model_name": "A", "api_base": "http://a/v1"},
+                {"model_name": "D", "api_base": "http://d/v1",
+                 "backends_ready": 0, "scale_to_zero": True,
+                 "backend_source": "knative-pa"},
+            ],
+        }
+        merged = {d["model_name"]: d for d in m.merge_deployments_with_health(ll)}
+        self.assertNotIn("down_reason", merged["A"])
+        self.assertNotIn("status_detail", merged["A"])
+        self.assertNotIn("down_reason", merged["D"])
 
 
 def _safe_service(**over):
@@ -373,6 +454,61 @@ class TestSelectHealthCheckModels(unittest.TestCase):
         # /health?model=%3F 무의미 조회가 매 주기 나간다 — 제외해야 한다.
         deps = [_safe_service(model_name="?"), _safe_service(model_name="ok")]
         self.assertEqual(m.select_health_check_models(deps), ["ok"])
+
+    def test_fully_blocked_name_skipped(self):
+        # 전부 일시중지 = 라우팅 대상 0 -> ping 할 이유가 없다.
+        # (LiteLLM /health 는 blocked 를 안 걸러주므로 모니터가 걸러야 한다)
+        deps = [_safe_service(model_name="paused", blocked=True),
+                _safe_service(model_name="paused", api_base="http://p2/v1",
+                              blocked=True)]
+        self.assertEqual(m.select_health_check_models(deps), [])
+
+    def test_partially_blocked_name_still_checked(self):
+        # 남은 sibling 이 실제 트래픽을 받으므로 상태를 봐야 한다.
+        # /health?model= 은 이름 단위라 살아있는 쪽만 골라 ping 할 수단이 없고,
+        # blocked 는 '깨우기 위험' 신호가 아니라 이름 전체를 버리지 않는다.
+        deps = [_safe_service(model_name="mixed", blocked=True),
+                _safe_service(model_name="mixed", api_base="http://m2/v1",
+                              blocked=False)]
+        self.assertEqual(m.select_health_check_models(deps), ["mixed"])
+
+    def test_blocked_does_not_poison_sibling_names(self):
+        # blocked 는 unsafe_underlying/unsafe_base 오염원이 아니다 — 같은
+        # underlying 을 쓰는 다른 이름까지 체크가 끊기면 안 된다.
+        deps = [_safe_service(model_name="paused", underlying="openai/X",
+                              blocked=True),
+                _safe_service(model_name="live", api_base="http://l/v1",
+                              underlying="openai/X")]
+        self.assertEqual(m.select_health_check_models(deps), ["live"])
+
+    def test_allowed_bases_include_paused_safe_backend(self):
+        # 회귀: 일시중지라 조회 대상에서 빠진 backend 의 base 가 합집합에서도
+        # 빠지면, LiteLLM 의 넓은 ?model= 매칭으로 그 endpoint 가 sibling 응답에
+        # 섞여 올 때마다 "Serverless 가 ping 됐다" 는 오경보가 영구히 뜬다.
+        # 합집합이 답하는 질문은 '조회 대상인가' 가 아니라 'ping 돼도 되는가'.
+        deps = [_safe_service(model_name="paused", underlying="openai/Q",
+                              api_base="http://p/v1", blocked=True),
+                _safe_service(model_name="live", underlying="Q",
+                              api_base="http://l/v1")]
+        names = m.select_health_check_models(deps)
+        allowed = m.health_check_allowed_bases(deps, names)
+        union = {b for s in allowed.values() for b in s}
+        self.assertEqual(names, ["live"])          # 조회는 살아있는 것만
+        self.assertIn("http://p", union)           # 하지만 ping 돼도 경보는 안 냄
+        self.assertIn("http://l", union)
+
+    def test_allowed_bases_exclude_paused_serverless(self):
+        # 반대로 일시중지 + Serverless 는 합집합에 넣으면 안 된다 — 그 endpoint 가
+        # 응답에 나타났다는 건 실제로 깨어났다는 뜻이라 경보가 맞다.
+        deps = [_safe_service(model_name="paused", api_base="http://s/v1",
+                              blocked=True, scale_to_zero=True,
+                              backend_source="knative-pa", mode="Serverless"),
+                _safe_service(model_name="live", api_base="http://l/v1")]
+        names = m.select_health_check_models(deps)
+        union = {b for s in m.health_check_allowed_bases(deps, names).values()
+                 for b in s}
+        self.assertNotIn("http://s", union)
+        self.assertIn("http://l", union)
 
     def test_dedup_and_sort(self):
         deps = [
@@ -632,6 +768,243 @@ class TestActiveHealthCheckMarker(unittest.TestCase):
         self.assertNotIn("active_health_check", self._collect(self._SENTINEL))
 
 
+class TestCollectLitellmModels(unittest.TestCase):
+    """result['models'] 는 별도 /v1/models 호출 없이 deployments 에서 유도한다.
+
+    회귀: 매 스냅샷 주기(기본 5s)마다 어떤 렌더러도 안 쓰는 /v1/models 를 다시
+    호출해 LiteLLM 왕복을 낭비하면 안 된다(부하 절감). 모델명은 /model/info 의
+    model_name(=/v1/models 의 id)에서 정렬·중복제거로 유도한다.
+    """
+
+    def test_models_derived_from_deployments_without_v1_models_call(self):
+        calls = []
+
+        def fake(url, key=None, timeout=10):
+            calls.append(url)
+            if "/model/info" in url:
+                return True, {"data": [
+                    {"model_name": "b-model",
+                     "litellm_params": {"model": "m", "api_base": "http://b/v1"},
+                     "model_info": {"id": "1"}},
+                    {"model_name": "a-model",
+                     "litellm_params": {"model": "m", "api_base": "http://a/v1"},
+                     "model_info": {"id": "2"}},
+                    {"model_name": "a-model",   # 중복 model_name → 1개로 축약
+                     "litellm_params": {"model": "m", "api_base": "http://a2/v1"},
+                     "model_info": {"id": "3"}},
+                    {"model_name": "?",         # 미상 플레이스홀더 → 제외
+                     "litellm_params": {"model": "m", "api_base": None},
+                     "model_info": {"id": "4"}},
+                ]}, None
+            return False, None, "skip"
+
+        orig = _ll.http_get_json
+        _ll.http_get_json = fake
+        try:
+            r = m.collect_litellm("http://llm", "sk", 5, with_health=False)
+        finally:
+            _ll.http_get_json = orig
+
+        self.assertEqual(r["models"], ["a-model", "b-model"])
+        self.assertFalse(any(u.endswith("/v1/models") for u in calls))
+        self.assertFalse(any("v1/models" in e for e in r["errors"]))
+
+
+class TestDiscoverBackends(unittest.TestCase):
+    """probe 자동발견 안전 필터 — 직접 probe 는 LiteLLM 을 안 거치고 백엔드에 바로
+    닿아 scale-to-zero 를 깨우므로, 선택적 health check 와 같은 안전 판정으로
+    위험 백엔드를 대상에서 제외해야 한다."""
+
+    def test_unsafe_and_shared_bases_excluded(self):
+        ll = {"deployments": [
+            {"model_name": "safe", "api_base": "http://plain.ns.svc:8080/v1"},
+            # 이름 규약(-predictor)인데 Raw 양성 확인 없음 → 보수적 제외
+            {"model_name": "kserve-unconfirmed",
+             "api_base": "http://foo-predictor.ns.svc/v1"},
+            # 양성 위험(scale-to-zero) → 제외
+            {"model_name": "s2z", "api_base": "http://bar.ns.svc/v1",
+             "scale_to_zero": True},
+            # 자체는 안전해 보여도 위험 deployment 와 같은 base 공유 → base 제외
+            {"model_name": "sharing-safe", "api_base": "http://bar.ns.svc/v1"},
+        ]}
+        out = m.discover_backends(ll)
+        self.assertEqual([b["url"] for b in out], ["http://plain.ns.svc:8080"])
+        # 제외는 조용히 삼키지 않는다 — litellm.errors 에 1줄 요약. 개수는
+        # deployment 가 아니라 base 단위(foo-predictor, bar 2개 — bar 공유 2행은 1개).
+        self.assertTrue(any("probe" in e and "2개" in e for e in ll["errors"]))
+
+    def test_raw_confirmed_kserve_included(self):
+        ll = {"deployments": [
+            {"model_name": "raw", "api_base": "http://r-predictor.ns.svc/v1",
+             "mode": "RawDeployment"}]}
+        out = m.discover_backends(ll)
+        self.assertEqual([b["url"] for b in out], ["http://r-predictor.ns.svc"])
+        self.assertFalse(ll.get("errors"))   # 제외 없음 → 경고 없음
+
+    def test_health_only_endpoints_filtered_by_name_rule(self):
+        # /health 에만 있는 주소는 k8s 판정이 없다 — KServe 이름 규약이면 Raw 확인이
+        # 불가능하므로 제외, 일반 이름만 대상에 남긴다.
+        ll = {"deployments": [],
+              "health": {"healthy_endpoints": [
+                  {"model": "m1", "api_base": "http://x-predictor.ns.svc/v1"},
+                  {"model": "m2", "api_base": "http://plain2.ns.svc/v1"}]}}
+        out = m.discover_backends(ll)
+        self.assertEqual([b["url"] for b in out], ["http://plain2.ns.svc"])
+
+
+class TestBlockedMarker(unittest.TestCase):
+    """model_info.blocked 파싱 (LiteLLM v1.90.0+ 관리자 일시중지).
+
+    active_health_check 와 같은 엄격 파싱을 쓴다 — bool() 강제 변환을 하면
+    "false" 문자열이 True 가 되어 멀쩡히 서빙 중인 모델을 PAUSED 로 오표시한다.
+    키가 아예 없는 경우(구버전 LiteLLM / config.yaml 전용 모델)는 '모름' 이라
+    키를 만들지 않는다 — 없는 것을 '활성' 으로 단정하지 않기 위해서."""
+
+    _SENTINEL = object()   # "키 자체가 없음" 표시
+
+    def _collect(self, blocked_value):
+        def fake(url, key=None, timeout=10):
+            if "/model/info" in url:
+                mi = {"id": "x"}
+                if blocked_value is not self._SENTINEL:
+                    mi["blocked"] = blocked_value
+                return True, {"data": [{
+                    "model_name": "mm",
+                    "litellm_params": {"model": "m", "api_base": "http://a/v1"},
+                    "model_info": mi}]}, None
+            return False, None, "skip"
+        orig = _ll.http_get_json
+        _ll.http_get_json = fake
+        try:
+            r = m.collect_litellm("http://llm", "sk", 5, with_health=False)
+        finally:
+            _ll.http_get_json = orig
+        return r["deployments"][0]
+
+    def test_bool_passthrough(self):
+        self.assertIs(self._collect(True).get("blocked"), True)
+        self.assertIs(self._collect(False).get("blocked"), False)
+
+    def test_string_forms_parsed_strictly(self):
+        self.assertIs(self._collect("false").get("blocked"), False)
+        self.assertIs(self._collect("True").get("blocked"), True)
+
+    def test_absent_key_stays_absent(self):
+        # 구버전 LiteLLM / config 전용 모델 -> '모름'. False 로 단정하면 안 된다.
+        self.assertNotIn("blocked", self._collect(self._SENTINEL))
+        self.assertNotIn("blocked", self._collect("maybe"))
+        self.assertNotIn("blocked", self._collect(1))
+
+
+class TestBlockedStatus(unittest.TestCase):
+    """blocked -> PAUSED 승격. LiteLLM /health 는 blocked 를 걸러주지 않아서
+    (v1.90.0 확인) 일시중지된 백엔드도 healthy 로 보고된다. 그대로 두면
+    '트래픽을 못 받는데 UP' 인 거짓 정상이 대시보드에 남는다."""
+
+    def _ll(self):
+        return {
+            "health": {
+                "healthy_endpoints": [{"api_base": "http://a/v1"},
+                                      {"api_base": "http://p/v1"}],
+                "unhealthy_endpoints": [{"api_base": "http://b/v1"}],
+            },
+            "deployments": [
+                {"model_name": "A", "api_base": "http://a/v1"},
+                {"model_name": "B", "api_base": "http://b/v1"},
+                # health 는 healthy 라고 하지만 관리자가 꺼둔 모델
+                {"model_name": "P", "api_base": "http://p/v1", "blocked": True},
+                {"model_name": "N", "api_base": "http://n/v1", "blocked": False},
+            ],
+        }
+
+    def test_blocked_overrides_healthy_status(self):
+        merged = {d["model_name"]: d
+                  for d in m.merge_deployments_with_health(self._ll())}
+        self.assertEqual(merged["P"]["status"], "PAUSED")
+        self.assertEqual(merged["P"]["status_source"], "blocked")
+        # 원래 health 판정은 보존 — 다시 켰을 때 뜰 백엔드인지 알아야 한다.
+        self.assertEqual(merged["P"]["health_status"], "UP")
+        # 그 판정의 근거도 보존. status_source 는 "blocked" 로 덮이므로 이게
+        # 없으면 괄호 안 UP 이 실측인지 추정인지 화면에서 구분할 수 없다.
+        self.assertEqual(merged["P"]["health_status_source"], "health")
+
+    def test_paused_records_k8s_provenance_when_health_absent(self):
+        # 회귀: MONITOR_HEALTH 기본값이 off 라 PAUSED 의 괄호 값은 대개 k8s
+        # readiness 추정이다. 이를 "health" 로 뭉개거나 아예 안 남기면 화면이
+        # 추정을 실측과 같은 확신으로 보여준다(판정근거 가시화의 취지 위반).
+        ll = {"health": None,
+              "deployments": [{"model_name": "P", "api_base": "http://p/v1",
+                               "backends_ready": 2, "backends_desired": 2,
+                               "blocked": True}]}
+        row = m.merge_deployments_with_health(ll)[0]
+        self.assertEqual(row["status"], "PAUSED")
+        self.assertEqual(row["status_source"], "blocked")
+        self.assertEqual(row["health_status"], "UP")
+        self.assertEqual(row["health_status_source"], "k8s")   # 실측이 아니다
+
+    def test_health_status_source_cleared_when_unpaused(self):
+        # merge 는 한 스냅샷에서 두 번 돈다 — health_status 와 마찬가지로
+        # 근거 필드도 재병합 때 지워져야 옛 값이 유령처럼 남지 않는다.
+        ll = {"health": None,
+              "deployments": [{"model_name": "P", "api_base": "http://p/v1",
+                               "backends_ready": 2, "backends_desired": 2,
+                               "blocked": True}]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        for d in ll["deployments"]:
+            d["blocked"] = False
+        row = m.merge_deployments_with_health(ll)[0]
+        self.assertNotIn("health_status", row)
+        self.assertNotIn("health_status_source", row)
+
+    def test_blocked_false_and_absent_are_untouched(self):
+        merged = {d["model_name"]: d
+                  for d in m.merge_deployments_with_health(self._ll())}
+        self.assertEqual(merged["A"]["status"], "UP")     # 키 없음
+        self.assertEqual(merged["B"]["status"], "DOWN")   # 키 없음
+        self.assertEqual(merged["N"]["status"], "?")      # blocked=False
+        self.assertNotIn("health_status", merged["A"])
+        self.assertNotIn("health_status", merged["N"])
+
+    def test_summary_excludes_paused_from_both_cards(self):
+        ll = self._ll()
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"litellm": ll, "backends": []}
+        s = m.summarize(snap)
+        statuses = [d["status"] for d in ll["deployments"]]
+        # 카드 == 표 항등식 유지 (PAUSED 는 양쪽 어디에도 안 들어간다)
+        self.assertEqual(s["deployments_healthy"], statuses.count("UP"))
+        self.assertEqual(s["deployments_unhealthy"], statuses.count("DOWN"))
+        self.assertEqual(s["deployments_healthy"], 1)     # A 만
+        self.assertEqual(s["deployments_unhealthy"], 1)   # B 만
+        self.assertEqual(s["deployments_blocked"], 1)     # P
+        self.assertEqual(s["deployments_total"], 4)       # 전체는 그대로
+        self.assertTrue(s["blocked_known"])
+
+    def test_merge_is_idempotent_for_health_status(self):
+        # 이 함수는 한 스냅샷에서 두 번 돈다(build_snapshot -> state.Refresher 가
+        # /health 주입 후 재실행). 회귀: 이전 회차의 health_status 가 남으면
+        # blocked 가 풀린 행에 옛 판정이 유령처럼 붙는다.
+        ll = self._ll()
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        # 운영자가 P 를 다시 켰다고 가정(다음 /model/info 가 blocked=False 를 준다)
+        for d in ll["deployments"]:
+            if d["model_name"] == "P":
+                d["blocked"] = False
+        again = {d["model_name"]: d
+                 for d in m.merge_deployments_with_health(ll)}
+        self.assertEqual(again["P"]["status"], "UP")       # health 로 복귀
+        self.assertNotIn("health_status", again["P"])      # 옛 값이 남지 않는다
+
+    def test_blocked_known_false_when_litellm_never_reports_it(self):
+        # 구버전 LiteLLM: 키가 하나도 없으면 '판별 불가' 로 남아야 한다.
+        ll = {"health": None,
+              "deployments": [{"model_name": "A", "api_base": "http://a/v1"}]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertFalse(s["blocked_known"])
+        self.assertEqual(s["deployments_blocked"], 0)
+
+
 class TestSummarize(unittest.TestCase):
     def test_cards_match_table_when_health_times_out(self):
         # 회귀 테스트: /health 타임아웃(health=None)이라도 카드 healthy 수가
@@ -693,6 +1066,22 @@ class TestSummarize(unittest.TestCase):
         s = m.summarize({"litellm": ll, "backends": []})
         self.assertEqual(s["deployments_healthy"], 2)
         self.assertEqual(s["deployments_unhealthy"], 1)
+
+    def test_collect_error_counts(self):
+        # 수집 실패 총계(k8s_errors/gpu_errors)를 summary 에 집계해 배너/메트릭이
+        # 공유하게 한다(셀별 툴팁만으론 규모가 안 보임).
+        ll = {"groups": [], "health": None, "deployments": [
+            {"model_name": "A", "api_base": "http://a/v1",
+             "k8s_error": "pods: HTTP 403"},
+            {"model_name": "B", "api_base": "http://b/v1",
+             "gpu_error": "service: HTTP 404 Not Found"},
+            {"model_name": "C", "api_base": "http://c/v1",
+             "k8s_error": "x", "gpu_error": "y"},
+            {"model_name": "D", "api_base": "http://d/v1"},
+        ]}
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertEqual(s["k8s_errors"], 2)   # A, C
+        self.assertEqual(s["gpu_errors"], 2)   # B, C
 
 
 class TestResolveBackendCount(unittest.TestCase):
@@ -940,6 +1329,74 @@ class TestGpu(unittest.TestCase):
         self.assertEqual(out["gpu_products"], {"H100": 4})
         self.assertIsNone(out["gpu_error"])
 
+    def test_node_cache_persists_across_clients(self):
+        # 회귀: 노드 GPU 라벨은 노드 수명 동안 불변 → 사이클 간(=K8sClient 재생성)
+        # node_cache 를 넘기면 두 번째 조회에서 /nodes/... 를 다시 부르지 않는다
+        # (정적 라벨을 위해 Node 오브젝트를 5초마다 반복 조회하던 부하 제거).
+        routes = [
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 1},
+                                "spec": {"replicas": 1}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [_pod("gpu-a", 2)]}, None)),
+            ("/nodes/gpu-a",
+             (True, {"metadata": {"labels":
+                     {"nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"}}}, None)),
+        ]
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        node_cache = {}
+
+        c1 = FakeClient(routes, default_namespace="kserve")
+        out1 = m.resolve_backend_count(dep, c1, self.GPU_SETTINGS,
+                                       node_cache=node_cache)
+        self.assertEqual(out1["gpu_products"], {"H100": 2})
+        self.assertTrue(any("/nodes/gpu-a" in p for p in c1.calls))
+
+        # 다음 사이클: 새 클라이언트지만 같은 node_cache → 노드 재조회 없이 캐시 히트
+        c2 = FakeClient(routes, default_namespace="kserve")
+        out2 = m.resolve_backend_count(dep, c2, self.GPU_SETTINGS,
+                                       node_cache=node_cache)
+        self.assertEqual(out2["gpu_products"], {"H100": 2})
+        self.assertFalse(any("/nodes/gpu-a" in p for p in c2.calls))
+
+    def test_node_cache_skips_failed_lookups(self):
+        # 회귀: 캐시가 프로세스 수명이 되면서, 노드 GET 일시 실패를 캐시하면 그
+        # 노드 장치명이 재기동 전까지 'GPU'(미상)로 영구히 굳는다 — 실패는 캐시
+        # 밖에 두고 다음 사이클에 자가 치유되어야 한다.
+        base_routes = [
+            ("inferenceservices/qwen36-35b",
+             (True, {"status": {"deploymentMode": "RawDeployment",
+                                "components": {"predictor": {}}}}, None)),
+            ("/deployments?labelSelector",
+             (True, {"items": [{"status": {"readyReplicas": 1},
+                                "spec": {"replicas": 1}}]}, None)),
+            ("/pods?labelSelector",
+             (True, {"items": [_pod("gpu-a", 2)]}, None)),
+        ]
+        dep = {"api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}
+        node_cache = {}
+
+        # 1사이클: /nodes/gpu-a 라우트 없음(404) → 미상 'GPU' 버킷, 캐시 미기록
+        c1 = FakeClient(list(base_routes), default_namespace="kserve")
+        out1 = m.resolve_backend_count(dep, c1, self.GPU_SETTINGS,
+                                       node_cache=node_cache)
+        self.assertEqual(out1["gpu_products"], {"GPU": 2})
+        self.assertNotIn("gpu-a", node_cache)   # 실패는 캐시하지 않는다
+
+        # 2사이클: 노드 조회 복구 → 같은 캐시로 자가 치유
+        c2 = FakeClient(base_routes + [
+            ("/nodes/gpu-a",
+             (True, {"metadata": {"labels":
+                     {"nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"}}}, None)),
+        ], default_namespace="kserve")
+        out2 = m.resolve_backend_count(dep, c2, self.GPU_SETTINGS,
+                                       node_cache=node_cache)
+        self.assertEqual(out2["gpu_products"], {"H100": 2})
+        self.assertEqual(node_cache.get("gpu-a"), "NVIDIA-H100-80GB-HBM3")
+
     def test_gpu_zero_when_no_ready_pods(self):
         client = FakeClient([
             ("inferenceservices/qwen36-35b",
@@ -1111,6 +1568,16 @@ class TestDemoSnapshot(unittest.TestCase):
         self.assertEqual(s["deployments_healthy"], statuses.count("UP"))
         self.assertEqual(s["deployments_unhealthy"], statuses.count("DOWN"))
 
+    def test_demo_has_epoch_and_error_surfacing(self):
+        # 데모도 build_snapshot 과 동일하게 ts_epoch 을 싣고, DOWN 사유·GPU 수집
+        # 오류를 노출해 새 UI(툴팁/배너)를 미리보기 할 수 있어야 한다.
+        snap = m.demo_snapshot()
+        self.assertIsInstance(snap.get("ts_epoch"), float)
+        self.assertGreaterEqual(snap["summary"]["gpu_errors"], 1)
+        downs = [d for d in snap["litellm"]["deployments"]
+                 if d.get("status") == "DOWN" and d.get("down_reason")]
+        self.assertTrue(downs, "데모에 사유가 붙은 DOWN 이 하나는 있어야 한다")
+
 
 class TestCollectUserAccess(unittest.TestCase):
     """per-user 키 접근 수집 — http_get_json 을 가짜로 갈아끼워 분기만 고정."""
@@ -1167,6 +1634,16 @@ class TestCollectUserAccess(unittest.TestCase):
 
 class TestAccessCache(unittest.TestCase):
     """키별 접근 캐시 — 폴링 중복 호출 제거, 성공/실패 각각 TTL 만료."""
+
+    def test_get_peek_without_collect(self):
+        # get() 은 수집 없이 살아있는 항목만 돌려준다(요청 경로 세마포어 선회피).
+        cache = m.AccessCache(ttl=30.0)
+        self.assertIsNone(cache.get("sk-x", now=100.0))      # 미스
+        cache.get_or_collect(
+            "sk-x", lambda: {"ok": True, "accessible": ["a"]}, now=100.0)
+        hit = cache.get("sk-x", now=110.0)                   # TTL 내
+        self.assertEqual(hit["accessible"], ["a"])
+        self.assertIsNone(cache.get("sk-x", now=200.0))      # 만료
 
     def test_caches_success_and_skips_recollect(self):
         cache = m.AccessCache(ttl=30.0)
@@ -1258,7 +1735,10 @@ class TestFilterSnapshotForUser(unittest.TestCase):
                     {"model_name": "secret-y", "api_base": "http://internal-b/v1",
                      "type": "vllm", "status": "DOWN",
                      "backends_ready": 0, "backends_desired": 1,
-                     "backend_source": "deployment"},
+                     "backend_source": "deployment",
+                     # DOWN 사유는 내부 주소를 담을 수 있어 비-admin 뷰에서 숨겨야 한다.
+                     "down_reason": "connection",
+                     "status_detail": "Connection error http://internal-b:8080"},
                 ],
             },
             "backends": [], "summary": {},
@@ -1294,6 +1774,17 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         # 상태·Pod 수(키 무관, deployment 단위)는 그대로 유지
         self.assertEqual(d["status"], "UP")
         self.assertEqual(d["backends_ready"], 2)
+
+    def test_hide_internal_strips_down_reason_detail(self):
+        # DOWN 사유(status_detail)에 내부 주소가 섞일 수 있어 비-admin 뷰에선
+        # allowlist 리댁션으로 자동 제거돼야 한다(admin 전체 뷰에만 노출).
+        out = m.filter_snapshot_for_user(
+            self._global(), {"accessible": ["secret-y"]}, hide_internal=True)
+        d = out["litellm"]["deployments"][0]
+        self.assertEqual(d["model_name"], "secret-y")
+        self.assertEqual(d["status"], "DOWN")          # 상태는 유지
+        self.assertNotIn("status_detail", d)           # 내부 주소 유출 방지
+        self.assertNotIn("down_reason", d)
 
     def test_redaction_keeps_type_axes_and_anon_backend_ref(self):
         out = m.filter_snapshot_for_user(
@@ -1335,6 +1826,116 @@ class TestFilterSnapshotForUser(unittest.TestCase):
         b = m._backend_ref({"model_name": "openai-b", "id": "id-2"}, "s")
         self.assertIsNotNone(a)
         self.assertNotEqual(a, b)
+
+    def test_redaction_keeps_blocked_state(self):
+        # "내 모델이 왜 응답이 없나" 의 답 — 내부 토폴로지가 아니므로 비-admin
+        # 뷰에도 남긴다. 여기서 빠지면 사용자는 장애와 일시중지를 구분 못 한다.
+        g = self._global()
+        g["litellm"]["deployments"][0].update(
+            {"blocked": True, "status": "PAUSED", "health_status": "UP",
+             "health_status_source": "k8s", "status_source": "blocked"})
+        out = m.filter_snapshot_for_user(g, {"accessible": ["gpt-x"]})
+        d = out["litellm"]["deployments"][0]
+        self.assertIs(d["blocked"], True)
+        self.assertEqual(d["status"], "PAUSED")
+        self.assertEqual(d["health_status"], "UP")
+        # 괄호 안 UP 이 실측인지 추정인지도 사용자 뷰에서 구분돼야 한다
+        # (상태 문자열일 뿐 내부 토폴로지가 아니다).
+        self.assertEqual(d["health_status_source"], "k8s")
+        # 내부 주소는 여전히 가려져 있어야 한다.
+        self.assertNotIn("api_base", d)
+        self.assertEqual(out["summary"]["deployments_blocked"], 1)
+        self.assertTrue(out["summary"]["blocked_known"])
+
+    def test_redaction_does_not_invent_blocked_key(self):
+        # 회귀: 리댁션이 blocked 키를 무조건 넣으면(값 None 이라도) summarize 의
+        # blocked_known 이 항상 참이 되어, blocked 를 모르는 LiteLLM 에서도
+        # "일시중지 판별 가능" 이라고 거짓 보고한다.
+        out = m.filter_snapshot_for_user(self._global(), {"accessible": ["gpt-x"]})
+        d = out["litellm"]["deployments"][0]
+        self.assertNotIn("blocked", d)
+        self.assertNotIn("health_status", d)
+        self.assertNotIn("health_status_source", d)
+        self.assertFalse(out["summary"]["blocked_known"])
+
+    def test_view_is_isolated_from_global_snapshot(self):
+        """뷰의 mutable 을 건드려도 global 스냅샷이 안 깨져야 한다.
+
+        회귀: 예전 구현은 스냅샷을 통째로 deepcopy 해서 자동으로 격리됐다.
+        비용 때문에 '필터 먼저, 필요한 것만 복사' 로 바꿨으므로(배포 1000개 중
+        50개 접근 사용자 13.9ms -> 0.21ms) 남기는 값마다 복사를 빠뜨리면
+        모든 사용자가 공유하는 global 스냅샷이 오염된다. 두 모드 다 검사한다.
+        """
+        for hide in (True, False):
+            g = self._global()
+            before = json.dumps(g, sort_keys=True, default=str)
+            v = m.filter_snapshot_for_user(
+                g, {"accessible": ["gpt-x", "gpt-y"]}, hide_internal=hide)
+            v["litellm"]["deployments"].clear()
+            v["litellm"]["groups"].append({"model_group": "침입"})
+            v["litellm"]["models"].append("침입")
+            v["summary"]["deployments_total"] = -1
+            if isinstance(v.get("backends"), list):
+                v["backends"].append({"url": "침입"})
+            self.assertEqual(json.dumps(g, sort_keys=True, default=str), before,
+                             "hide_internal=%s 뷰 변형이 global 로 새어나갔다" % hide)
+
+    def test_redaction_emits_only_scalars(self):
+        """리댁션 출력에 컨테이너가 없어야 한다 — filter 가 이 불변식에 기댄다.
+
+        회귀: hide_internal=True(기본 per-user 모드)는 리댁션된 행을 deepcopy
+        하지 않는다. `_redact_deployment_for_user` 가 스칼라만 낸다는 전제이기
+        때문이다. allowlist 에 컨테이너 필드(예: gpu_products)를 하나 추가하면
+        그 전제가 깨지고, 뷰는 공유 스냅샷과 **같은 객체**를 가리킨다 — 사용자
+        한 명이 자기 뷰를 변형하면 모든 사용자가 읽는 global 스냅샷이 오염된다.
+        예전 구현(전체 deepcopy)은 allowlist 내용과 무관하게 안전했으므로, 이
+        불변식은 성능 최적화가 새로 들여온 것이다. 발생 지점에서 고정한다.
+
+        컨테이너를 정말 노출해야 한다면 이 테스트를 고치는 게 아니라
+        filter_snapshot_for_user 의 리댁션 분기에서 deepcopy 를 해야 한다.
+        """
+        src = {
+            "model_name": "m", "namespace": "ns", "service": "svc",
+            "api_base": "http://x/v1", "status": "UP", "status_source": "health",
+            "type": "vllm", "network_type": "service", "backend_type": "vllm",
+            "backends_ready": 1, "backends_desired": 1, "backend_source": "eps",
+            "scale_to_zero": False, "mode": "RawDeployment",
+            "blocked": True, "health_status": "UP", "health_status_source": "k8s",
+            # 컨테이너 값들 — 리댁션이 이들을 통과시키면 안 된다.
+            "gpu_products": {"H100": 2}, "tags": ["a", "b"],
+            "nested": {"deep": {"x": 1}},
+        }
+        out = m._redact_deployment_for_user(src, "seed")
+        containers = {k: type(v).__name__ for k, v in out.items()
+                      if isinstance(v, (dict, list, set, tuple))}
+        self.assertEqual(
+            containers, {},
+            "리댁션이 컨테이너를 노출한다: %s — hide_internal=True 경로는 이 값을 "
+            "deepcopy 하지 않으므로 global 스냅샷과 객체를 공유하게 된다" % containers)
+
+    def test_nested_containers_are_not_shared_in_redacted_view(self):
+        # 위 불변식의 결과를 filter 수준에서도 확인한다: 리댁션 뷰가 global 의
+        # 중첩 컨테이너를 참조로 물고 있지 않은지(현재는 아예 노출 안 하므로
+        # 키 부재로 통과 — 노출로 바뀌면 위 테스트가 먼저 깨진다).
+        g = self._global()
+        for d in g["litellm"]["deployments"]:
+            d["gpu_products"] = {"H100": 2}
+        v = m.filter_snapshot_for_user(
+            g, {"accessible": ["gpt-x", "gpt-y"]}, hide_internal=True)
+        for vd, gd in zip(v["litellm"]["deployments"], g["litellm"]["deployments"]):
+            if "gpu_products" in vd:
+                self.assertIsNot(vd["gpu_products"], gd["gpu_products"])
+
+    def test_nested_containers_are_not_shared_with_global(self):
+        # gpu_products 처럼 행 안의 중첩 dict 까지 복사돼야 한다 — 얕은 복사면
+        # 사용자가 받은 뷰와 global 이 같은 객체를 가리킨다(내부노출 모드).
+        g = self._global()
+        for d in g["litellm"]["deployments"]:
+            d["gpu_products"] = {"H100": 2}
+        v = m.filter_snapshot_for_user(
+            g, {"accessible": ["gpt-x", "gpt-y"]}, hide_internal=False)
+        for vd, gd in zip(v["litellm"]["deployments"], g["litellm"]["deployments"]):
+            self.assertIsNot(vd["gpu_products"], gd["gpu_products"])
 
     def test_show_internal_keeps_api_base(self):
         out = m.filter_snapshot_for_user(
@@ -1543,6 +2144,65 @@ class TestPrometheusMetrics(unittest.TestCase):
         # 따옴표·역슬래시가 이스케이프되어야 한다.
         self.assertIn(r'model="we\"ird\\name"', text)
 
+    def test_blocked_metrics(self):
+        ll = {
+            "groups": [], "health": None,
+            "deployments": [
+                {"model_name": "A", "api_base": "http://a/v1",
+                 "namespace": "ns1", "service": "svc-a", "backends_ready": 2},
+                {"model_name": "P", "api_base": "http://p/v1",
+                 "namespace": "ns1", "service": "svc-p",
+                 "backends_ready": 2, "blocked": True},
+            ],
+        }
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "9.9.9", "litellm": ll, "backends": []}
+        snap["summary"] = m.summarize(snap)
+        g = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(
+            g['model_monitor_model_blocked{model="P",namespace="ns1",service="svc-p"}'],
+            ["1"])
+        self.assertEqual(
+            g['model_monitor_model_blocked{model="A",namespace="ns1",service="svc-a"}'],
+            ["0"])
+        self.assertEqual(g["model_monitor_deployments_blocked"], ["1"])
+        self.assertEqual(g["model_monitor_blocked_known"], ["1"])
+        # PAUSED 는 model_up 에서 -1(미상) — 기존 DOWN 알림(==0)을 건드리지 않는다.
+        self.assertEqual(
+            g['model_monitor_model_up{model="P",namespace="ns1",'
+              'service="svc-p",status_source="blocked"}'], ["-1"])
+        # 일시중지는 healthy 카드에도 안 잡힌다.
+        self.assertEqual(g["model_monitor_deployments_healthy"], ["1"])
+
+    def test_blocked_series_collapse_requires_all_blocked(self):
+        # 같은 (model,ns,svc) 라벨의 deployment 가 둘인데 하나만 꺼진 경우,
+        # 그 조합은 여전히 라우팅된다 -> 0 이어야 한다(min). max 면 거짓 양성.
+        ll = {
+            "groups": [], "health": None,
+            "deployments": [
+                {"model_name": "M", "api_base": "http://m1/v1",
+                 "namespace": "ns", "service": "svc",
+                 "backends_ready": 2, "blocked": True},
+                {"model_name": "M", "api_base": "http://m2/v1",
+                 "namespace": "ns", "service": "svc",
+                 "backends_ready": 2, "blocked": False},
+            ],
+        }
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "9.9.9", "litellm": ll, "backends": []}
+        snap["summary"] = m.summarize(snap)
+        g = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(
+            g['model_monitor_model_blocked{model="M",namespace="ns",service="svc"}'],
+            ["0"])
+        # 행 단위 집계는 그대로 1건이 PAUSED (그래야 카드가 표와 일치한다)
+        self.assertEqual(g["model_monitor_deployments_blocked"], ["1"])
+
+    def test_blocked_known_zero_on_old_litellm(self):
+        g = self._parse(m.render_prometheus_metrics(self._snap()))
+        self.assertEqual(g["model_monitor_blocked_known"], ["0"])
+        self.assertEqual(g["model_monitor_deployments_blocked"], ["0"])
+
     def test_no_api_base_label_leak(self):
         # 내부 URL(api_base)은 메트릭 라벨에 노출되면 안 된다(카디널리티/보안).
         text = m.render_prometheus_metrics(self._snap())
@@ -1552,6 +2212,59 @@ class TestPrometheusMetrics(unittest.TestCase):
     def test_loading_snapshot_reports_down(self):
         text = m.render_prometheus_metrics({"loading": True, "version": "x"})
         self.assertIn("model_monitor_up 0", text)
+
+    def test_reliability_gauges_present(self):
+        # 수집 신뢰도 게이지: reachable / litellm_errors / collect_failing /
+        # k8s·gpu 수집 에러 총계가 모두 노출돼야 한다.
+        ll = {"groups": [], "reachable": True,
+              "errors": ["health: timeout", "선택적 경고"],
+              "health": None, "deployments": [
+            {"model_name": "A", "api_base": "http://a/v1",
+             "backends_ready": 1, "backend_source": "deployment",
+             "k8s_error": "pods: 403"},
+            {"model_name": "B", "api_base": "http://b/v1",
+             "backends_ready": 2, "backend_source": "deployment",
+             "gpu_error": "service: 404"},
+        ]}
+        ll["deployments"] = m.merge_deployments_with_health(ll)
+        snap = {"version": "x", "litellm": ll, "backends": [],
+                "backend_count_enabled": True}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(parsed["model_monitor_litellm_reachable"], ["1"])
+        self.assertEqual(parsed["model_monitor_litellm_errors"], ["2"])
+        self.assertEqual(parsed["model_monitor_collect_errors"], ["1"])
+        self.assertEqual(parsed["model_monitor_gpu_collect_errors"], ["1"])
+        self.assertEqual(parsed["model_monitor_collect_failing"], ["0"])
+
+    def test_litellm_unreachable_and_collect_failing(self):
+        snap = {"version": "x", "backend_count_enabled": True,
+                "collect_error": "RuntimeError: boom",
+                "litellm": {"reachable": False, "errors": [],
+                            "deployments": []}}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(parsed["model_monitor_litellm_reachable"], ["0"])
+        self.assertEqual(parsed["model_monitor_collect_failing"], ["1"])
+
+    def test_snapshot_age_and_timestamp(self):
+        # ts_epoch 가 있으면 timestamp 를 그대로, age 는 음수 없이 노출.
+        ll = {"groups": [], "reachable": True, "health": None,
+              "deployments": []}
+        snap = {"version": "x", "litellm": ll, "backends": [],
+                "ts_epoch": 1_000_000.0}
+        snap["summary"] = m.summarize(snap)
+        parsed = self._parse(m.render_prometheus_metrics(snap))
+        self.assertEqual(
+            parsed["model_monitor_snapshot_timestamp_seconds"], ["1000000"])
+        age = float(parsed["model_monitor_snapshot_age_seconds"][0])
+        self.assertGreaterEqual(age, 0.0)
+
+    def test_snapshot_age_absent_without_epoch(self):
+        # ts_epoch 가 없는(구버전) 스냅샷은 age/timestamp 시리즈를 안 만든다.
+        text = m.render_prometheus_metrics({"loading": True, "version": "x"})
+        self.assertNotIn("model_monitor_snapshot_timestamp_seconds", text)
+        self.assertNotIn("model_monitor_snapshot_age_seconds", text)
 
 
 # ----- 웹/배선 계층(FastAPI 전환으로 새로 추가된 코드) 단위 테스트 -----
@@ -1676,6 +2389,26 @@ class TestSnapshotStore(unittest.TestCase):
         self.assertNotIn("collect_error", base)
 
 
+class TestRefresherBackoff(unittest.TestCase):
+    """연속 수집 예외 시 리프레시 지연이 지수 백오프(상한 60s)로 늘어난다 —
+    예상 밖 결함이 5초 타이트 재시도로 CPU(200m 캡)와 로그를 태우지 않게."""
+
+    def test_next_delay_exponential_with_cap(self):
+        r = m.Refresher({}, m.SnapshotStore(), interval=5.0)
+        self.assertEqual(r._next_delay(0), 5.0)     # 정상 시 원래 주기
+        self.assertEqual(r._next_delay(1), 10.0)
+        self.assertEqual(r._next_delay(2), 20.0)
+        self.assertEqual(r._next_delay(3), 40.0)
+        self.assertEqual(r._next_delay(4), 60.0)    # 상한 도달
+        self.assertEqual(r._next_delay(50), 60.0)   # 계속 실패해도 상한 고정
+
+    def test_next_delay_never_below_interval(self):
+        # interval 이 상한(60s)보다 크면 백오프가 주기를 단축하지 않는다.
+        r = m.Refresher({}, m.SnapshotStore(), interval=120.0)
+        self.assertEqual(r._next_delay(0), 120.0)
+        self.assertEqual(r._next_delay(3), 120.0)
+
+
 class TestRefresherDemo(unittest.TestCase):
     def test_collect_once_demo_populates_store(self):
         store = m.SnapshotStore()
@@ -1697,8 +2430,8 @@ def _settings_ns(**over):
     env 우선순위는 os.environ 으로 별도 제어한다."""
     base = dict(
         host="0.0.0.0", port=8088, interval=5.0, demo=False,
-        litellm_url=None, api_key=None, timeout=10.0, health=True,
-        health_timeout=90.0, selective_health=False, probe_backends=False,
+        litellm_url=None, api_key=None, timeout=10.0, health=False,
+        health_timeout=90.0, selective_health=True, probe_backends=False,
         backend_count=True, gpu_info=True,
         k8s_api_server=None, k8s_token_file="/t/token", k8s_ca_file="/t/ca",
         k8s_insecure=False, k8s_timeout=5.0,
@@ -1771,9 +2504,9 @@ class TestBuildCollectorSettings(unittest.TestCase):
         self.assertFalse(c["backend_count"])                       # env 우선
 
     def test_selective_health_default_env_file(self):
-        # 기본 false / env 우선 / 파일(litellm.selective_health) 반영
+        # 기본 true(전량 /health 기본 off 를 보완) / env 우선 / 파일 반영
         with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(
+            self.assertTrue(
                 m.build_collector_settings(_settings_ns())["selective_health"])
         with mock.patch.dict(os.environ,
                              {"MONITOR_SELECTIVE_HEALTH": "true"}, clear=True):
@@ -1790,6 +2523,25 @@ class TestBuildCollectorSettings(unittest.TestCase):
         finally:
             os.unlink(path)
         self.assertTrue(c["selective_health"])   # 파일값 반영
+
+    def test_health_default_off_env_overrides(self):
+        # 전량 /health 는 모든 백엔드 실 ping(scale-to-zero 각성) — opt-in 으로만.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(m.build_collector_settings(_settings_ns())["health"])
+        with mock.patch.dict(os.environ, {"MONITOR_HEALTH": "true"}, clear=True):
+            self.assertTrue(m.build_collector_settings(
+                _settings_ns(health=True))["health"])
+        cfg = {"litellm": {"health": True}}
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False) as f:
+            json.dump(cfg, f)
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True):
+                c = m.build_collector_settings(_settings_ns(config_file=path))
+        finally:
+            os.unlink(path)
+        self.assertTrue(c["health"])   # 파일값 반영
 
     def test_metrics_token_env_beats_file(self):
         cfg = {"metrics": {"enabled": True, "token": "file-tok"}}
@@ -1812,6 +2564,221 @@ class TestBuildCollectorSettings(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(m.build_collector_settings(
                 _settings_ns())["metrics_token"])
+
+
+class TestK8sMetaCache(unittest.TestCase):
+    """사이클 간 메타 캐시(ISVC 부재 · Service selector).
+
+    실측(배포 35 / 고유 Service 12 / 5초 주기): Service 마다 사이클당 k8s 5회 =
+    하루 약 103만 회인데, 그중 ISVC 부재 확인과 spec.selector 는 매번 같은 답을
+    준다. 이 둘만 TTL 캐시해 사이클당 60 -> 36회(40% 감소, 하루 약 41만 회)로
+    줄인다. 캐시하면 **안 되는** 것들이 회귀 포인트라 함께 고정한다.
+    """
+
+    class _Client:
+        default_namespace = "default"
+        enabled = True
+
+        def __init__(self, isvc_exists=False, isvc_err="HTTP 404 not found",
+                     pods=1, selector="app=x"):
+            self.calls = collections.Counter()
+            self.isvc_exists = isvc_exists
+            self.isvc_err = isvc_err
+            self.pods = pods
+            self.selector = selector
+
+        def get(self, path, *a, **kw):
+            if "inferenceservices" in path:
+                self.calls["isvc"] += 1
+                if not self.isvc_exists:
+                    return False, None, self.isvc_err
+                # revision 은 롤아웃마다 바뀌는 동적 값 — 호출마다 다르게 준다.
+                return True, {"status": {
+                    "deploymentMode": "RawDeployment",
+                    "components": {"predictor": {
+                        "latestReadyRevision": "rev-%d" % self.calls["isvc"]}}}}, None
+            if "/services/" in path:
+                self.calls["svc"] += 1
+                k, v = self.selector.split("=")
+                return True, {"spec": {"selector": {k: v}}}, None
+            if "/pods" in path:
+                self.calls["pods"] += 1
+                items = [{"metadata": {"name": "pod-1"},
+                          "spec": {"nodeName": "node-1", "containers": [
+                              {"image": "vllm/x", "resources": {
+                                  "limits": {"nvidia.com/gpu": "2"}}}]},
+                          "status": {"conditions": [
+                              {"type": "Ready", "status": "True"}]}}]
+                return True, {"items": items[:self.pods]}, None
+            if "/nodes/" in path:
+                self.calls["node"] += 1
+                return True, {"metadata": {"labels": {
+                    "nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"}}}, None
+            self.calls["other"] += 1
+            return False, None, "n/a"
+
+    def test_absent_isvc_is_cached_after_first_cycle(self):
+        meta = {}
+        counts = []
+        for _ in range(3):
+            c = self._Client()
+            m.detect_mode_and_revision(c, "ns", "svc", meta)
+            counts.append(c.calls["isvc"])
+        self.assertEqual(counts, [1, 0, 0], "ISVC 404 가 캐시되지 않았다")
+
+    def test_present_isvc_is_never_cached(self):
+        # 회귀: 성공을 캐시하면 revision(latestReadyRevision)이 굳고, 그걸 쓰는
+        # Knative PodAutoscaler 조회가 사라진 revision 을 가리킨다.
+        meta = {}
+        revs = []
+        # 클라이언트를 사이클 간 공유해야 revision 이 실제로 바뀐다(가짜 응답이
+        # 호출 횟수로 revision 을 만든다) — 캐시되면 조회가 안 일어나 값이 굳는다.
+        c = self._Client(isvc_exists=True)
+        for i in range(3):
+            info, _ = m.detect_mode_and_revision(c, "ns", "svc", meta)
+            self.assertEqual(c.calls["isvc"], i + 1,
+                             "성공을 캐시해 조회가 사라졌다")
+            revs.append(info["revision"])
+        self.assertEqual(revs, ["rev-1", "rev-2", "rev-3"],
+                         "revision 이 갱신되지 않았다(캐시에 굳었다)")
+        self.assertEqual(meta, {}, "found=True 를 캐시했다")
+
+    def test_transient_isvc_failure_is_not_cached(self):
+        # 404 가 아닌 실패(RBAC/타임아웃)를 캐시하면 network_type 이 TTL 동안
+        # '-'(판정 불가)로 굳는다 — 노드 라벨 캐시와 같은 원칙.
+        meta = {}
+        for _ in range(3):
+            c = self._Client(isvc_err="HTTP 403 forbidden")
+            m.detect_mode_and_revision(c, "ns", "svc", meta)
+            self.assertEqual(c.calls["isvc"], 1)
+        self.assertEqual(meta, {}, "일시적 실패가 캐시됐다")
+
+    def test_selector_is_cached(self):
+        meta = {}
+        counts = []
+        for _ in range(3):
+            c = self._Client()
+            m.service_pod_selector(c, "ns", "svc", meta)
+            counts.append(c.calls["svc"])
+        self.assertEqual(counts, [1, 0, 0])
+
+    def test_selector_failure_is_not_cached(self):
+        class NoSvc(TestK8sMetaCache._Client):
+            def get(self, path, *a, **kw):
+                if "/services/" in path:
+                    self.calls["svc"] += 1
+                    return False, None, "HTTP 403 forbidden"
+                return super().get(path, *a, **kw)
+        meta = {}
+        for _ in range(2):
+            c = NoSvc()
+            sel, err = m.service_pod_selector(c, "ns", "svc", meta)
+            self.assertIsNone(sel)
+            self.assertEqual(c.calls["svc"], 1)
+        self.assertEqual(meta, {})
+
+    def test_selector_dropped_when_pod_query_comes_back_empty(self):
+        # 자기치유: 라벨을 바꾼 재배포면 캐시한 selector 가 Pod 을 못 찾는다.
+        # TTL 을 기다리지 않고 버려 다음 사이클에 다시 읽어야 한다.
+        meta, nc = {}, {}
+        seen = []
+        for pods in (1, 1, 0, 1, 1):
+            c = self._Client(pods=pods)
+            m.collect_gpu_for_service(c, "ns", "svc", "svc", False, nc, meta)
+            seen.append(c.calls["svc"])
+        self.assertEqual(seen, [1, 0, 0, 1, 0],
+                         "Pod 0건 뒤에 selector 를 다시 읽지 않았다")
+
+    def test_cache_disabled_when_none(self):
+        # CLI/직접 호출/기존 테스트 경로: meta_cache 를 안 주면 종전 그대로.
+        for _ in range(3):
+            c = self._Client()
+            m.detect_mode_and_revision(c, "ns", "svc", None)
+            self.assertEqual(c.calls["isvc"], 1)
+            c2 = self._Client()
+            m.service_pod_selector(c2, "ns", "svc", None)
+            self.assertEqual(c2.calls["svc"], 1)
+
+    def test_ttl_expiry_refetches(self):
+        meta = {}
+        m_gpu = importlib.import_module("app.services.gpu")
+        m_gpu.meta_put(meta, ("sel", "ns", "s"), "app=y", ttl=0.05)
+        self.assertTrue(m_gpu.meta_get(meta, ("sel", "ns", "s"))[0])
+        time.sleep(0.1)
+        self.assertFalse(m_gpu.meta_get(meta, ("sel", "ns", "s"))[0])
+
+    def test_cache_is_bounded(self):
+        # node_cache 와 달리 상한을 둔다 — (ns,svc) 라 유계지만 안전망.
+        m_gpu = importlib.import_module("app.services.gpu")
+        cache = {}
+        for i in range(m_gpu._META_MAX + 100):
+            m_gpu.meta_put(cache, ("sel", "ns", "s%d" % i), "app=x")
+        self.assertLessEqual(len(cache), m_gpu._META_MAX)
+
+    def test_steady_state_call_reduction(self):
+        """정상상태에서 Service 당 5회 -> 3회 (동적 조회만 남는다)."""
+        def cycle(meta):
+            c = self._Client()
+            d = {"model_name": "m", "api_base": "http://svc.ns.svc:8000/v1"}
+            m.resolve_backend_count(d, c, {"gpu": True}, {}, {}, meta)
+            return sum(c.calls.values())
+        meta = {}
+        first, second, third = cycle(meta), cycle(meta), cycle(meta)
+        self.assertEqual(second, third, "정상상태가 안정적이지 않다")
+        self.assertLess(second, first)
+        # 남는 것은 EndpointSlice / Deployment status / Pod 목록 — 전부 동적.
+        self.assertEqual(first - second, 2,
+                         "절감이 ISVC+selector 2회가 아니다")
+
+
+class TestDashboardTemplateScopes(unittest.TestCase):
+    """대시보드 템플릿의 JS 스코프 정적 검사.
+
+    render() 는 표를 그리는 if 블록 안에서 필터 전 전체 목록(`all`)을 잡고,
+    그래프는 그 블록 **밖에서** 그린다. `all` 을 블록 지역(const)으로 두면
+    pausedMap(all) 이 ReferenceError 로 죽는데, render 호출이 폴링 try/catch 로
+    감싸여 있어 예외가 "수집 실패" 문구로 위장되고 **그래프만 조용히 사라진다**
+    — 실제로 그렇게 회귀했고, HTTP 200 · 표 렌더 정상이라 스모크 테스트로는
+    잡히지 않았다. 브라우저 없이도 재발을 막기 위해 중괄호 깊이로 검사한다.
+
+    파이썬 테스트가 JS 를 실행할 수는 없으므로(stdlib-only·에어갭) 완전한
+    스코프 분석이 아니다. `X(all)` 호출 지점까지 가는 길에 선언 시점보다 깊이가
+    얕아지는 구간이 있으면(= 선언 블록을 벗어났으면) 실패시킨다.
+    """
+
+    ROOT = os.path.dirname(os.path.abspath(__file__))
+    TPL = ("app", "web", "templates", "dashboard.html")
+
+    def test_all_is_in_scope_at_every_call_site(self):
+        with open(os.path.join(self.ROOT, *self.TPL), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+
+        decl = [i for i, l in enumerate(lines)
+                if re.match(r"\s*const all\s*=", l)]
+        self.assertEqual(len(decl), 1,
+                         "render() 의 `const all` 선언을 정확히 1개 찾지 못함 "
+                         "(이름이 바뀌었으면 이 테스트도 함께 고칠 것)")
+        decl = decl[0]
+
+        depth = 0
+        for l in lines[:decl + 1]:
+            depth += l.count("{") - l.count("}")
+
+        calls, cur, lowest = [], depth, depth
+        for i in range(decl + 1, len(lines)):
+            cur += lines[i].count("{") - lines[i].count("}")
+            if re.search(r"\b\w*Map\(all\)", lines[i]):
+                calls.append((i + 1, lines[i].strip(), lowest))
+            lowest = min(lowest, cur)
+
+        self.assertTrue(calls, "sharedMap(all)/pausedMap(all) 호출을 찾지 못함 "
+                               "— 검사가 무력화됐는지 확인할 것")
+        for lineno, src, low in calls:
+            self.assertGreaterEqual(
+                low, depth,
+                "%d행 `%s` 이 `const all` 선언 블록 밖이다 — 그래프가 "
+                "ReferenceError 로 죽고 폴링 try/catch 가 '수집 실패' 로 "
+                "위장한다. `all` 을 함수 스코프로 올릴 것." % (lineno, src))
 
 
 class TestVersionConsistency(unittest.TestCase):

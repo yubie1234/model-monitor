@@ -1,10 +1,14 @@
 """Prometheus 메트릭 (text exposition format 0.0.4).
 
 수집은 하지 않는다 — 이미 만들어진 스냅샷을 문자열로 포맷만 한다(요청 경로 비차단).
-상태 인코딩: UP=1, DOWN=0, ?(미상/scale-to-zero idle)=-1.
+상태 인코딩: UP=1, DOWN=0, ?(미상/scale-to-zero idle/PAUSED)=-1.
+PAUSED(관리자 일시중지)는 model_monitor_model_blocked 로 따로 노출한다 — 기존
+알림(model_up==0)을 건드리지 않으면서 "꺼둔 모델 제외" 를 표현할 수 있게.
 카디널리티: 라벨은 model/namespace/service/backend_source/status_source 로 한정하고
 api_base(내부 URL)는 노출하지 않는다(per-user 뷰에서 숨기는 내부 정보).
 """
+
+import time
 
 from app import __version__
 
@@ -90,9 +94,38 @@ def render_prometheus_metrics(snap):
     emit("model_monitor_backend_count_enabled",
          "k8s 백엔드 Pod 수 수집이 켜져 있으면 1.", "gauge",
          [({}, 1 if snap.get("backend_count_enabled") else 0)])
+    # 백그라운드 수집이 실패해도 store 는 직전 스냅샷을 계속 서빙한다(model_monitor_up
+    # 은 그래도 1). 그래서 '마지막 수집이 실패 중'을 별도 신호로 노출한다.
+    emit("model_monitor_collect_failing",
+         "마지막 백그라운드 수집이 실패해 직전 스냅샷을 서빙 중이면 1.", "gauge",
+         [({}, 1 if snap.get("collect_error") else 0)])
+    # LiteLLM 은 최상류 단일 의존성 — 죽으면 deployment 시리즈가 통째로 사라질 뿐
+    # (0 이 아니라 부재)이라 알림이 안 걸린다. reachable 을 명시적으로 노출한다.
+    emit("model_monitor_litellm_reachable",
+         "LiteLLM 게이트웨이에 도달 가능하면 1(미도달/미설정이면 0).", "gauge",
+         [({}, 1 if ll.get("reachable") else 0)])
+    emit("model_monitor_litellm_errors",
+         "LiteLLM 수집 중 기록된 에러 문자열 수(도달성/선택적 health 경고 포함).",
+         "gauge",
+         [({}, len(ll.get("errors") or []))])
     emit("model_monitor_collect_errors",
          "k8s 조회 에러가 기록된 deployment 수(>0 이면 일부 Pod 수가 부정확).", "gauge",
-         [({}, sum(1 for d in deps if d.get("k8s_error")))])
+         [({}, s.get("k8s_errors", sum(1 for d in deps if d.get("k8s_error"))))])
+    emit("model_monitor_gpu_collect_errors",
+         "GPU 정보 조회 에러가 기록된 deployment 수(>0 이면 일부 GPU 수가 부정확).",
+         "gauge",
+         [({}, s.get("gpu_errors", sum(1 for d in deps if d.get("gpu_error"))))])
+    # 스냅샷 신선도: ts_epoch 를 그대로 노출하고 age 도 계산해 준다. Refresher 가
+    # 멈추면(model_monitor_up=1 인데도) age 가 계속 커진다 → SnapshotStale 알림.
+    ts_epoch = snap.get("ts_epoch")
+    if isinstance(ts_epoch, (int, float)):
+        emit("model_monitor_snapshot_timestamp_seconds",
+             "마지막 스냅샷을 만든 시각(unix epoch 초).", "gauge",
+             [({}, round(float(ts_epoch), 3))])
+        emit("model_monitor_snapshot_age_seconds",
+             "마지막 스냅샷 이후 경과 초(렌더 시점 기준). 계속 커지면 수집 멈춤.",
+             "gauge",
+             [({}, max(0.0, round(time.time() - float(ts_epoch), 1)))])
 
     # --- 요약(summary) 게이지 ---
     emit("model_monitor_deployments_total",
@@ -104,6 +137,15 @@ def render_prometheus_metrics(snap):
     emit("model_monitor_deployments_unhealthy",
          "상태 DOWN 인 deployment 수.", "gauge",
          [({}, s.get("deployments_unhealthy", 0))])
+    emit("model_monitor_deployments_blocked",
+         "관리자가 LiteLLM 에서 일시중지(pause)한 deployment 수. "
+         "healthy/unhealthy 어느 쪽에도 포함되지 않는다.", "gauge",
+         [({}, s.get("deployments_blocked", 0))])
+    emit("model_monitor_blocked_known",
+         "LiteLLM 이 일시중지 상태(model_info.blocked)를 알려주면 1. "
+         "0 이면 구버전이거나 config 전용 모델이라 '비활성' 판별 자체가 불가.",
+         "gauge",
+         [({}, 1 if s.get("blocked_known") else 0)])
     emit("model_monitor_model_groups",
          "LiteLLM 모델 그룹 수.", "gauge",
          [({}, s.get("model_groups", 0))])
@@ -137,7 +179,7 @@ def render_prometheus_metrics(snap):
             lab["service"] = d["service"]
         return lab
 
-    up_s, ready_s, desired_s, s2z_s, gpu_s = [], [], [], [], []
+    up_s, ready_s, desired_s, s2z_s, gpu_s, blk_s = [], [], [], [], [], []
     for d in deps:
         lab = base_labels(d)
         up_lab = dict(lab)
@@ -153,10 +195,26 @@ def render_prometheus_metrics(snap):
         gpu_s.append((dict(lab), d.get("gpu_ready")))
         s2z_s.append(({"model": d.get("model_name") or ""},
                       1 if d.get("scale_to_zero") else 0))
+        # 일시중지는 model_up 에서 -1(미상)로 뭉뚱그려지므로 별도 게이지로 뺀다.
+        # 기존 DOWN 알림(model_up == 0)은 -1 이라 애초에 안 걸리니 제외 절이 필요
+        # 없다. 굳이 명시하려면 라벨 매칭을 반드시 붙일 것 — model_up 에는
+        # status_source 라벨이 더 있어 bare unless 는 라벨셋이 달라 **절대 매칭되지
+        # 않는다**(조용한 무효 절):
+        #   model_monitor_model_up == 0
+        #     unless on(model, namespace, service) model_monitor_model_blocked == 1
+        blk_s.append((dict(lab), 1 if d.get("status") == "PAUSED" else 0))
 
     emit("model_monitor_model_up",
-         "모델 상태: UP=1, DOWN=0, 미상/idle=-1.", "gauge",
+         "모델 상태: UP=1, DOWN=0, 미상/idle/일시중지=-1. "
+         "일시중지 구분은 model_monitor_model_blocked 를 함께 볼 것.", "gauge",
          _dedup_samples(up_s, _status_reduce))
+    emit("model_monitor_model_blocked",
+         "관리자가 일시중지(pause)해 트래픽을 안 받으면 1. 장애(DOWN)와 구분용.",
+         "gauge",
+         # 같은 (model,ns,svc) 에 deployment 가 여러 개면 min = '전부 꺼졌을 때만 1'.
+         # 하나라도 살아 있으면 그 조합은 여전히 라우팅되므로 1 로 표시하면 거짓
+         # 양성이다. 대시보드의 compositeStatus·그래프 노드와 같은 '완전 차단' 규칙.
+         _dedup_samples(blk_s, min))
     emit("model_monitor_model_backend_pods_ready",
          "이 모델 LB 뒤 ready Pod 수. 여러 모델이 같은 Service 를 공유할 수 있어 "
          "단순 합산은 물리 Pod 를 중복 집계한다 — 총합은 *_total 사용.", "gauge",

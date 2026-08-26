@@ -64,6 +64,11 @@ spec:
       rules:
         # 진짜 DOWN: UP=0 이면서 scale-to-zero 정상 idle 이 아닌 모델.
         # scale_to_zero==1(정상 idle)은 제외 → 오탐 방지(이 모니터만 아는 구분).
+        #
+        # 관리자 일시중지(PAUSED)도 자동 제외된다: PAUSED 는 model_up 이 0 이
+        # 아니라 -1 이라 이 식에 애초에 걸리지 않는다. 즉 운영자가 일부러 끈
+        # 모델은 알림을 울리지 않는다(구분이 필요하면
+        # model_monitor_model_blocked == 1 을 보면 된다).
         - alert: ModelDown
           expr: |
             model_monitor_model_up == 0
@@ -86,6 +91,18 @@ spec:
           annotations:
             summary: "LB UP인데 backend Pod 0: {{ $labels.model }}"
             description: "{{ $labels.model }} 의 LB 는 응답하지만 ready Pod 가 0 (scale-to-zero 아님). 요청이 실패할 수 있음."
+
+        # 꺼둔 채 잊힌 모델: 점검하려고 일시중지해 놓고 되돌리지 않은 흔한 사고.
+        # 장애가 아니므로 severity 는 info 이고, 하루를 넘겨야 울린다.
+        # (Pod/GPU 는 계속 물고 있으면서 트래픽은 0 인 상태라 비용도 새고 있다)
+        - alert: ModelPausedTooLong
+          expr: |
+            model_monitor_model_blocked == 1
+          for: 24h
+          labels: {severity: info}
+          annotations:
+            summary: "모델 일시중지 24시간 초과: {{ $labels.model }}"
+            description: "{{ $labels.model }} ({{ $labels.namespace }}/{{ $labels.service }}) 가 24시간 넘게 LiteLLM 에서 일시중지 상태. 되돌리려면 POST /model/unblock, 정말 안 쓰면 삭제 검토."
 
         # 용량 저하: ready/desired 비율이 낮음(개별 Service 가 아니라 전체 합 기준).
         - alert: BackendCapacityDegraded
@@ -115,3 +132,41 @@ spec:
           annotations:
             summary: "model-monitor k8s 수집 에러 {{ $value }}건"
             description: "일부 deployment 의 backend Pod 수가 부정확할 수 있음(RBAC/연결 확인)."
+
+        # GPU 수집 에러: nodes/pods RBAC·연결 문제로 GPU 수치가 광범위하게 깨짐.
+        - alert: ModelMonitorGpuCollectErrors
+          expr: model_monitor_gpu_collect_errors > 0
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: "model-monitor GPU 수집 에러 {{ $value }}건"
+            description: "일부 deployment 의 GPU 수치가 부정확할 수 있음(pods/nodes RBAC 확인)."
+
+        # 최상류 단일 의존성(LiteLLM) 미도달 — 죽으면 model_* 시리즈가 통째로
+        # 사라져(0 이 아니라 부재) ModelDown 이 안 걸리므로 별도로 잡는다.
+        - alert: LiteLLMUnreachable
+          expr: model_monitor_litellm_reachable == 0
+          for: 5m
+          labels: {severity: critical}
+          annotations:
+            summary: "LiteLLM 게이트웨이 미도달"
+            description: "model-monitor 가 LiteLLM 에 도달하지 못함 — 모델 목록·상태 갱신 불가."
+
+        # 스냅샷 정체(staleness): 스크레이프는 되는데(model_monitor_up=1) 백그라운드
+        # Refresher 가 멈춰 데이터가 낡음. age 가 refresh interval 을 크게 초과.
+        - alert: ModelMonitorSnapshotStale
+          expr: model_monitor_snapshot_age_seconds > 300
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: "model-monitor 스냅샷이 낡음 ({{ $value | humanizeDuration }})"
+            description: "폴링은 되지만 새 스냅샷을 만들지 못함 — 표시 데이터가 stale."
+
+        # 마지막 백그라운드 수집이 실패 상태로 직전 스냅샷을 서빙 중.
+        - alert: ModelMonitorCollectFailing
+          expr: model_monitor_collect_failing == 1
+          for: 10m
+          labels: {severity: warning}
+          annotations:
+            summary: "model-monitor 백그라운드 수집 실패 지속"
+            description: "직전 스냅샷을 계속 서빙 중 — 원인 확인(로그·LiteLLM·k8s)."

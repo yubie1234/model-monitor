@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v1.0.4** — KServe 판별을 svc 네이밍 규약(`-predictor`) 기반으로 전환 + sibling 교차 제외(GLM 등 external IP 백엔드 체크 편입)
+**버전: v1.1.0** — 관리자 일시중지(`model_info.blocked`) 를 `PAUSED` 로 구분 · 장애 원인·수집 신뢰도 가시화 · 대시보드 UX · 시스템 부하 개선
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -15,12 +15,39 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 | model groups | LiteLLM `GET /model_group/info` |
 | **model_name → api_base 매핑** | LiteLLM `GET /model/info` (api_base 평문, admin 키 권장) |
 | running(healthy) / unhealthy | LiteLLM `GET /health` (api_base 기준으로 위 매핑과 join) |
+| **DOWN 사유 (연결실패/타임아웃/5xx …)** | `/health` unhealthy endpoint 의 `error` 를 소수 카테고리로 정규화 — DOWN pill ⚠ 툴팁에 표시 |
+| **일시중지(PAUSED) 여부** | LiteLLM `GET /model/info` 의 `model_info.blocked` (v1.90.0+) |
 | **LB 뒤 backend Pod 개수 (ready/desired)** | Kubernetes API (EndpointSlice / Knative PodAutoscaler / Deployment) |
 | **GPU 개수 + 장치명 (H100/B200 …)** | Pod `resources.limits[nvidia.com/gpu]` + 노드 라벨 `nvidia.com/gpu.product` |
-| OpenAI 호환 모델 이름 목록 | LiteLLM `GET /v1/models` (이름만, **api_base 없음**) |
+| OpenAI 호환 모델 이름 목록 | `/model/info` 의 model_name 에서 유도 — 별도 `/v1/models` 호출 없음(per-user 뷰의 키 검증은 예외) |
 | backends up (옵션) | 각 백엔드 `GET /v1/models`, `/health` 직접 probe |
 
 > 주의: `/v1/models` 는 OpenAI 호환 스펙이라 `id`(model_name)만 줍니다. **api_base 는 `/model/info` 에서** 나옵니다.
+
+### 모델 비활성화(일시중지) 판별 — `PAUSED`
+
+LiteLLM v1.90.0 부터 관리자가 모델 deployment 를 **삭제하지 않고 껐다 켤 수** 있습니다
+(`POST /model/block` · `POST /model/unblock` · `PATCH /model/{id}/update {"blocked":true}`,
+Admin UI 의 토글 스위치). 꺼진 deployment 는 라우팅 풀에서 빠져 **트래픽을 전혀 받지 않습니다**.
+
+모니터는 이 상태를 `/model/info` 의 `model_info.blocked` 로 읽어 `PAUSED` 상태로 표시합니다.
+
+**왜 필요한가** — LiteLLM `/health` 는 `blocked` 를 걸러주지 않습니다(v1.90.0 소스 확인).
+일시중지된 백엔드도 계속 ping 되어 **healthy 로 보고**되므로, 이 판별이 없으면
+"트래픽을 못 받는데 대시보드에는 UP" 인 거짓 정상이 그대로 남습니다.
+
+- 표에는 `PAUSED(UP)` 처럼 **원래 health 판정을 괄호로** 함께 보여줍니다(`health_status` 필드) —
+  다시 켰을 때 실제로 뜰 백엔드인지 판단할 수 있게.
+- `PAUSED` 는 healthy 카드에도 unhealthy 카드에도 **들어가지 않고** 별도 `Paused` 카드로 셉니다
+  (장애와 의도된 정지를 섞지 않기 위해). status 필터의 "이상만(장애후보)" 에서도 제외됩니다.
+- 모든 deployment 가 꺼진 이름은 **능동 health check 대상에서 제외**합니다(꺼둔 백엔드를 두드리지 않음).
+  일부만 꺼졌으면 살아있는 sibling 상태를 봐야 하므로 계속 체크합니다.
+- **3상태**입니다: `true`(비활성) / `false`(활성) / **키 없음**(구버전 LiteLLM 이거나
+  `config.yaml` 전용 모델 — `blocked` 는 DB 등록 모델에만 붙습니다). 키가 없으면 '알 수 없음'
+  으로 두고 기존과 완전히 동일하게 동작합니다(`model_monitor_blocked_known` 으로 확인 가능).
+- **한계**: 한 이름의 deployment 가 **전부** 꺼지면 LiteLLM 이 그 이름을 `/v1/models` 에서 숨깁니다.
+  키별(per-user) 뷰의 접근 목록은 사용자 키의 `/v1/models` 에서 나오므로, 그런 모델은
+  사용자 뷰에서 `PAUSED` 로 보이는 게 아니라 **목록에서 사라집니다**(전체/admin 뷰에는 보입니다).
 
 ## LB 뒤 backend Pod 개수 (핵심)
 
@@ -69,6 +96,46 @@ LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델
 > in-cluster 에서 ServiceAccount 토큰이 있으면 **자동으로 켜집니다**(`MONITOR_BACKEND_COUNT=false` 로 끔).
 > 필요한 RBAC 는 [deploy/k8s.yaml](deploy/k8s.yaml) 의 ClusterRole 참고 — 최소한 `endpointslices` 읽기,
 > GPU 정보까지 보려면 `pods`·`nodes` 읽기.
+
+### k8s API 호출량과 캐시
+
+한 스냅샷 주기에 **고유 Service 당** 다음 5회를 조회합니다. 같은 Service 를 공유하는 deployment 가
+여러 개여도 사이클 내 캐시로 1회로 접힙니다(배포 100개가 Service 12개를 공유하면 60회, 배포당 0.6회).
+
+| 조회 | 성질 | 사이클 간 캐시 |
+|------|------|----------------|
+| `inferenceservices/<isvc>` | ISVC 존재 여부 + deploymentMode + revision | **부재(404)만** TTL 60초 |
+| `services/<svc>` (`spec.selector`) | 라벨 셀렉터 | TTL 60초 + 자기치유 |
+| `endpointslices?…` | ready endpoint | 없음 (동적) |
+| `deployments/<name>` | readyReplicas / replicas | 없음 (동적) |
+| `pods?labelSelector=…` | GPU 수 · 엔진 | 없음 (동적) |
+| `nodes/<name>` | GPU 장치명 라벨 | 프로세스 수명 (노드 수명 동안 불변) |
+
+**v1.1.0 에서 위 두 항목을 캐시**해 정상 상태 호출을 Service 당 5회 → 3회로 줄였습니다
+(Service 12개·5초 주기 실측: 하루 약 103만 → 66만 회, **38만 회 절감**. TTL 주기마다 콜드 1회는
+전체 5회를 조회하므로 평균 3.17회입니다).
+
+캐시하지 **않는** 것이 안전장치입니다:
+
+- **ISVC 조회 성공은 캐시하지 않습니다.** 반환하는 revision 이 `latestReadyRevision` 에서 오는
+  동적 값이라, 캐시하면 롤아웃 후에도 옛 revision 이 굳고 그걸 쓰는 Knative PodAutoscaler 조회가
+  사라진 revision 을 가리킵니다. 절감은 "ISVC 가 없는 일반 Service" 에서만 나옵니다.
+- **404 가 아닌 실패(RBAC/타임아웃/프록시)도 캐시하지 않습니다.** 일시적 실패를 굳히면
+  `network_type` 이 TTL 동안 `-`(판정 불가)로 고정됩니다 — 노드 라벨 캐시와 같은 원칙.
+- **selector 는 자기치유합니다.** 캐시한 selector 로 Pod 조회가 0건이면 TTL 을 기다리지 않고
+  버려 다음 사이클에 다시 읽습니다(라벨을 바꾼 재배포 대응). 실제로 0 replica 인 Service 가
+  매 사이클 selector 를 다시 받는 것이 대가인데, 그쪽은 어차피 호출 예산이 남습니다.
+
+TTL 은 [app/services/gpu.py](app/services/gpu.py) 의 `META_TTL`(기본 **60초**).
+
+> ⚠️ **TTL 을 늘리기 전에 읽어주세요 — 호출량이 아니라 각성 안전 문제입니다.** ISVC 부재를
+> 캐시하면 그동안 `network_type` 이 `service` 로 남습니다. 그런데 KServe 판별은 "이름 규약
+> (`-predictor`) **또는** `network_type==kserve`" 이라, 이름 규약을 따르지 않는 Service 에는
+> ISVC 조회가 **유일한 KServe 신호**입니다. 그런 Service 에 Serverless ISVC 가 새로 생기면
+> TTL 동안 health check 대상에 들어가 LiteLLM 이 그 백엔드를 ping 해 **깨웁니다**. 이름 규약을
+> 지키면 캐시와 무관하게 막히지만, 그 보장 하나에 각성 방지를 걸지 않으려고 60초로 뒀습니다 —
+> 위험 창이 캐시 없을 때의 5초에서 12배로만 늘고 절감은 41만 → 38만 회로 8% 만 줍니다.
+> 300초로 올리면 창이 60배가 되고 절감은 41만 회가 됩니다(+8%). 이 절충을 보고 정하세요.
 
 ## 사용법
 
@@ -125,6 +192,11 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   지금 렌더 중인 per-user 스냅샷(서버 응답 그대로)을 파일로 저장할 수 있습니다 — 문의/디버그에
   첨부. 브라우저 밖에서는 `curl -X POST -H "X-LiteLLM-Key: <내 키>" <base>/api/snapshot/user`
   로 같은 JSON 을 받을 수 있습니다. (admin 전체 export 는 기존처럼 admin 키 전용.)
+- **뷰 생성 비용 (v1.1.0)**: 공유 스냅샷을 통째로 복사한 뒤 걸러내던 것을 **필터 먼저, 접근 가능한
+  것만 복사**로 바꿨습니다. 예전엔 비용이 사용자 키와 무관하게 *전체* 배포 수에 비례했습니다
+  (폴링 주기 × 사용자 수만큼 반복). 실측: 배포 1000개 중 50개 접근 사용자 **13.7ms → 0.24ms**,
+  전체 접근이어도 **5.5배**. 남기는 값은 컨테이너면 deepcopy 해 공유 스냅샷과 객체를 공유하지
+  않습니다(뷰를 변형해도 다른 사용자 뷰가 깨지지 않음 — 회귀 테스트로 고정).
 - **접근 캐시**: 같은 키의 `/v1/models` 결과를 **짧은 TTL(기본 30s)** 캐시해 폴링 중복 호출을 제거
   (해시만 보관, 원문 키 비저장). 성공만 캐시 → 무효 키는 매번 재검증. 취소/만료 키는 최대 TTL 동안 stale.
   config `user_view.cache_ttl` 로 조절.
@@ -141,17 +213,31 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 요청 경로에서 수집하지 않고 **백그라운드 캐시 스냅샷을 포맷만** 하므로(다른 엔드포인트와 동일) 스크레이프가
 수집을 막지 않습니다. 시점 대시보드를 **시계열·알림**으로 확장하는 용도입니다(기존 Prometheus/Grafana 연동).
 
-- **요약 게이지**: `model_monitor_deployments_{total,healthy,unhealthy}`,
+- **요약 게이지**: `model_monitor_deployments_{total,healthy,unhealthy,blocked}`,
   `model_monitor_backend_pods_{ready,desired}_total`(공유 Service 는 1회만 집계),
-  `model_monitor_model_groups`, `model_monitor_backend_pods_known`.
+  `model_monitor_model_groups`, `model_monitor_backend_pods_known`,
+  `model_monitor_blocked_known`(0 이면 이 LiteLLM 이 일시중지 상태를 안 알려줌).
 - **모델(deployment) 단위**: `model_monitor_model_up`(라벨 `model`/`namespace`/`service`/`status_source`,
-  값 **UP=1 · DOWN=0 · 미상/idle=-1**), `model_monitor_model_backend_pods_{ready,desired}`,
-  `model_monitor_model_scale_to_zero`(0 Pod 가 정상 idle 인지 장애인지 구분).
+  값 **UP=1 · DOWN=0 · 미상/idle/일시중지=-1**), `model_monitor_model_backend_pods_{ready,desired}`,
+  `model_monitor_model_scale_to_zero`(0 Pod 가 정상 idle 인지 장애인지 구분),
+  `model_monitor_model_blocked`(관리자 일시중지 1/0 — 장애와 구분).
+- **GPU**: `model_monitor_backend_gpus_ready_total`(모든 LB 뒤 ready Pod 가 점유한 GPU 합계 — Pod 와
+  같은 이유로 공유 Service 는 1회만 집계), `model_monitor_backend_gpus_ready_by_device{device=…}`
+  (H100/B200 등 장치 모델별 — 이기종 클러스터에서 어느 장치가 부족한지),
+  `model_monitor_model_backend_gpus_ready`(모델 단위, 라벨 `model`/`namespace`/`service`),
+  `model_monitor_backend_gpus_known`(0 이면 노드 라벨/RBAC 문제로 GPU 를 하나도 못 알아낸 것 —
+  총량 0 이 '장애' 가 아니라 '미상' 임을 구분).
 - **스크레이프 신뢰도**: `model_monitor_up`, `model_monitor_build_info{version=…}`,
-  `model_monitor_backend_count_enabled`, `model_monitor_collect_errors`(>0 이면 일부 Pod 수 부정확).
+  `model_monitor_backend_count_enabled`, `model_monitor_collect_errors`(>0 이면 일부 Pod 수 부정확),
+  `model_monitor_gpu_collect_errors`(>0 이면 일부 GPU 수 부정확),
+  `model_monitor_litellm_reachable`(0=최상류 게이트웨이 미도달), `model_monitor_litellm_errors`(수집 경고 수),
+  `model_monitor_collect_failing`(1=마지막 수집 실패, 직전 스냅샷 서빙 중),
+  `model_monitor_snapshot_timestamp_seconds`/`model_monitor_snapshot_age_seconds`(스냅샷 나이 — 커지면 수집 멈춤).
 - 활용 예: `model_monitor_model_up == 0 and model_monitor_model_scale_to_zero == 0` 으로 **"진짜 죽음"만**
   알림(정상 idle 오탐 제거), `model_up == 1 and model_backend_pods_ready == 0` 으로 **LB 는 200인데 뒤에
-  Pod 0** 인 함정 탐지, `avg_over_time(model_monitor_model_up[30d])` 로 모델별 가동률 산출.
+  Pod 0** 인 함정 탐지, `avg_over_time(model_monitor_model_up[30d])` 로 모델별 가동률 산출,
+  `model_monitor_model_blocked == 1` 을 `for: 24h` 로 걸어 **꺼둔 채 잊힌 모델**(Pod·GPU 는 물고
+  트래픽은 0) 탐지. 일시중지는 `model_up` 이 0 이 아니라 -1 이라 기존 DOWN 알림에 **자동으로 안 걸립니다**.
 - **주의**: 한 `model_name` 에 여러 deployment(로드밸런싱)가 있으면 동일 라벨 series 가 중복될 수 있어
   내부적으로 합칩니다(상태는 DOWN 우선). 내부 `api_base` 는 라벨로 노출하지 않습니다(카디널리티·보안).
 - **키 필수 모드(`MONITOR_USER_VIEW=true`)** 에선 `/metrics` 도 인증이 필요합니다. 두 가지 방법:
@@ -172,7 +258,8 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   추세 그래프, 모델별 상태 타임라인, 상세 테이블로 구성. `namespace`/`model` 변수로 필터.
 - [deploy/prometheus-alerts.yaml](deploy/prometheus-alerts.yaml) — 스크레이프 설정 예시 + 알림 룰
   (`PrometheusRule`): `ModelDown`(idle 제외), `BackendPodsZeroWhileUp`, `BackendCapacityDegraded`,
-  `ModelMonitorDown`, `ModelMonitorCollectErrors`.
+  `ModelMonitorDown`, `ModelMonitorCollectErrors`, `ModelMonitorGpuCollectErrors`, `LiteLLMUnreachable`,
+  `ModelMonitorSnapshotStale`, `ModelMonitorCollectFailing`.
 
 ### 설정 우선순위
 환경변수(`LITELLM_BASE_URL`, `LITELLM_API_KEY`, `MONITOR_*`) > config 파일(`MONITOR_CONFIG_FILE`) > 기본값
@@ -206,8 +293,8 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_INTERVAL` | 스냅샷 갱신 주기 초 (5) |
 | `MONITOR_DEMO` | 샘플 데이터 모드 (false) |
 | `MONITOR_TIMEOUT` | HTTP 타임아웃 초 (10) |
-| `MONITOR_HEALTH` / `MONITOR_HEALTH_TIMEOUT` | `/health` 사용 / 타임아웃 초 (true / 90) |
-| `MONITOR_SELECTIVE_HEALTH` | 선택적 health check (false) — `MONITOR_HEALTH=false`일 때 안전한 모델만 `/health?model=` 개별 조회(ping 은 LiteLLM 이 대신). **KServe 판별 = svc 네이밍 규약(`-predictor`)**: KServe 는 k8s 가 RawDeployment 로 양성 확인한 경우만 체크, Serverless/scale-to-zero 는 절대 깨우지 않음. 그 외(일반 Service·**external IP 포함**)는 전부 체크 → UP/DOWN. 위험 sibling(같은 underlying 모델/api_base 공유)이 있는 이름은 함께 제외(LiteLLM 의 `?model=` 매칭이 이름보다 넓을 수 있어서). LiteLLM `model_info.active_health_check: true/false` 로 모델별 수동 override(단 Knative 양성 확인은 true 도 무시. bool 또는 "true"/"false" 문자열만 인정) |
+| `MONITOR_HEALTH` / `MONITOR_HEALTH_TIMEOUT` | 전량 `/health` 사용 / 타임아웃 초 (**false** / 90) — 전량 `/health` 는 LiteLLM 이 모든 백엔드를 실제 ping 해 scale-to-zero 를 깨우므로 기본 off, 필요 시 명시적으로 켠다 |
+| `MONITOR_SELECTIVE_HEALTH` | 선택적 health check (**true**) — `MONITOR_HEALTH=false`일 때 안전한 모델만 `/health?model=` 개별 조회(ping 은 LiteLLM 이 대신). **KServe 판별 = svc 네이밍 규약(`-predictor`)**: KServe 는 k8s 가 RawDeployment 로 양성 확인한 경우만 체크, Serverless/scale-to-zero 는 절대 깨우지 않음. 그 외(일반 Service·**external IP 포함**)는 전부 체크 → UP/DOWN. 위험 sibling(같은 underlying 모델/api_base 공유)이 있는 이름은 함께 제외(LiteLLM 의 `?model=` 매칭이 이름보다 넓을 수 있어서). LiteLLM `model_info.active_health_check: true/false` 로 모델별 수동 override(단 Knative 양성 확인은 true 도 무시. bool 또는 "true"/"false" 문자열만 인정) |
 | `MONITOR_PROBE_BACKENDS` | 백엔드 직접 probe (false) |
 | `MONITOR_BACKEND_COUNT` | LB 뒤 backend Pod 개수 수집 (true) |
 | `MONITOR_GPU_INFO` | GPU 개수/장치명 수집 (true; Pod·Node 읽기 권한 필요) |

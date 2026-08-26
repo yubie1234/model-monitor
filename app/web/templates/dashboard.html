@@ -96,7 +96,8 @@
   tbody tr:hover{background:var(--surface2)}
   td.mono,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
   td.api{font-family:var(--mono);font-size:12px;color:var(--muted);max-width:340px;
-    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:copy}
+  td.api.copied{color:var(--up)}   /* 클릭 복사 성공 피드백(잠깐 초록) */
   td.name{font-weight:550}
   /* 그래프 노드에 호버하면 표에서 대응하는 행을 하이라이트 (id 특이도로 grp/child 배경 위에 얹음) */
   #deployments tbody tr.hl>td{background:rgba(110,139,255,.16)}
@@ -117,6 +118,10 @@
   .pill.up{color:var(--up);background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.3)}
   .pill.down{color:var(--down);background:rgba(248,81,73,.10);border-color:rgba(248,81,73,.3)}
   .pill.unk{color:var(--muted);background:rgba(139,151,167,.1);border-color:var(--border)}
+  /* 일시중지 = 장애가 아니라 의도적으로 꺼둔 상태. 빨강(장애)과 반드시 구분되게
+     accent 계열 + 점선 테두리로 '멈춰 있음' 을 시각적으로 분리한다. */
+  .pill.pause{color:var(--accent);background:rgba(110,139,255,.10);
+    border-color:rgba(110,139,255,.35);border-style:dashed}
   .chip{font-family:var(--mono);font-size:11px;color:var(--muted);
     background:var(--surface2);border:1px solid var(--border);border-radius:5px;
     padding:1px 7px}
@@ -202,6 +207,9 @@
   .gnode.be.warn rect{fill:rgba(210,153,34,.12);stroke:rgba(210,153,34,.5)}
   .gnode.be.zero rect{fill:rgba(210,153,34,.08);stroke:rgba(210,153,34,.4)}
   .gnode.be.unk rect{fill:var(--surface2);stroke:var(--border)}
+  /* 일시중지 백엔드: accent 계열 + 반투명 — 장애(빨강)와 확실히 구분 */
+  .gnode.be.paused rect{fill:rgba(110,139,255,.07);stroke:rgba(110,139,255,.45)}
+  .gnode.be.paused .ntext{fill:var(--muted)}
   .gnode.be.shared rect{stroke-dasharray:4 3}
   .gedge{stroke:var(--faint);stroke-width:1.6;fill:none;opacity:.5}
   .gedge.shared{stroke:var(--warn);stroke-width:2;opacity:.8}
@@ -279,17 +287,18 @@
     <div class="sec-title">Model ↔ Backend
       <span class="filters">
         <input type="search" id="f-search" class="search" autocomplete="off" spellcheck="false"
-               aria-label="model_name 검색"
-               placeholder="🔍 모델 검색  ( / )"
-               title="model_name 으로 필터 — 표·그래프에 함께 적용. 단축키 &quot;/&quot;, 지우기 Esc">
+               aria-label="모델·백엔드 검색"
+               placeholder="🔍 모델·백엔드 검색  ( / )"
+               title="model_name·service·api_base 로 필터 — 표·그래프에 함께 적용. 단축키 &quot;/&quot;, 지우기 Esc">
         <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
-        <select id="f-status" title="상태로 필터. '이상만(≠UP)'은 정상 확인 안 된 것(DOWN·?)을 한 번에 — 장애 트리아지용">
+        <select id="f-status" title="상태로 필터. '이상만'은 정상 확인 안 된 것(DOWN·?)을 한 번에 — 장애 트리아지용이라 의도적으로 꺼둔 PAUSED 는 빼고 본다">
           <option value="">all</option>
-          <option value="!UP">이상만 (≠UP)</option>
+          <option value="!UP">이상만 (장애후보)</option>
           <option value="UP">UP</option>
           <option value="DOWN">DOWN</option>
+          <option value="PAUSED">PAUSED (비활성)</option>
           <option value="?">?</option>
         </select>
         <label for="f-net">net</label>
@@ -363,6 +372,39 @@ function saveGraphPin(){
 // 새로 그려지면 mouseleave 없이 노드가 떨어져 나가 하이라이트가 사라지므로, pin 복원과
 // 똑같이 재렌더 후 hover 도 다시 적용한다(pin 이 있으면 pin 우선 — hover 는 무시).
 let graphHover = null;
+
+// 필터 상태(검색어·status/net/eng·그룹/그래프 토글)도 pin 과 같은 이유로 sessionStorage 에
+// 보관해 F5 후 복원한다(pin 만 살아남고 필터는 리셋되던 비대칭 제거). 탭 닫으면 소멸.
+const FILTER_KEY = "mm_filters";
+function saveFilters(){
+  try{ sessionStorage.setItem(FILTER_KEY, JSON.stringify({
+    q:$("#f-search").value, s:$("#f-status").value, n:$("#f-net").value,
+    e:$("#f-eng").value, g:$("#f-group").checked, gr:$("#f-graph").checked })); }
+  catch(e){}
+}
+function loadFilters(){
+  let f=null; try{ f=JSON.parse(sessionStorage.getItem(FILTER_KEY)||"null"); }catch(e){}
+  if(!f) return;
+  $("#f-search").value = f.q||"";
+  if(f.s!=null) $("#f-status").value = f.s;
+  if(f.n!=null) $("#f-net").value = f.n;
+  if(f.e!=null) $("#f-eng").value = f.e;
+  if(f.g!=null) $("#f-group").checked = !!f.g;
+  if(f.gr!=null) $("#f-graph").checked = !!f.gr;
+}
+
+// 서버 스냅샷 갱신 멈춤(stale) 감지: 폴링(fetch)이 성공해도 서버측 Refresher 가 멈추면
+// 낡은 데이터가 초록불로 계속 표시된다. 서버가 찍은 ts 값이 "바뀌는지"만 보므로
+// (클라이언트 시계와 직접 비교·파싱하지 않음) 서버-브라우저 시계차와 무관하게 동작한다.
+let staleTs = null, staleSince = 0;   // ts 가 마지막으로 바뀐 시각(클라이언트 ms)
+let snapStale = false;                // 최근 render 가 판정한 stale 여부 — tick 이 dot 색에 반영
+function staleMs(snap){
+  if(window.__SNAPSHOT__ || !snap.ts) return 0;   // 정지 페이지는 판단 안 함
+  if(staleTs !== snap.ts){ staleTs = snap.ts; staleSince = Date.now(); }
+  return Date.now() - staleSince;
+}
+function fmtAgo(ms){ const s=Math.round(ms/1000);
+  return s<60 ? s+"초" : Math.floor(s/60)+"분 "+(s%60)+"초"; }
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,
   c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
@@ -449,9 +491,69 @@ function backendCell(d){
     +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
 }
 
-function statusPill(s){
-  const cls = s==="UP"?"up":(s==="DOWN"?"down":"unk");
-  return '<span class="pill '+cls+'">'+esc(s)+'</span>';
+// DOWN 사유(down_reason) 사람이 읽는 라벨. 서버가 /health error 원문을 소수
+// 카테고리로 정규화해 준다 — 여기선 그 카테고리에 한국어 설명을 붙인다(미매핑은
+// 코드 그대로 노출).
+const DOWN_REASON_TIP = {
+  connection:     "백엔드에 연결 실패 (Pod/DNS 소멸·미기동 정황)",
+  timeout:        "응답 타임아웃",
+  rate_limit:     "레이트 리밋 (429)",
+  auth:           "인증 실패 (키/권한)",
+  not_found:      "대상 없음 (404·healthy endpoint 없음)",
+  context_window: "컨텍스트 길이 초과",
+  server_error:   "백엔드 5xx 서버 오류",
+  client_error:   "요청 4xx 오류",
+  no_ready_pods:  "ready Pod 0 (k8s readiness)",
+  other:          "기타 오류",
+};
+// status_source 툴팁: 같은 UP 이라도 실제 /health 체크 결과인지, k8s readiness 추정인지
+// 신뢰도가 다르다 — pill 에 마우스를 올리면 판정 근거를 보여준다.
+const STATUS_SRC_TIP = {
+  health:  "LiteLLM /health 체크 결과",
+  k8s:     "k8s backend readiness 로 추정 (/health 미조회)",
+  blocked: "LiteLLM 에서 관리자가 일시중지(pause)한 상태 — 장애가 아니라 "
+           + "트래픽을 받지 않도록 꺼둔 것입니다",
+  unknown: "판단 불가 — /health 미조회 + backend 확인 실패",
+};
+// DOWN pill 툴팁: 사유 라벨 + 서버가 준 error 첫 줄(status_detail). 운영자가 pill 에
+// 마우스만 올리면 '왜 DOWN 인지'를 raw JSON 없이 바로 읽는다.
+function downTip(d){
+  if(!d) return "";
+  const parts = [];
+  if(d.down_reason) parts.push("사유: "+(DOWN_REASON_TIP[d.down_reason]||d.down_reason));
+  if(d.status_detail) parts.push(d.status_detail);
+  return parts.join("\n");
+}
+function statusPill(s, d){
+  const cls = statusPillCls(s);
+  // PAUSED 는 'PAUSED(UP)' 처럼 원래 health 판정을 괄호로 덧붙인다 — 다시 켰을 때
+  // 실제로 뜰 백엔드인지(Pod 가 살아있는지)를 한눈에 보게.
+  let txt = s;
+  if(s==="PAUSED"){
+    const hs = d && d.health_status;
+    txt = "PAUSED" + (hs && hs!=="?" ? "("+hs+")" : "");
+  }
+  // 판정 근거(status_source) + DOWN 사유를 한 툴팁에 합친다 — 같은 UP 이라도
+  // /health 실측인지 k8s 추정인지 신뢰도가 다르고, DOWN 이면 원인이 바로 필요하다.
+  const parts = [];
+  const srcTip = d ? STATUS_SRC_TIP[d.status_source] : null;
+  if(srcTip) parts.push("판정: "+srcTip);
+  // PAUSED 는 status_source 가 "blocked" 로 덮여 괄호 안 값(원래 health 판정)의
+  // 근거가 위 줄에서 사라진다. 실측인지 추정인지는 "다시 켜면 뜰까" 를 판단하는
+  // 신뢰도라 반드시 따로 보여준다 — MONITOR_HEALTH 기본 off 에서는 추정이 흔하다.
+  if(s==="PAUSED" && d && d.health_status && d.health_status_source){
+    const hsTip = STATUS_SRC_TIP[d.health_status_source];
+    if(hsTip) parts.push("괄호 안 "+d.health_status+" 의 근거: "+hsTip);
+  }
+  // 사유는 DOWN 일 때, 그리고 일시중지됐지만 원래 health 가 DOWN 이었을 때도 보여준다
+  // — 다시 켜도 뜨지 않을 백엔드인지 미리 알아야 하기 때문.
+  const dtip = (s==="DOWN" || (s==="PAUSED" && d && d.health_status==="DOWN"))
+    ? downTip(d) : "";
+  if(dtip) parts.push(dtip);
+  const tip = parts.join("\n");
+  const mark = dtip ? " ⚠" : "";
+  return '<span class="pill '+cls+'"'+(tip?' title="'+esc(tip)+'"':'')+'>'
+    +esc(txt)+mark+'</span>';
 }
 
 function card(label,val,cls,sub){
@@ -498,15 +600,33 @@ function trunc(s,n){s=String(s==null?"":s);return s.length>n?s.slice(0,n-1)+"…
 function backendHost(api){ if(!api) return "";
   return String(api).replace(/^[a-z]+:\/\//,"").replace(/[:\/].*$/,""); }
 function compositeStatus(bes){
+  // 일시중지된 backend 는 라우팅 풀에서 빠져 있으니 그룹 가용성 판정에서 뺀다
+  // (LiteLLM 도 blocked sibling 을 건너뛰고 남은 deployment 로 라우팅한다).
+  // 전부 일시중지면 그 모델 이름은 통째로 트래픽을 못 받는다 -> PAUSED.
+  const live = bes.filter(b=>(b.status||"?")!=="PAUSED");
+  if(live.length===0) return bes.length ? "PAUSED" : "?";
   let up=0,down=0;
-  bes.forEach(b=>{const s=b.status||"?"; if(s==="UP")up++; else if(s==="DOWN")down++;});
-  if(up===bes.length) return "UP";
-  if(down===bes.length && down>0) return "DOWN";
+  live.forEach(b=>{const s=b.status||"?"; if(s==="UP")up++; else if(s==="DOWN")down++;});
+  if(up===live.length) return "UP";
+  if(down===live.length && down>0) return "DOWN";
   if(up>0) return "DEGRADED";
   return "?";
 }
-function statusPillCls(s){return s==="UP"?"up":(s==="DOWN"?"down":(s==="DEGRADED"?"deg":"unk"));}
-function compositePill(s){return '<span class="pill '+statusPillCls(s)+'">'+esc(s)+'</span>';}
+function statusPillCls(s){return s==="UP"?"up":(s==="DOWN"?"down":
+  (s==="DEGRADED"?"deg":(s==="PAUSED"?"pause":"unk")));}
+// 그룹 헤더의 합성 pill: 무엇으로 합성됐는지(UP/DOWN/?/일시중지 내역) 툴팁으로 풀어준다.
+// compositeStatus 가 일시중지 backend 를 가용성 판정에서 제외하므로 내역에도 따로
+// 세어 보여준다 — 안 그러면 'UP 1' 뒤에 꺼둔 sibling 2개가 조용히 묻힌다.
+function compositePill(s, bes){
+  let tip="";
+  if(bes && bes.length){ let up=0,down=0,paused=0,unk=0;
+    bes.forEach(b=>{const t=b.status||"?";
+      if(t==="UP")up++; else if(t==="DOWN")down++; else if(t==="PAUSED")paused++; else unk++;});
+    tip = bes.length+"개 backend 합성: UP "+up+" · DOWN "+down
+        +(paused?" · 일시중지 "+paused:"")+(unk?" · ? "+unk:"");
+  }
+  return '<span class="pill '+statusPillCls(s)+'"'+(tip?' title="'+esc(tip)+'"':'')+'>'+esc(s)+'</span>';
+}
 function sumBackends(bes){
   let r=null,d=null;
   bes.forEach(b=>{ if(b.backends_ready!=null) r=(r||0)+b.backends_ready;
@@ -524,6 +644,16 @@ function aggCell(r,d){
 function sharedMap(all){
   const mp={};
   (all||[]).forEach(d=>{const k=svcKeyOf(d);(mp[k]=mp[k]||new Set()).add(d.model_name);});
+  return mp;
+}
+// backend Service 별 '전부 일시중지인가'. sharedMap 과 마찬가지로 **필터 전**
+// 전체 목록으로 계산해야 한다 — 필터로 살아있는 sibling 이 화면에서 빠졌을 뿐인데
+// 물리 백엔드를 꺼진 것으로 칠하면 거짓말이 된다(status='PAUSED' 필터가 정확히
+// 그 상황을 만든다).
+function pausedMap(all){
+  const mp={};
+  (all||[]).forEach(d=>{const k=svcKeyOf(d);
+    mp[k]=(mp[k]===undefined?true:mp[k]) && d.status==="PAUSED";});
   return mp;
 }
 // 장치명 -> 색(고정 매핑 + 해시 폴백). 상태색(green/red)과 겹치지 않는 계열.
@@ -586,7 +716,7 @@ function groupedRows(merged, shared, showBk, showGpu){
     // data-svcs: 이 그룹이 품은 backend 들의 키(공백 구분) — backend 노드 호버 시 자식행뿐
     // 아니라 부모 그룹행도 함께 하이라이트되게(model 노드 호버가 부모+자식을 밝히는 것과 대칭).
     const svcs=bes.map(b=>attrId(svcKeyOf(b))).join(" ");
-    let html='<tr class="grp-row" data-model="'+attrId(name)+'" data-svcs="'+svcs+'"><td>'+compositePill(st)+'</td>'
+    let html='<tr class="grp-row" data-model="'+attrId(name)+'" data-svcs="'+svcs+'"><td>'+compositePill(st,bes)+'</td>'
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
       +'<td>'+typeChips(net,eng)+'</td>';
@@ -598,14 +728,14 @@ function groupedRows(merged, shared, showBk, showGpu){
       const k=svcKeyOf(b), sh=shared[k]&&shared[k].size>1;
       const others=sh?[...shared[k]].filter(x=>x!==name):[];
       const svcLabel=svcLabelOf(b);
-      html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?")+'</td>'
+      html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?",b)+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
           +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
       if(showBk){ html+='<td>'+backendCell(b)+'</td>';
         if(showGpu) html+='<td>'+gpuCell(b)+'</td>';
         html+='<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
           +'<td class="srccol">'+esc(b.backend_source||"-")+'</td>'; }
-      html+='<td class="api" title="'+esc(b.api_base)+'">'+esc(b.api_base||"-")+'</td></tr>';
+      html+='<td class="api" title="'+esc(b.api_base)+'\n(클릭하여 복사)">'+esc(b.api_base||"-")+'</td></tr>';
     });
     return html;
   }).join("");
@@ -613,6 +743,9 @@ function groupedRows(merged, shared, showBk, showGpu){
 
 // ── Model ↔ Backend 이분 그래프 (SVG, 외부 의존성 0) ─────────────────────
 function beNodeCls(o){
+  // 일시중지가 최우선 — Pod 가 살아 있어도(r>0) 라우팅에서 빠져 있으므로
+  // 초록(정상)으로 칠하면 안 된다.
+  if(o.paused) return "paused";
   if(o.ext) return "unk";
   if(o.stz) return "zero";
   if(o.r==null) return "unk";
@@ -625,7 +758,7 @@ function beNodeCls(o){
 // ('gpt.4' vs 'gpt_4' 등 pin/하이라이트가 엉뚱한 행에 걸리는 충돌 방지),
 // 출력에 " 나 \ 가 없어 큰따옴표 속성값/선택자에 그대로 넣어도 안전하다.
 function attrId(s){return encodeURIComponent(String(s));}
-function buildGraph(deps){
+function buildGraph(deps, pausedBy){
   if(!deps || !deps.length) return "";
   const names=[], seenN={};
   deps.forEach(d=>{ if(!seenN[d.model_name]){seenN[d.model_name]=1;names.push(d.model_name);} });
@@ -635,6 +768,10 @@ function buildGraph(deps){
   deps.forEach(d=>{ const k=svcKeyOf(d);
     if(!svc[k]){ svc[k]={key:k,label:svcLabelOf(d),
       r:d.backends_ready,des:d.backends_desired,status:d.status,
+      // 그 Service 를 가리키는 deployment 가 **전부** 일시중지일 때만 paused.
+      // 판정은 필터 전 전체 목록(pausedMap)에서 온다 — 필터된 목록으로 접으면
+      // 살아있는 sibling 이 화면에서 빠졌을 뿐인데 꺼진 것으로 칠하게 된다.
+      paused:!!(pausedBy && pausedBy[k]),
       gpu:d.gpu_ready,gpu_products:d.gpu_products,
       ext:(d.backend_source==="external"),stz:d.scale_to_zero,models:new Set()}; svcOrder.push(k); }
     svc[k].models.add(d.model_name); });
@@ -661,7 +798,8 @@ function buildGraph(deps){
   let snodes="";
   svcOrder.forEach(k=>{ const o=svc[k], sh=o.models.size>1, y=sY[k];
     const gtxt=(o.gpu!=null && o.gpu>0)?("  ·  "+gpuText(o.gpu,o.gpu_products)):"";
-    const sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" replicas"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
+    let sub=o.ext?"external":((o.r==null?"?":o.r+(o.des!=null?"/"+o.des:""))+" replicas"+gtxt+(sh?"  ·  shared ×"+o.models.size:""));
+    if(o.paused) sub="일시중지  ·  "+sub;
     snodes+='<g class="gnode be '+beNodeCls(o)+(sh?' shared':'')+'" data-key="'+attrId(k)+'" data-kind="b">'
       +'<title>'+esc(o.label)+(sub?' — '+esc(sub):'')+'</title>'  // 전체 라벨+상태 tooltip
       +'<rect x="'+colR+'" y="'+y+'" width="'+NW+'" height="'+NH+'" rx="8"></rect>'
@@ -802,10 +940,28 @@ function render(snap){
     $("#livedot").style.background = "var(--warn)";
     return;
   }
-  banner.innerHTML = snap.collect_error
-    ? '<div class="err">⚠ 백그라운드 수집 실패(직전 스냅샷 표시 중): '
-      + esc(snap.collect_error) + '</div>'
-    : "";
+  // 수집 신뢰도 배너를 누적한다(여러 문제가 동시에 날 수 있음):
+  //  1) 백그라운드 수집 실패(직전 스냅샷 서빙 중)
+  //  2) LiteLLM 게이트웨이 미도달 — 최상류 단일 의존성이라 별도 강조
+  //  3) k8s/GPU 수집 오류 총계 — 셀마다 hover 하지 않아도 규모가 보이게
+  let bhtml = "";
+  if(snap.collect_error){
+    bhtml += '<div class="err">⚠ 백그라운드 수집 실패(직전 스냅샷 표시 중): '
+      + esc(snap.collect_error) + '</div>';
+  }
+  if(ll && ll.reachable === false){
+    bhtml += '<div class="err">⚠ LiteLLM 게이트웨이 미도달 — 모델 목록·상태를 '
+      + '갱신할 수 없습니다(표시 데이터가 낡았을 수 있음).</div>';
+  }
+  const kerr = (s.k8s_errors||0), gerr = (s.gpu_errors||0);
+  if(kerr || gerr){
+    const segs = [];
+    if(kerr) segs.push("backend Pod 수 "+kerr+"건");
+    if(gerr) segs.push("GPU 정보 "+gerr+"건");
+    bhtml += '<div class="note-banner">⚠ 수집 오류 '+segs.join(" · ")
+      + ' — 해당 행 수치가 부정확할 수 있음(셀 ⚠ 에 원인).</div>';
+  }
+  banner.innerHTML = bhtml;
   lastSnap = snap;
   // summary cards
   let cards = "";
@@ -837,6 +993,12 @@ function render(snap){
   cards += card("Registered", s.deployments_registered||0, "");
   cards += card("Running (healthy)", s.deployments_healthy||0, "good",
     "unhealthy "+(s.deployments_unhealthy||0));
+  // 일시중지 카드는 실제로 꺼둔 게 있을 때만 — 평상시 대시보드에 0 카드를 늘려
+  // 시선을 뺏지 않는다. healthy/unhealthy 어디에도 안 잡히므로 이 카드가 없으면
+  // "Registered 는 10인데 healthy+unhealthy 가 8" 인 차이를 설명할 길이 없다.
+  if(s.deployments_blocked)
+    cards += card("Paused (비활성)", s.deployments_blocked, "accent",
+      "관리자가 트래픽 차단");
   if(s.backend_pods_known)
     cards += card("Replicas", (s.backend_pods_ready||0)
       +'<span style="color:var(--faint);font-size:16px"> / '
@@ -862,14 +1024,27 @@ function render(snap){
   const fS = $("#f-status").value, fN = $("#f-net").value, fE = $("#f-eng").value;
   // model_name 검색: 대소문자 무시 부분일치. 표·그래프에 status/net/eng 와 함께 적용된다.
   const fQ = ($("#f-search").value||"").trim().toLowerCase();
-  // status 필터: '!UP'(이상만)은 UP 이 아닌 것(DOWN·?) 전부, 그 외엔 정확히 일치.
-  const stOk = d => !fS || (fS==="!UP" ? (d.status||"?")!=="UP" : (d.status||"?")===fS);
+  // status 필터: '!UP'(이상만)은 DOWN·? 를 한 번에, 그 외엔 정확히 일치.
+  // '이상만' 은 장애 트리아지용이라 PAUSED(의도적으로 꺼둔 것)는 빼고 본다 —
+  // 안 그러면 운영자가 일부러 중지한 모델이 매번 장애 후보로 섞여 올라온다.
+  const stOk = d => !fS || (fS==="!UP"
+    ? ((d.status||"?")!=="UP" && (d.status||"?")!=="PAUSED")
+    : (d.status||"?")===fS);
+  // 검색은 model_name 뿐 아니라 백엔드(service 라벨·api_base)도 매칭 — 운영자는
+  // svc 이름(*-predictor)으로 찾는 일이 많다. per-user 뷰는 리댁션돼 ref 라벨로 매칭.
+  const hayOf = d => (String(d.model_name||"")+" "+svcLabelOf(d)+" "
+    +String(d.api_base||"")).toLowerCase();
   const filterDep = d => stOk(d)
     && (!fN || netOf(d)===fN) && (!fE || engOf(d)===fE)
-    && (!fQ || String(d.model_name||"").toLowerCase().includes(fQ));
+    && (!fQ || hayOf(d).includes(fQ));
+  // 필터 전 **전체** deployment 목록. sharedMap/pausedMap 은 "필터로 화면에서만
+  // 빠진 sibling" 까지 봐야 정확하므로 반드시 이 목록으로 계산한다. 그래프는 아래
+  // 표 블록 **밖에서** 그리므로 함수 스코프에 둔다 — 블록 지역(const)으로 두면
+  // pausedMap(all) 이 ReferenceError 로 죽고, render 를 감싼 폴링 try/catch 가
+  // 그것을 "수집 실패" 로 위장해 그래프가 조용히 사라진다(회귀 있었음).
+  const all = (ll && ll.deployments) || [];
   let graphDeps = [];   // 그래프가 그릴 deployment(= 표와 동일한 필터 결과)
-  if(ll && ll.deployments && ll.deployments.length){
-    const all = ll.deployments;
+  if(all.length){
     const merged = all.filter(filterDep);
     graphDeps = merged;   // 그래프는 (status/net/eng) 필터 결과 전체를 그린다 — pin 으로 좁히지 않음
     // 그래프 노드 클릭(pin) 시: 표만 그 노드로 좁힌다(그래프는 유지 → 다른 노드로 이동 가능).
@@ -911,7 +1086,7 @@ function render(snap){
     } else {
       body = tableDeps.map(d=>{
         let row = '<tr data-model="'+attrId(d.model_name)+'" data-svc="'+attrId(svcKeyOf(d))+'"><td>'
-          +statusPill(d.status||"?")+"</td>"
+          +statusPill(d.status||"?",d)+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
           +'<td>'+typeChips(netOf(d),engOf(d))+"</td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
@@ -919,7 +1094,7 @@ function render(snap){
         if(showBk && !uHide) row +=
           '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
           +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
-        if(!uHide) row += '<td class="api" title="'+esc(d.api_base)+'">'
+        if(!uHide) row += '<td class="api" title="'+esc(d.api_base)+'\n(클릭하여 복사)">'
           +esc(d.api_base||"-")+"</td>";
         row += "</tr>";
         return row;
@@ -948,7 +1123,7 @@ function render(snap){
     gcol.style.display = "";
     split.classList.remove("no-graph");
     gwrap.innerHTML = graphDeps.length
-      ? buildGraph(graphDeps)
+      ? buildGraph(graphDeps, pausedMap(all))
       : '<div class="empty">필터 결과 없음</div>';
     const svg = gwrap.querySelector("svg");
     if(svg) wireGraph(svg);
@@ -981,7 +1156,16 @@ function render(snap){
   }
   if(snap.version) $("#ver").textContent = "v"+snap.version;
   $("#foot").textContent = "model_monitor v"+(snap.version||"?");
-  $("#updated").textContent = (snap.ts||"") + (snap.demo?"  (demo)":"");
+  // 갱신 멈춤 표시: auto-refresh 가 켜져 있는데(=계속 새 스냅샷이 와야 하는데)
+  // ts 가 폴링 3주기(최소 15초) 넘게 그대로면 서버 수집이 멈춘 것 — 명시 경고.
+  const stall = staleMs(snap);
+  snapStale = $("#auto").checked && stall > Math.max(REFRESH_MS*3, 15000);
+  const upd = $("#updated");
+  upd.textContent = (snap.ts||"") + (snap.demo?"  (demo)":"")
+    + (snapStale ? "  · ⚠ "+fmtAgo(stall)+"째 갱신 없음" : "");
+  upd.title = snapStale
+    ? "폴링은 성공하지만 서버가 새 스냅샷을 만들지 못하고 있습니다 — 표시 데이터가 낡았을 수 있음"
+    : "";
 }
 
 function showUvError(msg){
@@ -1018,6 +1202,9 @@ async function tick(){
     const u=$("#updated"); if(u) u.textContent += "  · saved snapshot (frozen)";
     return;
   }
+  // 숨긴(백그라운드) 탭에선 폴링하지 않는다 — 서버 부하·불필요한 per-user POST 방지.
+  // 다시 보이면 visibilitychange 리스너가 즉시 tick() 해 최신으로 따라잡는다.
+  if(document.hidden) return;
   // 키 필수 모드: 키가 없으면 무인증 호출을 아예 하지 않고 안내만.
   if(USER_VIEW && !uvActive()){
     showNeedKey();
@@ -1052,7 +1239,8 @@ async function tick(){
       snap = await r.json();
     }
     render(snap);
-    $("#livedot").style.background = "var(--up)";
+    // 갱신 멈춤(render 가 판정)이면 초록 대신 주황 — "연결은 되는데 데이터가 낡음".
+    $("#livedot").style.background = snapStale ? "var(--warn)" : "var(--up)";
   }catch(e){
     $("#livedot").style.background = "var(--down)";
     $("#updated").textContent = (e && e.name==="AbortError")
@@ -1068,17 +1256,39 @@ function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
   if(timer) clearInterval(timer);
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
-// 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
+// 탭이 다시 보이면 즉시 갱신(숨김 중엔 tick 이 폴링을 건너뜀 — 위 tick 참조).
+// auto-refresh 를 사용자가 껐다면 그 의사를 존중해 여기서도 갱신하지 않는다.
+document.addEventListener("visibilitychange", ()=>{
+  if(!document.hidden && $("#auto").checked) tick(); });
+// 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더 + sessionStorage 저장(F5 복원).
 // 검색은 타이핑마다(input) 즉시 반영 — 재수집 없이 표·그래프를 함께 좁힌다.
-$("#f-search").addEventListener("input", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-net").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-eng").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-group").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+function onFilterChange(){ saveFilters(); if(lastSnap) render(lastSnap); }
+$("#f-search").addEventListener("input", onFilterChange);
+$("#f-status").addEventListener("change", onFilterChange);
+$("#f-net").addEventListener("change", onFilterChange);
+$("#f-eng").addEventListener("change", onFilterChange);
+$("#f-group").addEventListener("change", onFilterChange);
 // 그래프를 끄면(pin 조작 수단이 사라지므로) 표를 좁힌 pin 도 함께 해제한다.
 $("#f-graph").addEventListener("change", ()=>{
   if(!$("#f-graph").checked && graphPin){ graphPin=null; saveGraphPin(); }
-  if(lastSnap) render(lastSnap); });
+  onFilterChange(); });
+// API_BASE 셀 클릭 → 전체 주소 복사(셀이 말줄임(…)되어 드래그 복사가 어렵다).
+// http(비보안 컨텍스트) 배포엔 clipboard API 가 없어 execCommand 폴백을 둔다.
+function copyText(t){
+  if(navigator.clipboard && window.isSecureContext)
+    return navigator.clipboard.writeText(t);
+  return new Promise((res,rej)=>{ const ta=document.createElement("textarea");
+    ta.value=t; ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.select();
+    try{ document.execCommand("copy") ? res() : rej(new Error("copy")); }
+    catch(e){ rej(e); } finally{ ta.remove(); } });
+}
+$("#deployments").addEventListener("click", (e)=>{
+  const td=e.target.closest("td.api"); if(!td) return;
+  const v=(td.textContent||"").trim(); if(!v || v==="-") return;
+  copyText(v).then(()=>{ td.classList.add("copied");   // 셀 잠깐 초록 = 복사됨
+    setTimeout(()=>td.classList.remove("copied"), 900); }).catch(()=>{});
+});
 // 📌 pin 칩 클릭 → pin 해제(표 전체 복원). 칩은 매 렌더마다 새로 그려지므로 위임으로 1회만.
 $("#dep-label").addEventListener("click", (e)=>{
   if(e.target.closest("#pin-badge") && graphPin){
@@ -1095,7 +1305,7 @@ document.addEventListener("keydown", (e)=>{
 document.addEventListener("keydown", (e)=>{
   if(e.key!=="Escape") return;
   const sb=$("#f-search");
-  if(sb && sb.value){ sb.value=""; if(lastSnap) render(lastSnap); return; }
+  if(sb && sb.value){ sb.value=""; onFilterChange(); return; }
   if(graphPin){ graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
 
 // 키 필수 모드: 키 입력 바 노출 + 조회/지우기/Enter, export 는 admin 키 헤더로.
@@ -1134,6 +1344,7 @@ if(USER_VIEW){
     setTimeout(()=>URL.revokeObjectURL(u), 15000);
   });
 }
+loadFilters();   // F5 복원: 저장된 필터를 첫 렌더 전에 되살린다(pin 복원과 짝)
 tick(); loop();
 </script>
 </body>

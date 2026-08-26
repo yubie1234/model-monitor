@@ -13,10 +13,10 @@ import asyncio
 from app import __version__
 from app.services.demo import demo_snapshot
 from app.services.litellm import (
-    _strip_openai_suffix,
     aggregate_selective_health,
     fetch_health,
     fetch_health_for_model,
+    health_check_allowed_bases,
     select_health_check_models,
 )
 from app.services.snapshot import (
@@ -66,6 +66,14 @@ class Refresher:
         self._health = None
         self._health_lock = asyncio.Lock()
         self._tasks = []
+        # 노드 GPU 장치명 라벨(nvidia.com/gpu.product)은 노드 수명 동안 불변이므로
+        # 사이클(기본 5s)마다 K8sClient 를 새로 만들어도 이 캐시는 유지해, 정적
+        # 라벨을 위해 Node 오브젝트를 반복해서 받지 않는다(공유 k8s API 부하 절감).
+        self._node_cache = {}
+        # 거의 변하지 않는 k8s 조회(ISVC 부재 · Service selector)의 TTL 캐시.
+        # node_cache 와 같은 이유로 프로세스 수명이다 — 사이클마다 새로
+        # 만들면(bc_cache 처럼) 사이클 간 절감이 0 이다.
+        self._meta_cache = {}
 
     async def collect_once(self):
         """스냅샷 1회 수집(메인은 health 없이 빠르게) 후 비동기 health 주입."""
@@ -74,7 +82,9 @@ class Refresher:
             await self.store.set(snap, None)
             return snap
 
-        snap = await asyncio.to_thread(build_snapshot, self.settings, False)
+        snap = await asyncio.to_thread(
+            build_snapshot, self.settings, False, self._node_cache,
+            self._meta_cache)
         if snap.get("litellm"):
             async with self._health_lock:
                 h = self._health
@@ -97,14 +107,30 @@ class Refresher:
         await self.store.set(snap, None)
         return snap
 
+    # 연속 수집 **예외** 시 지수 백오프 상한. 예외 경로는 예상 밖 결함(버그/자원
+    # 고갈)이라 즉시 재시도해도 같은 이유로 실패할 확률이 높다 — 5초 타이트 재시도로
+    # CPU(200m 캡)와 로그를 태우지 않는다. 정상적인 수집 실패(LiteLLM 미도달 등)는
+    # 예외가 아니라 snap.errors 로 기록되므로 이 백오프의 대상이 아니다.
+    _BACKOFF_MAX = 60.0
+
+    def _next_delay(self, failures):
+        """다음 사이클까지 대기 — 연속 예외 failures 회면 interval×2^n (상한 60s)."""
+        if failures <= 0:
+            return self.interval
+        return min(self.interval * (2 ** min(failures, 6)),
+                   max(self._BACKOFF_MAX, self.interval))
+
     async def _refresh_loop(self):
+        failures = 0
         while True:
-            await asyncio.sleep(self.interval)
+            await asyncio.sleep(self._next_delay(failures))
             try:
                 await self.collect_once()
+                failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
+                failures += 1
                 await self.store.set_error("%s: %s" % (type(e).__name__, e))
 
     # 선택적 health 동시 조회 수 — main.py 의 수집 스레드 예산(_COLLECT_THREADS=8)
@@ -168,13 +194,10 @@ class Refresher:
                     "selective health: deployment 에 k8s 판정(network_type)이 "
                     "없어 체크 대상을 못 고름 — backend_count 비활성/권한 확인")
             return h
-        # ?model= 응답 검증용: 모델별 허용 api_base(접미어 제거) 집합
-        allowed = {}
-        for d in deps:
-            n = d.get("model_name")
-            if n in names and d.get("api_base"):
-                allowed.setdefault(n, set()).add(
-                    _strip_openai_suffix(d["api_base"]))
+        # ?model= 응답 검증용: 모델별 허용 api_base(접미어 제거) 집합.
+        # 조회 대상(names)뿐 아니라 '일시중지라서만 빠진 안전한 backend' 도
+        # 포함된다 — 판정 규칙은 health_check_allowed_bases 참고.
+        allowed = health_check_allowed_bases(deps, names)
         sem = asyncio.Semaphore(self._SELECTIVE_PARALLEL)
 
         async def one(name):
@@ -197,11 +220,13 @@ class Refresher:
         # health 수집은 데모가 아니고 litellm_url 이 있을 때만.
         # 우선순위: 전량 /health(MONITOR_HEALTH=true) > 선택적(MONITOR_SELECTIVE_HEALTH=true).
         # 둘 다 켜져 있으면 전량이 이미 모든 모델을 커버하므로 선택적 루프는 안 띄운다.
+        # 전량의 기본은 off(config.py 와 동일) — 모든 백엔드를 실 ping 하는 부하 모드는
+        # 명시적으로만 켠다(scale-to-zero 각성 방지).
         if not self.demo and self.settings.get("litellm_url"):
-            if self.settings.get("health", True):
+            if self.settings.get("health", False):
                 self._tasks.append(asyncio.create_task(
                     self._health_loop(self._fetch_full_health)))
-            elif self.settings.get("selective_health"):
+            elif self.settings.get("selective_health", True):
                 self._tasks.append(asyncio.create_task(
                     self._health_loop(self._fetch_selective_health)))
 

@@ -8,6 +8,30 @@ import urllib.parse
 
 from app.core.http import http_get_json
 
+_TRUE_WORDS = ("true", "1", "yes", "on")
+_FALSE_WORDS = ("false", "0", "no", "off")
+
+
+def _parse_bool_marker(v):
+    """model_info 의 bool 마커를 엄격 파싱 -> True/False, 판독 불가면 None.
+
+    bool() 강제 변환 금지: YAML 에 "false"(따옴표 문자열)로 쓰는 흔한 실수가
+    bool("false")==True 로 뒤집혀 opt-out 이 opt-in 이 된다. bool 과 명시적
+    true/false 문자열만 인정하고, 그 외 값은 무시한다(fail-safe).
+
+    None 반환 = "이 필드가 없거나 못 읽었다" — 호출측은 키를 아예 안 만들어서
+    '모름' 과 '거짓' 을 구분한다.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in _TRUE_WORDS:
+            return True
+        if low in _FALSE_WORDS:
+            return False
+    return None
+
 
 def _classify_backend(model_name, underlying, api_base):
     """(레거시) model_name 접두사/underlying model 로 백엔드 종류 추정 (표시용).
@@ -156,6 +180,14 @@ def select_health_check_models(deployments):
     있다(같은 underlying 모델의 **다른 이름** deployment 의 endpoint 가 응답에
     포함됨). 안전한 이름이라도 위험한 sibling 과 underlying 또는 api_base 를
     공유하면 그 ping 이 sibling(Serverless)까지 깨울 수 있으므로 함께 제외한다.
+
+    또 **모든** deployment 가 blocked(관리자 일시중지)인 이름은 건너뛴다.
+    트래픽을 하나도 안 받는 모델이라 ping 해서 알아낼 게 없고, 운영자가 일부러
+    꺼둔 백엔드를 모니터가 계속 두드리지 않게 한다. LiteLLM /health 는 blocked
+    를 걸러주지 않으므로(v1.90.0 확인) 이 제외는 모니터 쪽에서만 가능하다.
+    반대로 **일부만** blocked 면 이름을 계속 체크한다 — 남은 sibling 이 실제로
+    트래픽을 받고 있어 그 상태를 봐야 하고, /health?model= 은 이름 단위라
+    살아있는 쪽만 골라 ping 할 수단이 없다(LiteLLM 의 '완전 차단' 개념과 동일).
     """
     # underlying 은 같은 모델이라도 provider 접두사 유무가 섞인다(실데이터:
     # "openai/Qwen3-Next-..." vs "Qwen3-Next-..."). 접두사를 떼고 비교해야
@@ -180,6 +212,10 @@ def select_health_check_models(deployments):
                 unsafe_base.add(_strip_openai_suffix(d["api_base"]))
 
     def _name_ok(ds):
+        # 전부 일시중지 = 라우팅 대상이 하나도 없음 -> ping 할 이유가 없다.
+        # (blocked 는 '깨우기 위험' 신호가 아니므로 unsafe_* 오염엔 쓰지 않는다)
+        if ds and all(d.get("blocked") is True for d in ds):
+            return False
         for d in ds:
             if not _deployment_health_safe(d):
                 return False
@@ -192,6 +228,33 @@ def select_health_check_models(deployments):
         return True
 
     return sorted(n for n, ds in by_name.items() if _name_ok(ds))
+
+
+def health_check_allowed_bases(deployments, names):
+    """?model= 응답 검증용 허용 base 집합 {model_name: {base, ...}}.
+
+    합집합이 답하는 질문은 **"이 endpoint 가 ping 돼도 괜찮은가"** 이지
+    "이 이름으로 조회를 보내는가" 가 아니다. 둘을 같은 집합으로 쓰면,
+    일시중지라 조회 대상에서 뺀 backend 가 sibling 응답에 섞여 올 때
+    "Serverless 가 ping 됐다" 는 오경보가 매 라운드 뜬다(일시중지는 깨우기
+    위험이 아니므로 경보 대상이 아니다).
+
+    그래서 조회 대상(names)의 base 에 더해, **일시중지라서만 빠졌고 그 자체로는
+    ping 해도 안전한** deployment 의 base 도 넣는다. 반대로 일시중지이면서
+    Serverless/KServe 위험인 backend 는 넣지 않는다 — 그건 실제로 깨어난
+    정황이라 경보가 맞다.
+    """
+    out = {}
+    sel = set(names or [])
+    for d in deployments or []:
+        base = d.get("api_base")
+        if not base:
+            continue
+        name = d.get("model_name")
+        if name in sel or (d.get("blocked") is True
+                           and _deployment_health_safe(d)):
+            out.setdefault(name, set()).add(_strip_openai_suffix(base))
+    return out
 
 
 def fetch_health_for_model(url, api_key, name, timeout):
@@ -307,7 +370,7 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
         "groups": [],          # model_group/info data
         "deployments": [],     # /model/info 정규화: model_name -> api_base 등
         "health": None,        # /health raw
-        "models": [],          # /v1/models ids (이름만)
+        "models": [],          # 모델 이름 목록 — deployments(model_name)에서 유도
         "errors": [],
     }
 
@@ -348,18 +411,24 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
             # 선택적 health check 수동 override — LiteLLM config 의
             # model_info.active_health_check (true=판정불가여도 체크 허용,
             # false=항상 제외). 없으면 k8s 판정(select_health_check_models)만 쓴다.
-            # bool() 강제 변환 금지: YAML 에 "false"(따옴표 문자열)로 쓰는 흔한
-            # 실수가 bool("false")==True 로 뒤집혀 opt-out 이 opt-in 이 된다.
-            # bool 과 명시적 true/false 문자열만 인정, 그 외 값은 무시(fail-safe).
-            ahc = mi.get("active_health_check")
-            if isinstance(ahc, bool):
+            ahc = _parse_bool_marker(mi.get("active_health_check"))
+            if ahc is not None:
                 dep["active_health_check"] = ahc
-            elif isinstance(ahc, str):
-                low = ahc.strip().lower()
-                if low in ("true", "1", "yes", "on"):
-                    dep["active_health_check"] = True
-                elif low in ("false", "0", "no", "off"):
-                    dep["active_health_check"] = False
+            # 관리자 일시중지(pause) 상태 — LiteLLM v1.90.0+ 의 model_info.blocked.
+            # (POST /model/block, /model/unblock, PATCH /model/{id}/update)
+            # blocked=true 인 deployment 는 LiteLLM 라우팅 풀에서 제외돼 트래픽을
+            # 전혀 받지 않는다. **장애가 아니라 의도적으로 꺼둔 상태**다.
+            #
+            # 주의: LiteLLM /health 는 blocked 를 전혀 걸러내지 않는다(v1.90.0
+            # 확인). 즉 일시중지된 백엔드도 계속 ping 돼 healthy 로 보고되므로,
+            # 이 플래그가 없으면 "트래픽을 안 받는데 UP" 인 거짓 정상이 뜬다.
+            #
+            # DB 등록 모델에만 붙고 config.yaml 전용 모델엔 키 자체가 없다
+            # → 3상태: True(비활성) / False(활성) / 키 없음(구버전 LiteLLM
+            # 이거나 config 전용 = 알 수 없음). 없으면 키를 만들지 않는다.
+            blocked = _parse_bool_marker(mi.get("blocked"))
+            if blocked is not None:
+                dep["blocked"] = blocked
             result["deployments"].append(dep)
     elif err:
         result["errors"].append("model/info: %s" % err)
@@ -373,12 +442,14 @@ def collect_litellm(url, api_key, timeout, health_timeout=None, with_health=True
             result["errors"].append(
                 "health: %s (모델 많으면 health_timeout 늘리기)" % err)
 
-    ok, data, err = http_get_json(base + "/v1/models", api_key, timeout)
-    if ok and isinstance(data, dict):
-        result["reachable"] = True
-        result["models"] = [m.get("id") for m in data.get("data", []) if m.get("id")]
-    elif err:
-        result["errors"].append("v1/models: %s" % err)
+    # /v1/models 의 id 는 /model/info 의 model_name(public name)과 같다(같은 게이트웨이
+    # 관점). 이미 model/info 를 받아 deployments 를 채웠으므로, 매 스냅샷 주기(기본 5s)
+    # 마다 /v1/models 를 또 호출하지 않고 그 목록에서 유도한다 — 어떤 렌더러도 별도로
+    # 안 쓰는 데이터를 위해 LiteLLM 왕복을 하루 수만 번 반복하지 않게 한다. "?"
+    # (model_name 미상 플레이스홀더)는 실제 모델이 아니므로 제외.
+    result["models"] = sorted(
+        {d["model_name"] for d in result["deployments"]
+         if d.get("model_name") and d["model_name"] != "?"})
 
     return result
 
@@ -411,20 +482,38 @@ def discover_backends(litellm_result):
 
     -> backends 를 수동으로 적을 필요가 없다. 주소의 원천은 LiteLLM 설정의
        litellm_params.api_base 이며, /model/info(우선) 또는 /health 가 그대로 돌려준다.
+
+    직접 probe 는 LiteLLM 을 경유하지 않고 백엔드에 바로 닿으므로, 선택적 health
+    check 와 같은 안전 판정(_deployment_health_safe)으로 위험 백엔드(Serverless/
+    scale-to-zero/Raw 확인 안 된 KServe)를 제외한다 — 리프레시 주기(기본 5s)마다
+    쏘는 probe 가 idle 백엔드를 깨우거나 scale-down 을 막지 않게. 같은 api_base 를
+    안전/위험 deployment 가 공유하면 그 base 전체를 제외한다(하나라도 위험하면 제외).
+    build_snapshot 은 backend_count 판정 **뒤**에 이 함수를 부르므로 k8s 필드
+    (serverless/scale_to_zero/mode)가 실려 있고, k8s 를 못 보는 환경에서도
+    이름 규약(-predictor)이 폴백으로 동작한다.
     """
     discovered = {}
+    skipped = set()  # 실제로 제외된 base — 조용한 커버리지 축소가 되지 않게 기록
+    unsafe = set()   # 위험 deployment 가 쓰는 base — probe 대상에서 제외
+    for d in litellm_result.get("deployments") or []:
+        if d.get("api_base") and not _deployment_health_safe(d):
+            unsafe.add(_strip_openai_suffix(d["api_base"]))
     # 1순위: /model/info 의 deployments (api_base 평문 + 종류 분류 포함)
     for d in litellm_result.get("deployments") or []:
         api_base = d.get("api_base")
         if not api_base:
             continue
         base = _strip_openai_suffix(api_base)
+        if base in unsafe:
+            skipped.add(base)
+            continue
         discovered.setdefault(base, {
             "name": d.get("model_name") or base,
             "url": base,
             "type": d.get("type", "-"),
         })
-    # 2순위 보강: /health 에만 있는 주소
+    # 2순위 보강: /health 에만 있는 주소 — deployment 가 없어 k8s 판정이 불가하므로
+    # 이름 규약으로만 거른다(KServe 로 보이면 Raw/Serverless 구분이 안 돼 보수적 제외).
     health = litellm_result.get("health") or {}
     for ep in (health.get("healthy_endpoints") or []) + (
             health.get("unhealthy_endpoints") or []):
@@ -432,9 +521,21 @@ def discover_backends(litellm_result):
         if not api_base:
             continue
         base = _strip_openai_suffix(api_base)
-        if base in discovered:
+        if base in discovered or base in unsafe:
+            if base in unsafe:
+                skipped.add(base)
+            continue
+        if _looks_kserve({"api_base": base}):
+            skipped.add(base)
             continue
         model = ep.get("model", "")
         btype = _classify_backend(model, model, base)
         discovered[base] = {"name": model or base, "url": base, "type": btype}
+    # 제외를 조용히 삼키지 않는다 — selective health 의 '조용한 무력화 방지' 경고와
+    # 동일 패턴. 제외가 있으면 대시보드가 읽는 litellm.errors 에 1줄 요약을 남겨
+    # summary.backends_total 감소의 원인을 운영자가 볼 수 있게 한다.
+    if skipped:
+        litellm_result.setdefault("errors", []).append(
+            "probe: 안전 필터로 backend %d개 제외 — Serverless/미확인 KServe 는 "
+            "직접 probe 가 idle 백엔드를 깨울 수 있어 fail-safe 제외" % len(skipped))
     return list(discovered.values())
