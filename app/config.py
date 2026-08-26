@@ -94,6 +94,12 @@ class Settings(BaseSettings):
     prometheus_url: Optional[str] = Field(
         None, validation_alias=AliasChoices("MONITOR_PROMETHEUS_URL",
                                             "PROMETHEUS_URL"))
+    # 한 model_name 에 backend 가 여러 개일 때 모델 등급을 무엇으로 볼지.
+    # least-busy(기본): 다음 요청이 갈 가장 한가한 backend 기준.
+    # shuffle: LiteLLM 기본 라우팅(simple-shuffle)처럼 요청이 흩어지면 가장 나쁜
+    #          backend 기준이 정직하다. LiteLLM 의 routing_strategy 에 맞춘다.
+    load_routing: str = Field(
+        "least-busy", validation_alias=AliasChoices("MONITOR_LOAD_ROUTING"))
     prometheus_first: bool = Field(
         False, validation_alias=AliasChoices("MONITOR_PROMETHEUS_FIRST"))
     prometheus_lookback: str = Field(
@@ -252,6 +258,9 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
             _env_set("MONITOR_LOAD_THREADS"),
             settings.load_threads, ld.get("threads"), 12)),
         "load_thresholds": ld.get("thresholds") or {},
+        "load_routing": _pick(
+            _env_set("MONITOR_LOAD_ROUTING"),
+            settings.load_routing, ld.get("routing"), "least-busy"),
         "prometheus_url": _pick(
             _env_set("MONITOR_PROMETHEUS_URL", "PROMETHEUS_URL"),
             settings.prometheus_url, pm.get("url"), None),

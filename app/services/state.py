@@ -132,6 +132,10 @@ class Refresher:
                     snap["litellm"]["deployments"], loads,
                     _strip_openai_suffix, alias)
                 snap["load_enabled"] = True
+                # 모델 등급 판정 규칙(라우팅 방식)은 summarize·대시보드가 같은
+                # 값을 봐야 카드와 표가 어긋나지 않는다 -> 스냅샷에 실어 보낸다.
+                snap["load_routing"] = self.settings.get("load_routing",
+                                                         "least-busy")
                 snap["summary"] = summarize(snap)
         await self.store.set(snap, None)
         return snap

@@ -238,6 +238,62 @@ def aggregate_pod_loads(samples, scope):
     return out
 
 
+# per-user 뷰용 사유 코드 — 원문 에러 문자열 대신 이 고정 집합만 내보낸다
+# (원문에는 조회 대상 주소 같은 내부 정보가 섞일 수 있다).
+LOAD_REASON_TEXT = {
+    "timeout": "응답 없음(타임아웃)",
+    "refused": "연결 안 됨",
+    "forbidden": "권한 없음",
+    "no_metrics": "게이지 없음",
+    "skipped_wake_risk": "조회 안 함(깨울 위험)",
+    "skipped_external": "조회 안 함(외부 백엔드)",
+    "no_sample": "표본 없음",
+    "error": "수집 실패",
+}
+
+
+def load_reason_code(load):
+    """부하 dict -> 정규화된 사유 코드. 정상 등급이면 None."""
+    if not load or load.get("state") not in (None, "unknown"):
+        return None
+    txt = str(load.get("error") or load.get("state_reason") or "").lower()
+    if load.get("scope") == "skipped":
+        return "skipped_external" if "external" in txt else "skipped_wake_risk"
+    if "timed out" in txt or "timeout" in txt:
+        return "timeout"
+    if "refused" in txt or "connection" in txt:
+        return "refused"
+    if "403" in txt or "forbidden" in txt or "401" in txt:
+        return "forbidden"
+    if "게이지" in txt or "metric" in txt:
+        return "no_metrics"
+    if "샘플 없음" in txt:
+        return "no_sample"
+    return "error"
+
+
+def load_of(d):
+    """deployment 행에서 부하 dict 를 꺼낸다.
+
+    admin 뷰는 `load` dict 를 그대로 갖고 있고, per-user 뷰는 리댁션 때문에
+    평탄한 스칼라(load_state/load_running/...)만 갖는다 — 집계·렌더가 두 형태를
+    따로 처리하지 않도록 여기서 같은 모양으로 되돌린다.
+    """
+    lo = d.get("load")
+    if isinstance(lo, dict):
+        return lo
+    if d.get("load_state") is None:
+        return None
+    return {"state": d.get("load_state"),
+            "state_reason": d.get("load_reason")
+                            or LOAD_REASON_TEXT.get(d.get("load_reason_code"), ""),
+            "running": d.get("load_running"), "waiting": d.get("load_waiting"),
+            "kv_cache_pct": d.get("load_kv_pct"), "kv_cache_avg_pct": None,
+            "throughput": None, "scope": d.get("load_scope"),
+            "pods_sampled": d.get("load_pods_sampled") or 0,
+            "pods_failed": d.get("load_pods_failed") or 0, "per_pod": []}
+
+
 def classify_load(load, thresholds=None):
     """부하 dict -> (state, reason). "지금 바쁜가"에 한 단어로 답한다.
 

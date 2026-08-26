@@ -10,7 +10,7 @@ from datetime import datetime
 from app import __version__
 from app.core.k8s import K8sClient
 from app.services.backend_count import resolve_backend_count
-from app.services.load import LOAD_RANK
+from app.services.load import LOAD_RANK, load_of
 from app.services.litellm import (
     collect_backend,
     collect_litellm,
@@ -325,20 +325,33 @@ def summarize(snap):
         # simple-shuffle 이라 여유 있는 backend 가 하나 있어도 요청 일부는 포화된
         # backend 로 간다 — "하나가 한가하니 괜찮다"는 보장이 없다. 대신 화면에는
         # 등급 분포를 함께 보여 과잉 경보가 되지 않게 한다.
+        # 한 model_name 에 backend 가 여러 개일 때 모델의 등급을 무엇으로 볼지는
+        # **LiteLLM 라우팅 방식**에 달렸다:
+        #  - least-busy(기본): 다음 요청은 가장 한가한 backend 로 간다 -> 그
+        #    backend 의 등급이 "지금 요청하면 어떻게 되나"의 답이다(=최선).
+        #  - simple-shuffle: 요청이 무작위로 흩어지므로 포화된 backend 도 일부
+        #    트래픽을 받는다 -> 가장 나쁜 등급이 정직하다(=최악).
+        # 어느 쪽이든 화면에는 등급 분포를 함께 보여 부분 포화를 숨기지 않는다.
+        least_busy = str(snap.get("load_routing") or "least-busy") != "shuffle"
         seen_load = set()
         by_model = {}
         for d in ll.get("deployments") or []:
-            load = d.get("load")
+            load = load_of(d)
             if not load:
                 continue
             state = load.get("state", "unknown")
             name = d.get("model_name") or "?"
-            cur = by_model.setdefault(name, {"rank": -1, "state": "unknown",
+            cur = by_model.setdefault(name, {"rank": None, "state": "unknown",
                                              "reason": None})
             rank = LOAD_RANK.get(state, -1)
-            if rank > cur["rank"]:
-                cur.update(rank=rank, state=state,
-                           reason=load.get("state_reason"))
+            # 모름(-1)은 등급 후보로 치지 않는다 — 아는 backend 가 하나라도 있으면
+            # 그걸로 판정하고, 전부 모름일 때만 unknown 이 남는다.
+            if rank >= 0:
+                better = (cur["rank"] is None or cur["rank"] < 0
+                          or (rank < cur["rank"] if least_busy else rank > cur["rank"]))
+                if better:
+                    cur.update(rank=rank, state=state,
+                               reason=load.get("state_reason"))
             key = (d.get("namespace"), d.get("service"))
             if key == (None, None):
                 key = ("", d.get("backend_ref") or d.get("api_base"))
@@ -358,7 +371,8 @@ def summarize(snap):
                 s["kv_max_pct"] = kv if s["kv_max_pct"] is None else max(
                     s["kv_max_pct"], kv)
                 s["load_known"] = True
-        known = {n: v for n, v in by_model.items() if v["rank"] >= 0}
+        known = {n: v for n, v in by_model.items()
+                 if v["rank"] is not None and v["rank"] >= 0}
         s["models_load_total"] = len(known)
         s["models_saturated"] = sum(1 for v in known.values()
                                     if v["state"] == "saturated")

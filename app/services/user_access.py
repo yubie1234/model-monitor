@@ -12,6 +12,7 @@ import threading
 
 from app.core.http import http_get_json
 from app.services.snapshot import summarize
+from app.services.load import load_reason_code
 
 
 def collect_user_access(url, user_key, timeout):
@@ -171,6 +172,28 @@ def _redact_deployment_for_user(d, ref_seed=None):
     for k in ("blocked", "health_status", "health_status_source"):
         if k in d:
             out[k] = d[k]
+    # 지금 부하도 내부 토폴로지가 아니라 "지금 이 모델을 쓸 수 있나"의 답이라 남긴다.
+    # 단 **평탄한 스칼라로만** — load dict 안의 per_pod 에는 조회한 Pod 주소가 들어
+    # 있어 그대로 넘기면 클러스터 내부가 새어 나간다. 사유도 원문 대신 정규화 코드로.
+    lo = d.get("load")
+    if isinstance(lo, dict) and lo.get("state"):
+        out["load_state"] = lo["state"]
+        code = load_reason_code(lo)
+        if code:
+            out["load_reason_code"] = code
+        elif lo.get("state_reason"):
+            # 정상 등급의 근거("대기 9건")는 숫자와 상태뿐이라 그대로 보여도 된다.
+            out["load_reason"] = lo["state_reason"]
+        if lo.get("scope"):
+            out["load_scope"] = lo["scope"]
+        # 값이 없는 항목은 키 자체를 만들지 않는다 — 무조건 None 을 넣으면
+        # "측정했는데 0" 과 "모름" 이 구분되지 않는다(blocked 와 같은 이유).
+        for src, dst in (("running", "load_running"), ("waiting", "load_waiting"),
+                         ("kv_cache_pct", "load_kv_pct"),
+                         ("pods_sampled", "load_pods_sampled"),
+                         ("pods_failed", "load_pods_failed")):
+            if lo.get(src) is not None:
+                out[dst] = lo[src]
     return out
 
 

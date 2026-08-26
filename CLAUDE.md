@@ -105,6 +105,25 @@ Collectors are synchronous (blocking `urllib`). The FastAPI **lifespan** starts 
 ### Model-grouped view & Model↔Backend graph (web only)
 The dashboard JS groups deployments by `model_name` (composite `UP`/`DEGRADED`/`DOWN` + `Σ ready/desired`, child rows per backend), flags shared backends (`⇄`), and draws a pure-SVG bipartite **Model ↔ Backend** graph. This logic lives entirely in `web/templates/dashboard.html` (no extra snapshot data; derived from `model_name`/`namespace`/`service`/`status`). The old single-file had Python TUI equivalents — those were **not** ported (no TUI).
 
+### 지금 부하 (`app/services/load.py`, `MONITOR_LOAD`, 기본 ON)
+backend Pod 마다 `/metrics`(vLLM/SGLang 게이지)를 읽어 처리 중/대기 요청 · KV 캐시 사용률 ·
+tok/s · 등급(idle/ok/BUSY/FULL)을 deployment 행에 붙인다. Pod 주소는 `gpu.collect_gpu_for_service`
+가 이미 받아오는 Pod 목록(`pod_targets`)에서 나오므로 **k8s 호출이 늘지 않는다**.
+
+- **깨울 위험이 있으면 조회하지 않는다.** Pod 주소가 없을 때 LB(api_base)로 폴백하면 activator 를
+  거쳐 scale-to-zero 백엔드를 깨운다 — 전량 `/health` 를 기본 off 로 둔 것과 같은 이유다.
+  `litellm._deployment_health_safe` 로 판정하고, external 백엔드도 제외한다. 제외된 대상은 0 이
+  아니라 **이유를 단 `unknown`**(`scope="skipped"`).
+- **자체 스레드풀 금지.** `Refresher._fetch_load` 가 공용 스레드 예산(semaphore 4) 안에서 모아
+  느린 `/health` 와 같은 방식으로 주입한다. tok/s 카운터 차분 캐시(`_tput_cache`)도 Refresher 수명.
+- **엔진 차이는 `_PROM_SPECS` 한 곳에서** — `:`↔`_` 접두사 정규화(SGLang), alias 는 합산 아닌 택일
+  (vLLM V0/V1 동시 노출 시 2배 방지), `tp_rank`/`pp_rank`/`moe_ep_rank` 는 복제 보고라 max 로 접고
+  `dp_rank`/`engine` 만 합산(TP=4 에서 4배 부풀림 방지).
+- **모델 등급은 라우팅 방식에 따른다**(`MONITOR_LOAD_ROUTING`): least-busy(기본)=가장 한가한 backend,
+  shuffle=가장 나쁜 backend. `summarize` 와 대시보드가 **같은 규칙**을 써야 카드와 표가 안 어긋난다.
+- per-user 뷰에는 평탄한 스칼라(`load_state`/`load_running`/...)로만 나간다 — `per_pod` 에 Pod 주소가
+  있어 그대로 넘기면 내부가 샌다. 사유도 원문 대신 정규화 코드(`load_reason_code`).
+
 ### Per-user (key) view — `MONITOR_USER_VIEW=true` (off by default; demo disables it)
 "Key-required mode": the user enters their own LiteLLM key (header `X-LiteLLM-Key` only — never query/logs/server-store; browser `sessionStorage`). `POST /api/snapshot/user` filters the shared snapshot per key via `services/user_access.filter_snapshot_for_user` (access set from that key's `GET /v1/models`, cached with a short TTL in `AccessCache` — sha256 of the key, success-only). A normal key sees only its models with internal `api_base`/namespace **redacted**; the admin key (= the monitor's own `api_key`, constant-time compared in `auth.is_admin_key`) sees the full view + exports. **fail-closed**: an invalid key never falls back to global. When on, `GET /api/snapshot` is 403-locked and `/snapshot.json`, `/snapshot.html`, `/metrics` require the admin key header. Template placeholder `__USER_VIEW__` is injected by `web/routes.load_dashboard_html` (alongside `__INTERVAL_MS__`).
 

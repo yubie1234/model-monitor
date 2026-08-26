@@ -739,6 +739,21 @@ function gpuBar(products){
   return '<span class="gbar">'+segs+'</span><span class="glegend">'+leg+'</span>';
 }
 // ── 지금 부하 (백엔드 엔진 게이지) ───────────────────────────────────────
+// per-user 뷰는 리댁션 때문에 평탄한 스칼라(load_state/load_running/...)만 온다.
+// 셀/집계가 두 형태를 따로 다루지 않도록 여기서 admin 뷰와 같은 모양으로 되돌린다.
+const LOAD_CODE_TEXT = {timeout:"응답 없음(타임아웃)", refused:"연결 안 됨",
+  forbidden:"권한 없음", no_metrics:"게이지 없음",
+  skipped_wake_risk:"조회 안 함(깨울 위험)", skipped_external:"조회 안 함(외부 백엔드)",
+  no_sample:"표본 없음", error:"수집 실패"};
+function loadOf(d){
+  if(d.load) return d.load;
+  if(d.load_state==null) return null;
+  return {state:d.load_state,
+          state_reason:d.load_reason||LOAD_CODE_TEXT[d.load_reason_code]||"",
+          running:d.load_running, waiting:d.load_waiting, kv_cache_pct:d.load_kv_pct,
+          pods_sampled:d.load_pods_sampled||0, pods_failed:d.load_pods_failed||0,
+          scope:d.load_scope, per_pod:[]};
+}
 const LOAD_LV = {saturated:["FULL","full"], busy:["BUSY","busy"],
                  ok:["ok","ok"], idle:["idle","idle"], unknown:["?","unk"]};
 const LOAD_RANK = {saturated:3, busy:2, ok:1, idle:0, unknown:-1};
@@ -794,7 +809,7 @@ function kvBit(l){
     +'<span class="kvbar"><i style="width:'+pct+'%"></i></span><b>'+pct+'%</b></span>';
 }
 function loadCell(d, uHide){
-  const l=d.load;
+  const l=loadOf(d);
   if(!l) return '<span class="srccol">-</span>';
   const st=l.state||"unknown", lv=LOAD_LV[st]||LOAD_LV.unknown;
   const why = st==="unknown" ? loadWhyShort(l.state_reason)
@@ -810,16 +825,26 @@ function kvClass(pct){ return pct>=95?"bad":(pct>=80?"warn":"good"); }
 // 모델 등급 = backend 중 **가장 나쁜 것**. LiteLLM 기본 라우팅(simple-shuffle)은
 // 여유 있는 backend 로만 보내주지 않으므로, 하나가 포화면 요청 일부는 기다린다.
 // 대신 등급 분포(FULL 1 · ok 2)를 함께 보여 과잉 경보가 되지 않게 한다.
-function compositeLoad(bes){
-  let worst=null, counts={};
-  bes.forEach(b=>{ const l=b.load; if(!l) return;
+// 모델 등급 = 라우팅 방식에 달렸다. least-busy(기본)면 다음 요청이 갈 **가장
+// 한가한** backend 가 답이고, simple-shuffle 이면 포화된 backend 도 트래픽을 받으니
+// **가장 나쁜** 쪽이 정직하다. summarize 와 같은 규칙을 써야 카드와 표가 안 어긋난다.
+function compositeLoad(bes, leastBusy){
+  let pick=null, counts={};
+  bes.forEach(b=>{ const l=loadOf(b); if(!l) return;
     const st=l.state||"unknown"; counts[st]=(counts[st]||0)+1;
-    if(!worst || (LOAD_RANK[st]??-1) > (LOAD_RANK[worst.state]??-1)) worst={state:st, load:l};
+    const r=LOAD_RANK[st]??-1;
+    if(r<0) return;                       // 모름은 등급 후보가 아니다
+    const cur=pick?(LOAD_RANK[pick.state]??-1):null;
+    if(cur===null || (leastBusy ? r<cur : r>cur)) pick={state:st, load:l};
   });
-  return {worst:worst, counts:counts};
+  if(!pick){   // 전부 모름 -> 그 사실을 그대로
+    const any=bes.map(loadOf).find(Boolean);
+    if(any) pick={state:"unknown", load:any};
+  }
+  return {worst:pick, counts:counts};
 }
-function compositeLoadCell(bes, uHide){
-  const c=compositeLoad(bes);
+function compositeLoadCell(bes, uHide, leastBusy){
+  const c=compositeLoad(bes, leastBusy);
   if(!c.worst) return '<span class="srccol">-</span>';
   const st=c.worst.state, lv=LOAD_LV[st]||LOAD_LV.unknown;
   const order=["saturated","busy","ok","idle","unknown"];
@@ -829,8 +854,11 @@ function compositeLoadCell(bes, uHide){
     : (st==="unknown" ? loadWhyShort(c.worst.load.state_reason)
                       : (c.worst.load.state_reason||"")+partialNote(c.worst.load));
   const tip = n>1
-    ? ("backend "+n+"개 중 가장 나쁜 등급으로 표시 — LiteLLM 기본 라우팅은 "
-       +"여유 있는 backend 만 고르지 않으므로 하나가 포화면 요청 일부는 기다린다.")
+    ? (leastBusy
+       ? ("backend "+n+"개 중 **가장 한가한** 등급으로 표시 — least-busy 라우팅이면 "
+          +"다음 요청은 여유 있는 backend 로 간다. 분포로 부분 포화를 함께 표시.")
+       : ("backend "+n+"개 중 **가장 나쁜** 등급으로 표시 — simple-shuffle 라우팅이면 "
+          +"포화된 backend 도 요청 일부를 받는다."))
     : podTip(c.worst.load, uHide);
   const sl=sumLoad(bes).load;
   return '<div class="load" title="'+esc(tip)+'"><span class="lv '+lv[1]+'">'+lv[0]+'</span>'
@@ -839,7 +867,7 @@ function compositeLoadCell(bes, uHide){
 // 요청 수는 합, 사용률은 최댓값(더하는 값이 아니다).
 function sumLoad(bes){
   let run=null,q=null,kv=null,tp=null;
-  bes.forEach(b=>{ const l=b.load; if(!l) return;
+  bes.forEach(b=>{ const l=loadOf(b); if(!l) return;
     if(l.running!=null) run=(run||0)+l.running;
     if(l.waiting!=null) q=(q||0)+l.waiting;
     if(l.kv_cache_pct!=null) kv=(kv==null?l.kv_cache_pct:Math.max(kv,l.kv_cache_pct));
@@ -848,7 +876,8 @@ function sumLoad(bes){
 }
 
 // model_name 으로 묶은 tbody 행들(부모 그룹 행 + 자식 백엔드 행)
-function groupedRows(merged, shared, showBk, showGpu, showLoad, uHide){
+function groupedRows(merged, shared, showBk, showGpu, showLoad, uHide,
+                    leastBusy){
   const order=[], groups={};
   merged.forEach(d=>{ if(!groups[d.model_name]){groups[d.model_name]=[];order.push(d.model_name);}
     groups[d.model_name].push(d); });
@@ -862,7 +891,7 @@ function groupedRows(merged, shared, showBk, showGpu, showLoad, uHide){
     let html='<tr class="grp-row" data-model="'+attrId(name)+'" data-svcs="'+svcs+'"><td>'+compositePill(st,bes)+'</td>'
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
-      + (showLoad ? '<td>'+compositeLoadCell(bes,uHide)+'</td>' : '')
+      + (showLoad ? '<td>'+compositeLoadCell(bes,uHide,leastBusy)+'</td>' : '')
       +'<td>'+typeChips(net,eng)+'</td>';
     if(showBk){ html+='<td>'+aggCell(agg.r,agg.d)+'</td>';
       if(showGpu){const sg=sumGpu(bes); html+='<td>'+aggGpuCell(sg.g,sg.products)+'</td>';}
@@ -1181,10 +1210,11 @@ function render(snap){
   const showGpu = !!s.gpu_known && !uHide;   // GPU 컬럼도 내부정보 — user 뷰 숨김
   // 부하 컬럼은 per-user 뷰에도 보여준다(내부 토폴로지가 아니라 "지금 쓸 수 있나" 정보).
   // Pod 주소가 담긴 툴팁만 uHide 로 가린다(loadCell/podTip).
-  // per-user 뷰에서는 숨긴다: 부하 값 자체는 "지금 쓸 수 있나" 정보지만, 지금
-  // 스키마는 Pod 주소가 담긴 per_pod 를 함께 들고 있어 리댁션 허용목록을 통과하지
-  // 못한다(빈 칸만 남는다). 노출하려면 평탄한 스칼라로 따로 내보내야 한다.
-  const showLoad = !!snap.load_enabled && !uHide;
+  // 부하는 per-user 뷰에도 보여준다 — 내부 토폴로지가 아니라 "지금 이 모델을
+  // 쓸 수 있나"의 답이다. 리댁션은 평탄한 스칼라만 남기므로(Pod 주소 제외)
+  // loadOf 가 같은 모양으로 되돌린다.
+  const showLoad = !!snap.load_enabled;
+  const leastBusy = String(snap.load_routing||"least-busy") !== "shuffle";
   const dt = $("#deployments");
   // status/net/engine 필터는 표와 그래프에 똑같이 적용한다(그래프도 필터된 집합만 그림).
   const fS = $("#f-status").value, fN = $("#f-net").value, fE = $("#f-eng").value;
@@ -1250,7 +1280,8 @@ function render(snap){
     } else if(grouped){
       // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
       // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
-      body = groupedRows(tableDeps, sharedMap(all), showBk, showGpu, showLoad, uHide);
+      body = groupedRows(tableDeps, sharedMap(all), showBk, showGpu, showLoad,
+                         uHide, leastBusy);
     } else {
       body = tableDeps.map(d=>{
         let row = '<tr data-model="'+attrId(d.model_name)+'" data-svc="'+attrId(svcKeyOf(d))+'"><td>'

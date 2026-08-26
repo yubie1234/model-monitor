@@ -2455,6 +2455,7 @@ def _settings_ns(**over):
         user_view=False, user_view_show_internal=False,
         user_view_cache_ttl=30.0, metrics=True, metrics_token=None,
         load=True, load_timeout=3.0, load_threads=12,
+        load_routing="least-busy",
         prometheus_url=None, prometheus_first=False, prometheus_lookback="2m",
         config_file=None,
     )
@@ -3154,27 +3155,48 @@ class TestPrometheusFallback(unittest.TestCase):
 class TestSummarizeLoad(unittest.TestCase):
     """카드 수치: 모델 단위 등급 vs 물리 백엔드 단위 요청 수."""
 
-    def _dep(self, name, ns, svc, state, running, waiting, kv):
+    def _dep(self, name, ns, svc, state, running=None, waiting=None, kv=None):
         return {"model_name": name, "namespace": ns, "service": svc,
                 "api_base": "http://%s/v1" % svc,
                 "load": {"state": state, "state_reason": "t", "running": running,
                          "waiting": waiting, "kv_cache_pct": kv,
                          "pods_sampled": 1, "pods_failed": 0, "per_pod": []}}
 
-    def test_model_grade_is_worst_backend(self):
-        # 한 모델의 backend 2개: 하나는 포화, 하나는 여유 -> 모델은 saturated
-        ll = {"groups": [], "health": None, "deployments": [
+    def _two_backend_model(self):
+        # 한 모델의 backend 2개: 하나는 포화, 하나는 여유
+        return {"groups": [], "health": None, "deployments": [
             self._dep("A", "ns", "a1", "saturated", 15, 9, 94.0),
             self._dep("A", "ns", "a2", "ok", 4, 0, 41.0),
             self._dep("B", "ns", "b1", "idle", 0, 0, 1.0)]}
-        s = m.summarize({"litellm": ll, "backends": []})
+
+    def test_least_busy_routing_grades_by_best_backend(self):
+        # least-busy: 다음 요청은 한가한 backend 로 간다 -> 모델은 아직 쓸 만하다.
+        s = m.summarize({"litellm": self._two_backend_model(), "backends": [],
+                         "load_routing": "least-busy"})
         self.assertEqual(s["models_load_total"], 2)      # 모델 2개(행 3개 아님)
+        self.assertEqual(s["models_saturated"], 0)
+        self.assertEqual(s["models_busy"], 0)
+        self.assertIsNone(s["busiest"])
+        self.assertEqual(s["running"], 19)               # 요청 수는 그대로 합
+        self.assertEqual(s["queued"], 9)
+        self.assertEqual(s["kv_max_pct"], 94.0)          # 부분 포화는 숨기지 않는다
+
+    def test_shuffle_routing_grades_by_worst_backend(self):
+        # simple-shuffle: 포화된 backend 도 트래픽을 받으므로 최악이 정직하다.
+        s = m.summarize({"litellm": self._two_backend_model(), "backends": [],
+                         "load_routing": "shuffle"})
         self.assertEqual(s["models_saturated"], 1)
         self.assertEqual(s["models_busy"], 1)
-        self.assertEqual(s["running"], 19)               # 15+4+0
-        self.assertEqual(s["queued"], 9)
-        self.assertEqual(s["kv_max_pct"], 94.0)
         self.assertEqual(s["busiest"]["model_name"], "A")
+
+    def test_unknown_backend_does_not_decide_the_grade(self):
+        # 하나는 모름, 하나는 ok -> 아는 쪽으로 판정(모름이 등급을 먹지 않는다)
+        ll = {"groups": [], "health": None, "deployments": [
+            self._dep("A", "ns", "a1", "unknown", None, None, None),
+            self._dep("A", "ns", "a2", "ok", 3, 0, 30.0)]}
+        s = m.summarize({"litellm": ll, "backends": []})
+        self.assertEqual(s["models_load_total"], 1)
+        self.assertEqual(s["models_busy"], 0)
 
     def test_shared_service_counted_once_but_both_models_graded(self):
         # 서로 다른 model_name 이 같은 Service 를 공유 -> 요청 수는 한 번만,
@@ -3187,6 +3209,63 @@ class TestSummarizeLoad(unittest.TestCase):
         self.assertEqual(s["running"], 4)
         self.assertEqual(s["queued"], 2)
         self.assertEqual(s["models_busy"], 2)
+
+
+class TestPerUserLoadRedaction(unittest.TestCase):
+    """per-user 뷰에도 부하를 보여주되, Pod 주소는 절대 나가지 않는다."""
+
+    def _row(self, load):
+        return {"model_name": "A", "api_base": "http://a.ns.svc:8080/v1",
+                "namespace": "ns", "service": "svc", "status": "UP",
+                "backends_ready": 2, "load": load}
+
+    def test_flat_scalars_only_no_pod_addresses(self):
+        load = {"state": "busy", "state_reason": "대기 2건", "running": 4,
+                "waiting": 2, "kv_cache_pct": 88.0, "kv_cache_avg_pct": 70.0,
+                "scope": "pods", "pods_sampled": 2, "pods_failed": 1,
+                "per_pod": [{"url": "http://10.42.1.11:8080", "running": 4}]}
+        out = _ua._redact_deployment_for_user(self._row(load))
+        self.assertEqual(out["load_state"], "busy")
+        self.assertEqual(out["load_reason"], "대기 2건")
+        self.assertEqual((out["load_running"], out["load_waiting"]), (4, 2))
+        self.assertEqual(out["load_kv_pct"], 88.0)
+        self.assertEqual((out["load_pods_sampled"], out["load_pods_failed"]), (2, 1))
+        self.assertNotIn("load", out)          # 원본 dict 자체는 안 넘어간다
+        blob = json.dumps(out, ensure_ascii=False)
+        self.assertNotIn("10.42.1.11", blob)   # Pod 주소 유출 금지
+        self.assertNotIn("per_pod", blob)
+        for v in out.values():                 # 스칼라만(공유 스냅샷 별칭 방지)
+            self.assertNotIsInstance(v, (dict, list, set))
+
+    def test_error_reason_becomes_a_code_not_raw_text(self):
+        load = {"state": "unknown", "scope": "pods",
+                "error": "connection error: [Errno 111] Connection refused",
+                "state_reason": "connection error: [Errno 111] Connection refused",
+                "running": None, "waiting": None, "kv_cache_pct": None,
+                "pods_sampled": 0, "pods_failed": 2, "per_pod": []}
+        out = _ua._redact_deployment_for_user(self._row(load))
+        self.assertEqual(out["load_state"], "unknown")
+        self.assertEqual(out["load_reason_code"], "refused")
+        self.assertNotIn("load_reason", out)   # 원문은 안 나간다
+        self.assertNotIn("load_running", out)  # 모르는 값은 키 자체가 없다
+
+    def test_skipped_wake_risk_code(self):
+        load = {"state": "unknown", "scope": "skipped",
+                "error": "Pod 주소 미확인 + 깨울 위험(serverless/scale-to-zero) — LB 조회 생략",
+                "pods_sampled": 0, "pods_failed": 0, "per_pod": []}
+        out = _ua._redact_deployment_for_user(self._row(load))
+        self.assertEqual(out["load_reason_code"], "skipped_wake_risk")
+
+    def test_summarize_reads_flat_fields_too(self):
+        # per-user 뷰는 summarize 를 재실행한다 — 평탄 필드로도 카드가 채워져야 한다.
+        rows = [{"model_name": "A", "namespace": None, "service": None,
+                 "backend_ref": "r1", "load_state": "busy", "load_running": 4,
+                 "load_waiting": 2, "load_kv_pct": 88.0, "load_scope": "pods"}]
+        s = m.summarize({"litellm": {"groups": [], "health": None,
+                                     "deployments": rows}, "backends": []})
+        self.assertTrue(s["load_known"])
+        self.assertEqual((s["running"], s["queued"]), (4, 2))
+        self.assertEqual(s["models_busy"], 1)
 
 
 class TestDemoLoad(unittest.TestCase):

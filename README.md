@@ -300,6 +300,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_GPU_INFO` | GPU 개수/장치명 수집 (true; Pod·Node 읽기 권한 필요) |
 | `MONITOR_LOAD` | **지금 부하** 수집 (true; `MONITOR_BACKEND_COUNT` 필요) — 각 backend Pod 의 `/metrics`(vLLM/SGLang 게이지)를 읽어 처리 중/대기 요청·KV 캐시 사용률·tok/s 를 표시. Pod 주소는 GPU 집계가 이미 받아오는 Pod 목록에서 나오므로 **k8s 호출이 늘지 않는다**. Pod 주소를 못 얻는 백엔드(scale-to-zero·external)는 **조회하지 않고** 이유와 함께 `?` — LB 로 찌르면 activator 를 거쳐 모델을 깨우기 때문 |
 | `MONITOR_LOAD_TIMEOUT` | Pod `/metrics` 조회 타임아웃 초 (3) — 죽은 Pod 가 사이클을 잡아먹지 않게 짧게 |
+| `MONITOR_LOAD_ROUTING` | 한 `model_name` 에 backend 가 여러 개일 때 모델 등급 기준 (`least-busy` \| `shuffle`). **LiteLLM 의 `routing_strategy` 에 맞춘다** — least-busy 면 다음 요청이 갈 가장 한가한 backend 가 답이고, simple-shuffle 이면 포화된 backend 도 트래픽을 받으므로 가장 나쁜 쪽이 정직하다. 어느 쪽이든 화면에는 등급 분포(`FULL 1 · ok 1`)를 함께 표시 |
 | `MONITOR_PROMETHEUS_URL` | Pod 직접 조회가 막혔을 때(NetworkPolicy·mTLS) 같은 게이지를 대신 읽을 외부 Prometheus URL. 출처가 같아 정확도는 동일하고 스크레이프 주기만큼 늦다 |
 | `MONITOR_PROMETHEUS_FIRST` / `MONITOR_PROMETHEUS_LOOKBACK` | Pod 조회를 건너뛰고 Prometheus 만 사용 (false) / 조회 구간 (`2m` — 이보다 오래된 샘플은 '모름'으로 둔다) |
 | `MONITOR_METRICS` | Prometheus `/metrics` (true) |

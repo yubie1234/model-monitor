@@ -232,6 +232,7 @@ def demo_snapshot():
         if lo:
             d["load"] = lo
     snap["load_enabled"] = True
+    snap["load_routing"] = "least-busy"
     snap["summary"] = summarize(snap)
     snap["demo"] = True
     return snap
