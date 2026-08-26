@@ -2172,7 +2172,8 @@ _DASHBOARD_HTML = r"""<!doctype html>
     color:var(--muted);margin-bottom:7px}
   .card .val{font-family:var(--mono);font-size:26px;font-weight:600;
     font-variant-numeric:tabular-nums;line-height:1}
-  .card .sub{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:6px}
+  .card .sub{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:6px;
+    overflow-wrap:anywhere}
   .val.good{color:var(--up)} .val.bad{color:var(--down)} .val.warn{color:var(--warn)}
   .val.accent{color:var(--accent)}
 
@@ -2267,7 +2268,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
 <div class="wrap">
   <header>
     <h1>Model Monitor <span class="ver" id="ver"></span>
-      <span class="dim">· 떠 있는 모델 &amp; LB 뒤 backend</span></h1>
+      <span class="dim">· 지금 바쁜 모델 &amp; LB 뒤 backend</span></h1>
     <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
@@ -2512,10 +2513,12 @@ function render(snap){
         s.kv_max_pct>=95?"bad":(s.kv_max_pct>=80?"warn":"good"),
         "가장 붐비는 Pod");
   }
+  cards += card("모델 상태", (s.deployments_healthy||0)
+    +'<span style="color:var(--faint);font-size:16px"> / '
+    +(s.deployments_registered||0)+'</span>',
+    (s.deployments_unhealthy?"warn":"good"),
+    "UP / 등록 · unhealthy "+(s.deployments_unhealthy||0));
   cards += card("Model Groups", s.model_groups||0, "accent");
-  cards += card("Registered", s.deployments_registered||0, "");
-  cards += card("Running (healthy)", s.deployments_healthy||0, "good",
-    "unhealthy "+(s.deployments_unhealthy||0));
   if(s.backend_pods_known)
     cards += card("Backend Pods", (s.backend_pods_ready||0)
       +'<span style="color:var(--faint);font-size:16px"> / '

@@ -50,7 +50,8 @@
     color:var(--muted);margin-bottom:7px}
   .card .val{font-family:var(--mono);font-size:26px;font-weight:600;
     font-variant-numeric:tabular-nums;line-height:1}
-  .card .sub{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:6px}
+  .card .sub{font-family:var(--mono);font-size:11.5px;color:var(--faint);margin-top:6px;
+    overflow-wrap:anywhere}
   .val.good{color:var(--up)} .val.bad{color:var(--down)} .val.warn{color:var(--warn)}
   .val.accent{color:var(--accent)}
 
@@ -80,7 +81,7 @@
   td.mono,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
   td.api{font-family:var(--mono);font-size:12px;color:var(--muted);max-width:340px;
     overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  td.name{font-weight:550}
+  td.name{font-weight:550;white-space:nowrap}
 
   .pill{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);
     font-size:11px;font-weight:600;padding:2px 9px;border-radius:20px;
@@ -106,6 +107,29 @@
   .bk .note{font-size:10.5px;color:var(--faint)}
   .srccol{font-family:var(--mono);font-size:11px;color:var(--faint)}
 
+  /* 사용량/부하 셀 */
+  .use{display:flex;align-items:center;gap:8px;white-space:nowrap}
+  .use .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px}
+  .use .pct{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .use.good .pct{color:var(--up)} .use.warn .pct{color:var(--warn)}
+  .use.bad .pct{color:var(--down)}
+  .use .bar{width:52px;height:5px;border-radius:3px;background:var(--surface2);
+    overflow:hidden;border:1px solid var(--border)}
+  .use .bar i{display:block;height:100%}
+  .use.good .bar i{background:var(--up)} .use.warn .bar i{background:var(--warn)}
+  .use.bad .bar i{background:var(--down)}
+  .wait{font-family:var(--mono);font-size:11px;color:var(--warn)}
+  .load{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .load .lv{font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 8px;
+    border-radius:20px;border:1px solid transparent}
+  .load .why{font-size:11px;color:var(--faint)}
+  .lv.full{color:var(--down);background:rgba(248,81,73,.12);border-color:rgba(248,81,73,.35)}
+  .lv.busy{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
+  .lv.ok{color:var(--up);background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.28)}
+  .lv.idle{color:var(--faint);background:var(--surface2);border-color:var(--border)}
+  .lv.unk{color:var(--muted);background:var(--surface2);border-color:var(--border)}
+  .idle{color:var(--faint)}
+
   .empty{color:var(--muted);padding:18px;text-align:center;font-style:italic}
   .err{color:var(--down);font-family:var(--mono);font-size:12px;
     background:rgba(248,81,73,.07);border:1px solid rgba(248,81,73,.25);
@@ -117,13 +141,13 @@
   footer{margin-top:30px;color:var(--faint);font-size:11.5px;font-family:var(--mono);
     border-top:1px solid var(--border);padding-top:14px}
 </style>
-<script>window.__SNAPSHOT__={"version": "0.1.3", "ts": "2026-06-25 06:35:54", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat"}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat"}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "status": "UP", "status_source": "health"}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "status": "UP", "status_source": "health"}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "status": "UP", "status_source": "health"}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "status": "DOWN", "status_source": "health"}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 4, "deployments_total": 4, "deployments_healthy": 3, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 4, "backend_pods_desired": 8, "backend_pods_known": true}, "demo": true};</script>
+<script>window.__SNAPSHOT__={"version": "0.3.0", "ts": "2026-08-26 11:03:34", "litellm": {"url": "http://litellm:4000 (demo)", "reachable": true, "groups": [{"model_group": "KServe-Qwen3.6-35B-A3B-FP8", "providers": ["openai"], "mode": "chat", "rpm": 600, "tpm": 400000}, {"model_group": "Qwen3-Embedding-8B", "providers": ["openai"], "mode": "embedding"}, {"model_group": "SGlang-Qwen3.6-27B-FP8", "providers": ["openai"], "mode": "chat", "rpm": 120}], "deployments": [{"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "underlying": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1", "id": "a1b2c3", "type": "kserve", "backends_ready": 3, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "kserve", "service": "qwen36-35b-predictor", "backend_pods": [{"ip": "10.42.1.11", "port": 8080, "pod": "p-0"}, {"ip": "10.42.1.12", "port": 8080, "pod": "p-1"}, {"ip": "10.42.2.7", "port": 8080, "pod": "p-2"}], "status": "UP", "status_source": "health", "load": {"scope": "pods", "pods_sampled": 3, "pods_failed": 0, "engine": "vllm", "running": 15, "waiting": 9, "kv_cache_pct": 94.0, "kv_cache_avg_pct": 91.2, "throughput": 1235.0, "per_pod": [{"url": "http://10.42.1.11:8080", "engine": "vllm", "running": 5, "waiting": 3, "kv_cache_pct": 88.0, "throughput": 410.0}, {"url": "http://10.42.1.12:8080", "engine": "vllm", "running": 4, "waiting": 2, "kv_cache_pct": 91.5, "throughput": 380.0}, {"url": "http://10.42.2.7:8080", "engine": "vllm", "running": 6, "waiting": 4, "kv_cache_pct": 94.0, "throughput": 445.0}], "state": "saturated", "state_reason": "대기 9건"}}, {"model_name": "Qwen3-Embedding-8B", "underlying": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1", "id": "j1k2l3", "type": "kserve", "backends_ready": 0, "backends_desired": 0, "backend_source": "knative-pa", "mode": "Serverless", "scale_to_zero": true, "namespace": "kserve", "service": "qwen3-embd-predictor", "status": "UP", "status_source": "health", "load": {"scope": "lb-sample", "pods_sampled": 0, "pods_failed": 1, "engine": null, "running": null, "waiting": null, "kv_cache_pct": null, "kv_cache_avg_pct": null, "throughput": null, "per_pod": [{"url": "http://qwen3-embd-predictor.kserve.svc:8080", "error": "connection error: [Errno 111] Connection refused"}], "error": "connection error: [Errno 111] Connection refused", "state": "unknown", "state_reason": "connection error: [Errno 111] Connection refused"}}, {"model_name": "SGlang-Qwen3.6-27B-FP8", "underlying": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1", "id": "d4e5f6", "type": "sglang", "backends_ready": 1, "backends_desired": 3, "backend_source": "endpointslice", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen36-27b-sglang", "status": "UP", "status_source": "health", "load": {"scope": "pods", "pods_sampled": 1, "pods_failed": 0, "engine": "sglang", "running": 2, "waiting": 0, "kv_cache_pct": 31.0, "kv_cache_avg_pct": 31.0, "throughput": 120.0, "per_pod": [{"url": "http://10.42.3.4:30000", "engine": "sglang", "running": 2, "waiting": 0, "kv_cache_pct": 31.0, "throughput": 120.0}], "state": "ok", "state_reason": "처리 중 2건"}}, {"model_name": "vLLM-Stack-Qwen3-32B-AWQ", "underlying": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1", "id": "g7h8i9", "type": "vllm", "backends_ready": 0, "backends_desired": 2, "backend_source": "deployment", "mode": "RawDeployment", "scale_to_zero": false, "namespace": "serving", "service": "qwen3-32b-vllm", "status": "DOWN", "status_source": "health", "load": {"scope": "lb-sample", "pods_sampled": 0, "pods_failed": 1, "engine": null, "running": null, "waiting": null, "kv_cache_pct": null, "kv_cache_avg_pct": null, "throughput": null, "per_pod": [{"url": "http://qwen3-32b-vllm.serving.svc:8000", "error": "connection error: [Errno 111] Connection refused"}], "error": "connection error: [Errno 111] Connection refused", "state": "unknown", "state_reason": "connection error: [Errno 111] Connection refused"}}], "health": {"healthy_count": 3, "unhealthy_count": 1, "healthy_endpoints": [{"model": "hosted_vllm/Qwen3.6-35B-A3B-FP8", "api_base": "http://qwen36-35b-predictor.kserve.svc:8080/v1"}, {"model": "hosted_vllm/Qwen3.6-27B-FP8", "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1"}, {"model": "openai/Qwen3-Embedding-8B", "api_base": "http://qwen3-embd-predictor.kserve.svc:8080/v1"}], "unhealthy_endpoints": [{"model": "hosted_vllm/Qwen3-32B-AWQ", "api_base": "http://qwen3-32b-vllm.serving.svc:8000/v1"}]}, "models": ["KServe-Qwen3.6-35B-A3B-FP8", "SGlang-Qwen3.6-27B-FP8", "vLLM-Stack-Qwen3-32B-AWQ", "Qwen3-Embedding-8B"], "errors": []}, "backends": [{"name": "KServe-Qwen3.6-35B-A3B-FP8", "url": "http://qwen36-35b-predictor.kserve.svc:8080", "type": "kserve", "up": true, "models": ["Qwen3.6-35B-A3B-FP8"], "error": null}, {"name": "SGlang-Qwen3.6-27B-FP8", "url": "http://qwen36-27b-sglang.serving.svc:30000", "type": "sglang", "up": true, "models": ["Qwen3.6-27B-FP8"], "error": null}, {"name": "vLLM-Stack-Qwen3-32B-AWQ", "url": "http://qwen3-32b-vllm.serving.svc:8000", "type": "vllm", "up": false, "models": [], "error": "connection error"}], "backend_count_enabled": true, "summary": {"model_groups": 3, "deployments_registered": 4, "deployments_total": 4, "deployments_healthy": 3, "deployments_unhealthy": 1, "backends_up": 2, "backends_total": 3, "backend_models": 2, "backend_pods_ready": 4, "backend_pods_desired": 8, "backend_pods_known": true, "usage_known": false, "usage_requests": 0, "usage_tokens": 0, "usage_spend": 0.0, "usage_rpm": 0.0, "usage_models_used": 0, "usage_window_hours": null, "load_known": true, "running": 17, "queued": 9, "models_busy": 1, "models_saturated": 1, "models_idle": 0, "kv_max_pct": 94.0, "busiest": {"model_name": "KServe-Qwen3.6-35B-A3B-FP8", "state": "saturated", "reason": "대기 9건"}, "pods_sampled": 4, "pods_failed": 2}, "usage": null, "load_enabled": true, "demo": true};</script>
 </head>
 <body>
 <div class="wrap">
   <header>
     <h1>Model Monitor <span class="ver" id="ver"></span>
-      <span class="dim">· 떠 있는 모델 &amp; LB 뒤 backend</span></h1>
+      <span class="dim">· 지금 바쁜 모델 &amp; LB 뒤 backend</span></h1>
     <span class="chain">LiteLLM → KServe → vLLM / SGLang</span>
     <span class="spacer"></span>
     <label class="toggle"><input type="checkbox" id="auto" checked> auto-refresh</label>
@@ -140,7 +164,7 @@
 
   <section id="deployments-sec">
     <div class="sec-title">Deployments
-      <span class="src">/model/info api_base · /health status · k8s backend pods</span>
+      <span class="src" id="dep-src">/model/info api_base · /health status · k8s backend pods</span>
       <span class="filters">
         <label for="f-status">status</label>
         <select id="f-status">
@@ -148,6 +172,18 @@
           <option value="UP">UP</option>
           <option value="DOWN">DOWN</option>
           <option value="?">?</option>
+        </select>
+        <label for="f-load">load</label>
+        <select id="f-load">
+          <option value="">all</option>
+          <option value="busy">바쁨(BUSY+FULL)</option>
+          <option value="saturated">FULL</option>
+          <option value="idle">idle</option>
+        </select>
+        <label for="f-sort">sort</label>
+        <select id="f-sort">
+          <option value="load">부하순</option>
+          <option value="name">이름순</option>
         </select>
         <label for="f-type">type</label>
         <select id="f-type">
@@ -200,6 +236,115 @@ function backendCell(d){
     +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
 }
 
+function fmtNum(n){
+  if(n==null) return "?";
+  n=Number(n);
+  const u=[["G",1e9],["M",1e6],["k",1e3]];
+  for(const [s,d] of u){ if(Math.abs(n)>=d) return (n/d).toFixed(1)+s; }
+  return String(Math.round(n));
+}
+function utilCls(r){ return r==null?"":(r>=0.9?"bad":(r>=0.7?"warn":"good")); }
+
+// window 누적 요청 수
+function reqCell(d){
+  const u=d.usage;
+  if(!u || u.requests==null) return '<span class="srccol">?</span>';
+  const tip = u.tokens!=null ? ' title="tokens '+fmtNum(u.tokens)+'"' : '';
+  return '<span class="use'+(u.requests?'':' idle')+'"'+tip+'>'
+    +'<span class="num">'+fmtNum(u.requests)+'</span></span>';
+}
+
+// 분당 요청 + (한도가 있으면) 사용률 바
+function rateCell(d){
+  const u=d.usage;
+  if(!u || u.requests_per_min==null) return '<span class="srccol">?</span>';
+  const rpm=Number(u.requests_per_min);
+  let html='<span class="num">'+rpm.toFixed(2)+'</span>';
+  if(u.rpm_util!=null){
+    const cls=utilCls(u.rpm_util);
+    const pct=Math.min(100, Math.round(u.rpm_util*100));
+    html='<span class="num">'+rpm.toFixed(2)+'</span>'
+      +'<span class="bar"><i style="width:'+pct+'%"></i></span>'
+      +'<span class="pct">'+pct+'%</span>';
+    return '<div class="use '+cls+'" title="rpm 한도 '+esc(u.rpm_limit)
+      +' 대비 사용률">'+html+'</div>';
+  }
+  return '<div class="use'+(rpm?'':' idle')+'" title="분당 요청(집계 구간 평균)">'
+    +html+'</div>';
+}
+
+// 지금 바쁜가 — 등급 + 근거
+const LOAD_LV = {saturated:["FULL","full"], busy:["BUSY","busy"],
+                 ok:["ok","ok"], idle:["idle","idle"], unknown:["?","unk"]};
+function podTip(l){
+  if(!l) return "";
+  const scope = l.scope==="pods"
+    ? ("Pod "+(l.pods_sampled||0)+"개 직접 조회")
+    : "LB 경유 1개 샘플 (Pod 주소 미확인)";
+  const rows=(l.per_pod||[]).map(p=> p.error
+    ? ((p.url||"")+" — "+p.error)
+    : ((p.url||"")+" — run "+(p.running!=null?p.running:"?")
+       +", queue "+(p.waiting!=null?p.waiting:"?")
+       +", kv "+(p.kv_cache_pct!=null?p.kv_cache_pct+"%":"?")));
+  return scope + (rows.length? ("\n"+rows.join("\n")) : "");
+}
+function loadCell(d){
+  const l=d.load;
+  if(!l) return '<span class="srccol">-</span>';
+  const [label,cls] = LOAD_LV[l.state||"unknown"]||LOAD_LV.unknown;
+  let why = l.state_reason||"";
+  if(l.state==="unknown"){                    // 긴 에러는 줄이고 원문은 툴팁으로
+    const r=why.toLowerCase();
+    why = (r.includes("connection")||r.includes("timed out")) ? "연결 안 됨"
+        : (r.includes("게이지")||r.includes("metric")) ? "게이지 없음" : why.slice(0,28);
+  }
+  const tip = (l.state==="unknown" && l.state_reason ? l.state_reason+"\n" : "")+podTip(l);
+  return '<div class="load" title="'+esc(tip)+'">'
+    +'<span class="lv '+cls+'">'+label+'</span>'
+    +'<span class="why">'+esc(why)+'</span></div>';
+}
+function runCell(d){
+  const l=d.load||{};
+  if(l.running==null) return '<span class="srccol">?</span>';
+  return '<span class="mono"'+(l.running?'':' style="color:var(--faint)"')+'>'
+    +l.running+'</span>';
+}
+function queueCell(d){
+  const l=d.load||{};
+  if(l.waiting==null) return '<span class="srccol">?</span>';
+  if(!l.waiting) return '<span class="mono" style="color:var(--faint)">0</span>';
+  const cls = l.waiting>=5 ? "bad" : "warn";
+  return '<div class="use '+cls+'" title="지금 기다리고 있는 요청">'
+    +'<span class="num">'+l.waiting+'</span></div>';
+}
+// KV 캐시 사용률 = GPU 가 실제로 얼마나 물려 있는지 (Pod 중 최댓값)
+function kvCell(d){
+  const l=d.load;
+  if(!l || l.kv_cache_pct==null) return '<span class="srccol">'+(l?"?":"-")+'</span>';
+  const pct=Math.min(100, Math.round(l.kv_cache_pct));
+  const tip = l.kv_cache_avg_pct!=null
+    ? ("Pod 최대 "+l.kv_cache_pct+"% · 평균 "+l.kv_cache_avg_pct+"%") : "KV 사용률";
+  return '<div class="use '+utilCls(pct/100)+'" title="'+esc(tip)+'">'
+    +'<span class="num">'+pct+'%</span>'
+    +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
+}
+function tputCell(d){
+  const l=d.load||{};
+  if(l.throughput==null)
+    return '<span class="srccol" title="두 번째 갱신부터 표시(카운터 차분)">-</span>';
+  return '<span class="mono">'+Math.round(l.throughput)+'</span>';
+}
+function podsCell(d){
+  const l=d.load;
+  if(!l) return '<span class="srccol">-</span>';
+  if(l.scope!=="pods")
+    return '<span class="srccol" style="color:var(--warn)" title="'+esc(podTip(l))
+      +'">LB</span>';
+  const bad=l.pods_failed||0, n=l.pods_sampled||0;
+  return '<span class="mono"'+(bad?' style="color:var(--warn)"':'')
+    +' title="'+esc(podTip(l))+'">'+(bad? (n+"/"+(n+bad)) : n)+'</span>';
+}
+
 function statusPill(s){
   const cls = s==="UP"?"up":(s==="DOWN"?"down":"unk");
   return '<span class="pill '+cls+'">'+esc(s)+'</span>';
@@ -230,57 +375,143 @@ function render(snap){
   lastSnap = snap;
   // summary cards
   let cards = "";
+  if(s.load_known){
+    const busy=s.models_busy||0, sat=s.models_saturated||0;
+    cards += card("지금 바쁜 모델",
+      busy+'<span style="color:var(--faint);font-size:16px"> / '
+      +(s.deployments_registered||0)+'</span>',
+      sat?"bad":(busy?"warn":"good"),
+      s.busiest&&busy ? esc(s.busiest.model_name)+" · "+esc(s.busiest.reason||"")
+                      : "큐 없음 · 여유");
+    cards += card("처리 중", s.running||0, (s.running?"good":""),
+      "in-flight 요청 합");
+    cards += card("대기", s.queued||0, (s.queued?"bad":""),
+      s.queued? "지금 기다리는 요청" : "대기 없음");
+    if(s.kv_max_pct!=null)
+      cards += card("KV 최대", Math.round(s.kv_max_pct)+"%",
+        s.kv_max_pct>=95?"bad":(s.kv_max_pct>=80?"warn":"good"),
+        "가장 붐비는 Pod");
+  }
+  cards += card("모델 상태", (s.deployments_healthy||0)
+    +'<span style="color:var(--faint);font-size:16px"> / '
+    +(s.deployments_registered||0)+'</span>',
+    (s.deployments_unhealthy?"warn":"good"),
+    "UP / 등록 · unhealthy "+(s.deployments_unhealthy||0));
   cards += card("Model Groups", s.model_groups||0, "accent");
-  cards += card("Registered", s.deployments_registered||0, "");
-  cards += card("Running (healthy)", s.deployments_healthy||0, "good",
-    "unhealthy "+(s.deployments_unhealthy||0));
   if(s.backend_pods_known)
     cards += card("Backend Pods", (s.backend_pods_ready||0)
       +'<span style="color:var(--faint);font-size:16px"> / '
       +(s.backend_pods_desired||"?")+'</span>', "",
       "LB 뒤 ready / desired");
+  if(s.usage_known)
+    cards += card("Requests ("+(s.usage_window_hours||24)+"h)",
+      fmtNum(s.usage_requests), "accent",
+      Number(s.usage_rpm||0).toFixed(1)+" req/min · "
+      +(s.usage_models_used||0)+" model 사용");
+  if(s.usage_known && s.usage_tokens)
+    cards += card("Tokens ("+(s.usage_window_hours||24)+"h)",
+      fmtNum(s.usage_tokens), "", "누적 total tokens");
+  if(s.live_known)
+    cards += card("In-flight", s.live_running||0,
+      (s.live_waiting?"warn":"good"),
+      (s.live_waiting||0)+" 대기 · 백엔드 /metrics");
   $("#cards").innerHTML = cards;
 
   // deployments
   const showBk = !!snap.backend_count_enabled;
+  const usage = snap.usage||{};
+  const showUse = !!(usage.models && Object.keys(usage.models).length);
+  const showLoad = !!snap.load_enabled;
+  const win = usage.window_hours||24;
+  const srcEl=$("#dep-src");
+  if(srcEl) srcEl.textContent = (showLoad ? "지금 부하 = 백엔드 엔진 게이지(Pod 별 /metrics) · " : "")
+    + "/model/info api_base · /health status"
+    + (showBk ? " · k8s backend pods" : "")
+    + (showUse ? " · 누적 usage "+(usage.source||"") : "");
   const dt = $("#deployments");
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
     const fS = $("#f-status").value, fT = $("#f-type").value;
+    const fL = $("#f-load") ? $("#f-load").value : "";
+    const sortBy = $("#f-sort") ? $("#f-sort").value : "load";
+    const RANK = {saturated:3, busy:2, ok:1, idle:0, unknown:-1};
     const merged = all.filter(d=>
-      (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT));
-    $("#f-count").textContent = (fS||fT)
+      (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT)
+      && (!fL || (fL==="busy"
+            ? ["busy","saturated"].includes((d.load||{}).state)
+            : (d.load||{}).state===fL)));
+    // 기본은 부하순 — "지금 바쁜 것"이 항상 맨 위로 온다
+    if(showLoad && sortBy==="load") merged.sort((a,b)=>{
+      const ra=RANK[(a.load||{}).state]??-1, rb=RANK[(b.load||{}).state]??-1;
+      if(ra!==rb) return rb-ra;
+      const qa=(a.load||{}).waiting||0, qb=(b.load||{}).waiting||0;
+      if(qa!==qb) return qb-qa;
+      const na=(a.load||{}).running||0, nb=(b.load||{}).running||0;
+      if(na!==nb) return nb-na;
+      return String(a.model_name||"").localeCompare(String(b.model_name||""));
+    });
+    $("#f-count").textContent = (fS||fT||fL)
       ? merged.length+" / "+all.length : all.length+"";
-    let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
-    if(showBk) head += '<th>BACKENDS (ready/desired)</th><th>MODE</th><th>SRC</th>';
+    let head = "<tr><th>STATUS</th><th>MODEL_NAME</th>";
+    if(showLoad) head += '<th>LOAD</th><th class="num">RUN</th><th class="num">QUEUE</th>'
+      +'<th class="num">KV CACHE</th><th class="num">TOK/S</th><th class="num">PODS</th>';
+    if(showBk) head += '<th>BACKENDS (ready/desired)</th>';
+    if(showUse) head += '<th class="num">REQ ('+win+'h)</th><th class="num">RPM</th>';
+    head += "<th>TYPE</th>";
+    if(showBk) head += '<th>MODE</th><th>SRC</th>';
     head += "<th>API_BASE</th></tr>";
     dt.querySelector("thead").innerHTML = head;
     dt.querySelector("tbody").innerHTML = merged.length ? merged.map(d=>{
       let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
-        +'<td class="name">'+esc(d.model_name)+"</td>"
-        +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
-      if(showBk) row += "<td>"+backendCell(d)+"</td>"
-        +'<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
+        +'<td class="name">'+esc(d.model_name)+"</td>";
+      if(showLoad) row += "<td>"+loadCell(d)+"</td><td>"+runCell(d)+"</td>"
+        +"<td>"+queueCell(d)+"</td><td>"+kvCell(d)+"</td>"
+        +"<td>"+tputCell(d)+"</td><td>"+podsCell(d)+"</td>";
+      if(showBk) row += "<td>"+backendCell(d)+"</td>";
+      if(showUse) row += "<td>"+reqCell(d)+"</td><td>"+rateCell(d)+"</td>";
+      row += '<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
+      if(showBk) row +=
+        '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
         +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
       row += '<td class="api" title="'+esc(d.api_base)+'">'+esc(d.api_base||"-")+"</td></tr>";
       return row;
-    }).join("") : '<tr><td class="empty" colspan="7">필터 결과 없음</td></tr>';
+    }).join("") : '<tr><td class="empty" colspan="11">필터 결과 없음</td></tr>';
   } else {
     $("#f-count").textContent="";
     dt.querySelector("thead").innerHTML="";
     dt.querySelector("tbody").innerHTML='<tr><td class="empty">deployment 없음 (LiteLLM /model/info 응답 비어있음 또는 미연결)</td></tr>';
   }
-  $("#dep-err").innerHTML = (ll && ll.errors && ll.errors.length)
+  let depErr = (ll && ll.errors && ll.errors.length)
     ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
+  if(s.pods_failed)
+    depErr += '<div class="note-banner" style="margin-top:8px">Pod '+s.pods_failed
+      +' 곳의 /metrics 조회 실패 — 부하가 과소 집계될 수 있습니다(PODS 열에 마우스를 올리면 원인).</div>';
+  if(snap.load_error)
+    depErr += '<div class="err">부하 수집 실패: '+esc(snap.load_error)+'</div>';
+  if(!showUse && usage.errors && usage.errors.length)
+    depErr += '<div class="note-banner" style="margin-top:8px">사용량(요청 수) 수집 실패 — '
+      +'LiteLLM 분석 엔드포인트 응답 없음/권한 부족: '+esc(usage.errors.slice(0,2).join("; "))
+      +'</div>';
+  $("#dep-err").innerHTML = depErr;
 
   // groups
   const gt = $("#groups");
   if(ll && ll.groups && ll.groups.length){
-    gt.querySelector("thead").innerHTML="<tr><th>MODEL_GROUP</th><th>PROVIDERS</th><th>MODE</th></tr>";
-    gt.querySelector("tbody").innerHTML = ll.groups.map(g=>
-      '<tr><td class="name">'+esc(g.model_group)+"</td>"
+    gt.querySelector("thead").innerHTML="<tr><th>MODEL_GROUP</th><th>PROVIDERS</th><th>MODE</th>"
+      +(showUse?'<th class="num">REQ ('+win+'h)</th><th class="num">TOKENS</th>':"")
+      +'<th class="num">RPM / TPM 한도</th></tr>';
+    const um = usage.models||{};
+    gt.querySelector("tbody").innerHTML = ll.groups.map(g=>{
+      const u = um[g.model_group];
+      let r='<tr><td class="name">'+esc(g.model_group)+"</td>"
       +'<td class="mono" style="color:var(--muted)">'+esc((g.providers||[]).join(", ")||"-")+"</td>"
-      +"<td>"+esc(g.mode||"-")+"</td></tr>").join("");
+      +"<td>"+esc(g.mode||"-")+"</td>";
+      if(showUse) r+='<td class="mono">'+(u?fmtNum(u.requests):'<span class="srccol">?</span>')+"</td>"
+        +'<td class="mono">'+(u&&u.tokens!=null?fmtNum(u.tokens):'<span class="srccol">?</span>')+"</td>";
+      r+='<td class="mono" style="color:var(--muted)">'
+        +((g.rpm||g.tpm)?((g.rpm||"-")+" / "+(g.tpm||"-")):'<span class="srccol">무제한</span>')+"</td></tr>";
+      return r;
+    }).join("");
   } else {
     gt.querySelector("thead").innerHTML="";
     gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
@@ -319,8 +550,9 @@ function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
 // 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
-$("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+["#f-status","#f-type","#f-load","#f-sort"].forEach(sel=>{
+  const el=$(sel); if(el) el.addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+});
 tick(); loop();
 </script>
 </body>
