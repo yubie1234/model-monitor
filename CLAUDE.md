@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`model-monitor` is a single-file monitor for a LiteLLM → KServe → vLLM/SGLang stack. It answers two questions: **which models are actually serving**, and **how many backend Pods sit behind each `api_base` (load balancer)**. It renders to a terminal (TUI), a web dashboard (`--serve`), or JSON.
+`model-monitor` is a single-file monitor for a LiteLLM → KServe → vLLM/SGLang stack. It answers three questions: **which models are actually serving**, **how many backend Pods sit behind each `api_base` (load balancer)**, and — the primary one — **is a model busy right now** (in-flight/queued requests, KV cache pressure, tok/s, read per Pod from the engine's own gauges). It renders to a terminal (TUI), a web dashboard (`--serve`), or JSON.
 
 **Default constraint: zero third-party dependencies — Python 3.6+ standard library only.** The whole point is that `model_monitor.py` runs on an air-gapped node with no `pip install`. Default to stdlib imports (`http.server`, `urllib`, `ssl`, `json`, `argparse`, `threading`, etc.). PyYAML is used *only if already present* (config loading degrades to JSON otherwise) — never make it a hard requirement. **If a task genuinely needs an external package, do not add it silently — ask the user first** and confirm it's acceptable given the air-gapped deployment target before introducing the dependency.
 
@@ -51,7 +51,16 @@ The core pipeline is `build_snapshot(settings)` → a single `snap` dict consume
 
    `parse_api_base` turns an `api_base` URL into `(namespace, service)`; IPs/public domains classify as `external` and short-circuit (no k8s calls). A `(ns, svc)` cache dedupes k8s lookups across deployments sharing a Service. The k8s client auto-enables in-cluster via the ServiceAccount token (`--no-backend-count` disables).
 
-3. **사용량** (`collect_usage` + `attach_usage_to_deployments`) — 모델별 요청 수/토큰. LiteLLM 은 버전마다
+3. **현재 부하** (`load_targets` → `collect_load` → `aggregate_pod_loads` → `classify_load`) — 이 도구의 1급
+   지표다. LB(`api_base`)로 `/metrics` 를 찌르면 뒤에 있는 Pod 중 하나만 응답하므로, backend 개수를 셀 때
+   EndpointSlice 에서 **Pod 주소(`backend_pods`)를 함께 얻어 Pod 마다 직접** 조회한다(스레드 병렬).
+   집계는 RUN/QUEUE 는 합, KV 는 최댓값(+평균). 등급은 큐 우선(대기 ≥1 → BUSY, ≥5 또는 KV ≥95% → FULL);
+   게이지를 못 읽으면 `unknown` 이지 0 이 아니다. Pod 주소가 없으면 LB 1회 샘플링하고 `scope="lb-sample"`
+   로 **표본을 드러낸다**(UI 의 `PODS` 열). tok/s 는 생성 토큰 카운터를 직전 샘플과 차분해서 내므로
+   watch/serve 의 2번째 갱신부터 나온다(`_TPUT_HISTORY`). 기본 ON, `--no-load` 로 끈다.
+
+4. **누적 사용량** (`collect_usage` + `attach_usage_to_deployments`) — 모델별 요청 수/토큰. **기본 OFF**
+   (`--usage` 로 켬) — "지금 바쁜가"와 다른 축이고 LiteLLM DB 가 있어야 한다. LiteLLM 은 버전마다
    분석 엔드포인트가 달라서 후보(`/global/activity/model` → `/gateway/daily/activity` → `/model/metrics`)를
    **우선순위로 시도하고 처음 데이터가 나온 응답만** 정규화한다(`usage["source"]` 에 기록). 전부 실패하면
    비워 두고 UI 에서 열이 사라진다 — backend 개수와 같은 원칙으로 **추정값을 넣지 않는다**. 사용량은
@@ -62,9 +71,9 @@ The core pipeline is `build_snapshot(settings)` → a single `snap` dict consume
    `--probe-metrics` 를 켜면 백엔드 `/metrics`(vLLM/SGLang Prometheus 게이지)에서 현재 실행/대기 요청과
    KV 캐시 사용률을 읽어 붙인다(LB 경유라 Pod 1개 샘플이라는 점을 UI 에 표기).
 
-4. **`merge_deployments_with_health`** joins `/model/info` (api_base) with `/health` (status) by api_base. When `/health` is missing/timed out, status falls back to k8s backend readiness (`backends_ready > 0` → UP, `scale_to_zero` → `?`). Deployments are sorted by name so output order is stable across LiteLLM responses.
+5. **`merge_deployments_with_health`** joins `/model/info` (api_base) with `/health` (status) by api_base. When `/health` is missing/timed out, status falls back to k8s backend readiness (`backends_ready > 0` → UP, `scale_to_zero` → `?`). Deployments are sorted by name so output order is stable across LiteLLM responses.
 
-5. **`summarize`** computes the headline counts. Invariant covered by tests: the dashboard cards (`deployments_healthy`/`unhealthy`) must always equal the UP/DOWN rows in the table, even when `/health` times out.
+6. **`summarize`** computes the headline counts. Invariant covered by tests: the dashboard cards (`deployments_healthy`/`unhealthy`) must always equal the UP/DOWN rows in the table, even when `/health` times out.
 
 ### Web dashboard threading
 `--serve` does **not** collect on the request path. A background `refresh_loop` rebuilds the snapshot on an interval and `/health` is collected in a *separate* `health_loop` thread (because it's slow), then injected. HTTP handlers return the last cached snapshot immediately — no request ever blocks on collection. Endpoints: `/` (HTML), `/api/snapshot` (live JSON), `/snapshot.json` (download), `/snapshot.html` (self-contained frozen page).

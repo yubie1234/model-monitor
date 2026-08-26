@@ -8,9 +8,10 @@ model_monitor.py — LiteLLM -> KServe -> vLLM/SGLang 백엔드에서 실제로 
       * LiteLLM gateway:  GET /model_group/info  (등록된 모델 그룹)
                           GET /health             (백엔드 실제 health = "떠 있음"의 근거)
                           GET /v1/models          (OpenAI 호환 모델 목록)
-                          GET /global/activity/model 등 (모델별 요청 수/토큰 = 사용량)
+                          GET /global/activity/model (누적 요청 수/토큰, --usage)
+      * 백엔드 GET /metrics: **지금 바쁜지** (실행/대기 요청, KV 캐시 사용률, tok/s)
+                             — k8s EndpointSlice 로 Pod 주소를 얻어 Pod 마다 직접 조회
       * (옵션) 백엔드 직접 probe: 각 vLLM/SGLang 엔드포인트의 GET /v1/models, /health
-      * (옵션) 백엔드 GET /metrics: 현재 실행/대기 요청, KV 캐시 사용률(--probe-metrics)
   - 출력: 1회 스냅샷 / --json / --watch(실시간) 지원
   - --demo: 라이브 엔드포인트 없이 샘플 데이터로 출력 미리보기
 
@@ -31,7 +32,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # ----------------------------------------------------------------------------
 # HTTP (stdlib only)
@@ -102,6 +103,7 @@ def resolve_settings(args):
     litellm = cfg.get("litellm", {}) if isinstance(cfg.get("litellm"), dict) else {}
     bc = cfg.get("backend_count", {}) if isinstance(cfg.get("backend_count"), dict) else {}
     ug = cfg.get("usage", {}) if isinstance(cfg.get("usage"), dict) else {}
+    ld = cfg.get("load", {}) if isinstance(cfg.get("load"), dict) else {}
 
     # backend 개수 수집(k8s API) 사용 여부:
     #   --no-backend-count 면 off, 기본은 auto(= in-cluster SA 토큰 있으면 자동 on)
@@ -140,14 +142,19 @@ def resolve_settings(args):
         "default_namespace": bc.get("default_namespace"),
         "namespace_overrides": bc.get("namespace_overrides", {}) or {},
         "activator_namespace": bc.get("activator_namespace", "knative-serving"),
-        # --- 사용량(요청 수/토큰/사용률) ---
-        #  LiteLLM 분석 엔드포인트 1~2회 호출. 권한/버전 문제로 실패해도 나머지는 그대로.
-        "usage": (not getattr(args, "no_usage", False)
-                  and ug.get("enabled", True)),
+        # --- 현재 부하(기본 ON) ---
+        #  백엔드 엔진 게이지(Pod 별 /metrics)로 "지금 바쁜가"를 판정한다.
+        #  Pod 하나가 죽어 있어도 refresh 가 멈추지 않게 타임아웃은 짧게 잡는다.
+        "load": (not getattr(args, "no_load", False)
+                 and ld.get("enabled", True)),
+        "load_timeout": float(getattr(args, "load_timeout", None)
+                              or ld.get("timeout") or 3.0),
+        "load_thresholds": ld.get("thresholds") or {},
+        "sort": getattr(args, "sort", "load"),
+        # --- 누적 사용량(요청 수/토큰): opt-in ---
+        #  "지금 부하"와는 다른 축이고 LiteLLM DB 가 있어야 나온다 -> 기본 off.
+        "usage": bool(getattr(args, "usage", False) or ug.get("enabled", False)),
         "usage_window": float(args.usage_window or ug.get("window_hours") or 24.0),
-        # 백엔드 /metrics(Prometheus) 직접 probe -> 현재 실행/대기 요청, KV 캐시 사용률
-        "probe_metrics": bool(getattr(args, "probe_metrics", False)
-                              or cfg.get("probe_metrics")),
     }
     return settings
 
@@ -584,10 +591,11 @@ def attach_usage_to_deployments(ll, usage):
 
 
 # ----------------------------------------------------------------------------
-# 현재 부하(live): 백엔드 Prometheus /metrics 에서 실행/대기 요청 + KV 캐시 사용률
-#   LiteLLM 집계는 "지난 N시간 누적"이라 지금 얼마나 물려 있는지는 알 수 없다.
-#   그건 vLLM/SGLang 이 직접 노출하는 게이지에서만 나온다.
-#   주의: api_base 는 LB 라서 /metrics 응답은 **뒤에 있는 Pod 중 하나**의 값이다.
+# 현재 부하(load): "지금 바쁜가?" — 이 도구가 답해야 하는 질문
+#   LiteLLM 누적 집계로는 알 수 없다. 지금 몇 개가 물려 있고 큐가 쌓였는지는
+#   vLLM/SGLang 이 노출하는 게이지에서만 나온다.
+#   가능하면 **Pod 마다 직접** 조회한다(EndpointSlice 주소). LB(api_base)로
+#   찌르면 뒤에 있는 Pod 중 하나만 응답해서, 3개 중 1개만 터져도 안 보인다.
 # ----------------------------------------------------------------------------
 
 _PROM_SPECS = [
@@ -595,13 +603,21 @@ _PROM_SPECS = [
         "running": ("vllm:num_requests_running",),
         "waiting": ("vllm:num_requests_waiting",),
         "kv_cache": ("vllm:gpu_cache_usage_perc", "vllm:kv_cache_usage_perc"),
+        "gen_tokens": ("vllm:generation_tokens_total",),
+        "throughput": (),
     }),
     ("sglang", {
         "running": ("sglang:num_running_reqs",),
         "waiting": ("sglang:num_queue_reqs",),
-        "kv_cache": ("sglang:token_usage", "sglang:kv_cache_usage",),
+        "kv_cache": ("sglang:token_usage", "sglang:kv_cache_usage"),
+        "gen_tokens": ("sglang:generation_tokens_total",),
+        "throughput": ("sglang:gen_throughput",),   # tok/s 를 직접 주는 버전
     }),
 ]
+
+# Pod URL -> (monotonic 시각, 누적 생성 토큰). 카운터 차분으로 지금의 tok/s 를 낸다.
+_TPUT_HISTORY = {}
+_TPUT_LOCK = threading.Lock()
 
 
 def parse_prom_metrics(text):
@@ -629,7 +645,7 @@ def parse_prom_metrics(text):
 
 
 def live_from_prom(text):
-    """/metrics 본문 -> {"engine","running","waiting","kv_cache_pct"} (모르면 None)."""
+    """/metrics 본문 -> Pod 1개의 부하 dict (모르는 값은 None)."""
     metrics = parse_prom_metrics(text)
     if not metrics:
         return None
@@ -637,7 +653,7 @@ def live_from_prom(text):
         if not any(n in metrics for names in spec.values() for n in names):
             continue
         live = {"engine": engine, "running": None, "waiting": None,
-                "kv_cache_pct": None}
+                "kv_cache_pct": None, "gen_tokens": None, "throughput": None}
         for field, names in spec.items():
             vals = []
             for n in names:
@@ -645,55 +661,197 @@ def live_from_prom(text):
             if not vals:
                 continue
             if field == "kv_cache":
-                # 0~1 비율로 나오는 게 보통 -> % 로. 여러 라벨이면 최댓값(가장 붐비는 쪽).
+                # 0~1 비율로 나오는 게 보통 -> % 로. 라벨이 여러 개면 가장 붐비는 값.
                 pct = max(vals)
                 live["kv_cache_pct"] = round(pct * 100.0 if pct <= 1.0 else pct, 1)
+            elif field == "throughput":
+                live["throughput"] = round(sum(vals), 1)
+            elif field == "gen_tokens":
+                live["gen_tokens"] = sum(vals)
             else:
                 live[field] = int(sum(vals))   # 라벨(모델)별로 나뉘어 있으면 합
         return live
     return None
 
 
-def collect_live_metrics(bases, timeout, api_key=None, max_threads=8):
-    """백엔드 base URL 목록 -> {base: live dict}. 스레드로 병렬 probe."""
-    bases = [b for b in dict.fromkeys(bases) if b]
-    out, lock = {}, threading.Lock()
+def _throughput_from_counter(url, gen_tokens, now=None):
+    """생성 토큰 카운터를 직전 샘플과 차분해 tok/s 산출. 첫 샘플이면 None.
 
-    def work(queue):
+    watch/serve 처럼 주기적으로 도는 모드에서만 값이 나온다(1회 실행은 비교 대상 없음).
+    카운터가 줄었으면(Pod 재시작) 버리고 다시 기준을 잡는다.
+    """
+    if gen_tokens is None:
+        return None
+    now = now if now is not None else time.monotonic()
+    with _TPUT_LOCK:
+        prev = _TPUT_HISTORY.get(url)
+        _TPUT_HISTORY[url] = (now, gen_tokens)
+    if not prev:
+        return None
+    dt, dv = now - prev[0], gen_tokens - prev[1]
+    if dt <= 0 or dv < 0:
+        return None
+    return round(dv / dt, 1)
+
+
+def probe_pod_load(url, timeout, api_key=None, now=None):
+    """Pod(또는 LB) 한 곳의 /metrics 조회 -> 부하 dict."""
+    ok, text, err = http_get_text(url + "/metrics", api_key, timeout,
+                                  accept="text/plain")
+    if not ok:
+        return {"url": url, "error": err}
+    live = live_from_prom(text)
+    if live is None:
+        return {"url": url,
+                "error": "엔진 게이지 없음(vllm:/sglang: 메트릭 미노출)"}
+    live["url"] = url
+    if live.get("throughput") is None:
+        live["throughput"] = _throughput_from_counter(url, live.get("gen_tokens"), now)
+    return live
+
+
+def aggregate_pod_loads(samples, scope):
+    """Pod 별 샘플 -> deployment 1행의 부하 요약.
+
+    running/waiting 은 합(그 모델 전체가 지금 몇 개를 물고 있나),
+    KV 는 최댓값(한 Pod 만 포화돼도 그 모델은 이미 아픈 것) + 평균을 함께 남긴다.
+    """
+    oks = [x for x in samples if not x.get("error")]
+    out = {
+        "scope": scope,                       # pods | lb-sample
+        "pods_sampled": len(oks),
+        "pods_failed": len(samples) - len(oks),
+        "engine": oks[0].get("engine") if oks else None,
+        "running": None, "waiting": None,
+        "kv_cache_pct": None, "kv_cache_avg_pct": None,
+        "throughput": None,
+        "per_pod": samples,
+    }
+    if not oks:
+        errs = [x.get("error") for x in samples if x.get("error")]
+        out["error"] = errs[0] if errs else "샘플 없음"
+        return out
+    for field in ("running", "waiting"):
+        vals = [x[field] for x in oks if x.get(field) is not None]
+        if vals:
+            out[field] = sum(vals)
+    kvs = [x["kv_cache_pct"] for x in oks if x.get("kv_cache_pct") is not None]
+    if kvs:
+        out["kv_cache_pct"] = round(max(kvs), 1)
+        out["kv_cache_avg_pct"] = round(sum(kvs) / len(kvs), 1)
+    tps = [x["throughput"] for x in oks if x.get("throughput") is not None]
+    if tps:
+        out["throughput"] = round(sum(tps), 1)
+    return out
+
+
+# 부하 등급 판정 기준(설정으로 덮어쓸 수 있다)
+LOAD_THRESHOLDS = {
+    "queue_busy": 1,        # 대기 요청이 1개라도 있으면 = 이미 밀리는 중
+    "queue_saturated": 5,   # 큐가 이만큼 쌓이면 포화
+    "kv_busy": 80.0,        # KV 캐시 사용률(%)
+    "kv_saturated": 95.0,
+}
+
+# 등급 순서(정렬·집계용). 큰 값일수록 바쁨.
+LOAD_RANK = {"unknown": -1, "idle": 0, "ok": 1, "busy": 2, "saturated": 3}
+
+
+def classify_load(load, thresholds=None):
+    """부하 dict -> (state, reason). "지금 바쁜가"에 한 단어로 답한다.
+
+    saturated: 큐가 쌓였거나 KV 가 거의 찼다 -> 지금 요청하면 기다린다
+    busy:      대기가 생기기 시작했거나 KV 가 높다
+    ok:        처리 중이지만 여유 있음
+    idle:      아무것도 안 하는 중
+    """
+    t = dict(LOAD_THRESHOLDS)
+    t.update(thresholds or {})
+    if not load or load.get("error"):
+        return "unknown", (load or {}).get("error") or "수집 실패"
+    running, waiting = load.get("running"), load.get("waiting")
+    kv = load.get("kv_cache_pct")
+    if running is None and waiting is None and kv is None:
+        return "unknown", "게이지 없음"
+    if waiting is not None and waiting >= t["queue_saturated"]:
+        return "saturated", "대기 %d건" % waiting
+    if kv is not None and kv >= t["kv_saturated"]:
+        return "saturated", "KV %.0f%%" % kv
+    if waiting is not None and waiting >= t["queue_busy"]:
+        return "busy", "대기 %d건" % waiting
+    if kv is not None and kv >= t["kv_busy"]:
+        return "busy", "KV %.0f%%" % kv
+    if running:
+        return "ok", "처리 중 %d건" % running
+    return "idle", "요청 없음"
+
+
+def load_targets(deployments):
+    """deployment 목록 -> probe 대상. Pod 주소가 있으면 Pod 별, 없으면 LB 1회.
+
+    같은 Service 를 공유하는 deployment 는 한 번만 조회하도록 base 로 묶는다.
+    """
+    targets = {}
+    for d in deployments or []:
+        if not d.get("api_base"):
+            continue
+        base = _strip_openai_suffix(d["api_base"])
+        if base in targets:
+            continue
+        pods = d.get("backend_pods") or []
+        urls = ["http://%s:%s" % (p["ip"], p["port"]) for p in pods
+                if p.get("ip") and p.get("port")]
+        if urls:
+            targets[base] = {"urls": urls, "scope": "pods"}
+        else:
+            # Pod 주소를 모른다(외부 주소·k8s 미사용·scale-to-zero) -> LB 로 1회
+            targets[base] = {"urls": [base], "scope": "lb-sample"}
+    return targets
+
+
+def collect_load(targets, timeout, api_key=None, max_threads=12, thresholds=None):
+    """probe 대상 -> {base: 부하 요약}. Pod 들을 스레드로 동시에 찌른다."""
+    jobs = []
+    for base, spec in targets.items():
+        for url in spec["urls"]:
+            jobs.append((base, url))
+    results, lock = {}, threading.Lock()
+
+    def work():
         while True:
             with lock:
-                if not queue:
+                if not jobs:
                     return
-                base = queue.pop()
-            ok, text, err = http_get_text(base + "/metrics", api_key, timeout,
-                                          accept="text/plain")
-            live = live_from_prom(text) if ok else None
-            if live is None:
-                live = {"engine": None, "running": None, "waiting": None,
-                        "kv_cache_pct": None,
-                        "error": err or "metrics 파싱 실패(엔진 게이지 없음)"}
-            live["url"] = base + "/metrics"
+                base, url = jobs.pop()
+            sample = probe_pod_load(url, timeout, api_key)
             with lock:
-                out[base] = live
+                results.setdefault(base, []).append(sample)
 
-    queue = list(bases)
-    threads = [threading.Thread(target=work, args=(queue,), daemon=True)
-               for _ in range(min(max_threads, len(queue)) or 1)]
+    threads = [threading.Thread(target=work, daemon=True)
+               for _ in range(min(max_threads, max(1, len(jobs))))]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+
+    out = {}
+    for base, spec in targets.items():
+        samples = sorted(results.get(base) or [], key=lambda x: x.get("url") or "")
+        agg = aggregate_pod_loads(samples, spec["scope"])
+        agg["state"], agg["state_reason"] = classify_load(agg, thresholds)
+        out[base] = agg
     return out
 
 
-def attach_live_to_deployments(deployments, live_by_base):
-    """base URL 기준으로 live 지표를 deployment 행에 붙인다."""
+def attach_load_to_deployments(deployments, load_by_base):
+    """base URL 기준으로 부하 요약을 deployment 행에 붙인다."""
     out = []
     for d in deployments or []:
         base = _strip_openai_suffix(d["api_base"]) if d.get("api_base") else None
-        live = live_by_base.get(base) if base else None
-        out.append(dict(d, live=live) if live else d)
+        load = load_by_base.get(base) if base else None
+        out.append(dict(d, load=load) if load else d)
     return out
+
 
 # ----------------------------------------------------------------------------
 # Backend 개수: api_base(LB) 뒤의 실제 Pod/replica 수
@@ -857,8 +1015,26 @@ def _is_activator(ep, activator_ns):
     return name.startswith("activator")
 
 
+def _slice_port(item):
+    """EndpointSlice 의 대상 포트(= Pod 컨테이너 포트). http 계열 우선."""
+    ports = item.get("ports") or []
+    for pt in ports:
+        name = (pt.get("name") or "").lower()
+        if name in ("http", "http1", "http-usermetric", "user-port") and pt.get("port"):
+            return pt["port"]
+    for pt in ports:
+        if pt.get("port"):
+            return pt["port"]
+    return None
+
+
 def count_via_endpointslice(client, ns, svc, activator_ns):
-    """EndpointSlice ready 주소 수 합산. activator 만 있으면 activator_only=True."""
+    """EndpointSlice ready 주소 수 합산 + Pod 주소 목록.
+
+    addresses 는 LB 뒤 **각 Pod 의 실제 주소**라서, 여기서 얻어두면 부하 지표를
+    LB 로 한 Pod 만 찔러보는 대신 Pod 마다 직접 조회할 수 있다.
+    activator 만 있으면 activator_only=True.
+    """
     path = ("/apis/discovery.k8s.io/v1/namespaces/%s/endpointslices"
             "?labelSelector=kubernetes.io/service-name=%s" % (ns, svc))
     ok, data, err = client.get(path)
@@ -867,7 +1043,9 @@ def count_via_endpointslice(client, ns, svc, activator_ns):
     ready = 0
     saw_activator = False
     saw_real = False
+    pods = []
     for item in data.get("items", []) or []:
+        port = _slice_port(item)
         for ep in item.get("endpoints", []) or []:
             cond = ep.get("conditions") or {}
             if cond.get("ready") is False:
@@ -878,7 +1056,11 @@ def count_via_endpointslice(client, ns, svc, activator_ns):
                 continue
             saw_real = True
             ready += len(addrs)
-    return {"ready": ready, "activator_only": saw_activator and not saw_real}, None
+            ref = ep.get("targetRef") or {}
+            for ip in addrs:
+                pods.append({"ip": ip, "port": port, "pod": ref.get("name")})
+    return ({"ready": ready, "activator_only": saw_activator and not saw_real,
+             "pods": pods}, None)
 
 
 def count_via_endpoints(client, ns, svc):
@@ -1013,6 +1195,7 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     out = {"backends_ready": None, "backends_desired": None,
            "backend_source": "none", "mode": "Unknown",
            "scale_to_zero": False, "namespace": None, "service": None,
+           "backend_pods": None,      # [{ip, port, pod}] — Pod 별 /metrics 조회용
            "k8s_error": None}
     api_base = deployment.get("api_base")
     if not api_base:
@@ -1049,6 +1232,12 @@ def resolve_backend_count(deployment, client, settings, cache=None):
             out["scale_to_zero"] = True
 
     if info["found"]:
+        # KServe 경로는 Deployment 라벨로 개수를 세지만, 부하는 Pod 마다 봐야 하므로
+        # 주소는 EndpointSlice 에서 따로 얻는다(실패해도 개수 산출에는 영향 없음).
+        if settings.get("load"):
+            es, _ = count_via_endpointslice(client, ns, svc, activator_ns)
+            if es and es.get("pods"):
+                out["backend_pods"] = es["pods"]
         # --- KServe ISVC: Deployment 라벨 합산이 raw/serverless 공통으로 가장 견고 ---
         dep, err = count_via_deployment_label(client, ns, isvc)
         if dep is not None:
@@ -1070,6 +1259,8 @@ def resolve_backend_count(deployment, client, settings, cache=None):
     else:
         # --- 일반 Service(비 KServe): EndpointSlice 의 ready 주소 수 ---
         es, err = count_via_endpointslice(client, ns, svc, activator_ns)
+        if es is not None and es.get("pods"):
+            out["backend_pods"] = es["pods"]
         if es is not None and not es.get("activator_only"):
             out["backends_ready"] = es["ready"]
             out["backend_source"] = "endpointslice"
@@ -1144,7 +1335,7 @@ def build_snapshot(settings, with_health=True):
     if snap["litellm"]:
         snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
 
-    # 모델별 사용량(요청 수/토큰/사용률) — LiteLLM 분석 엔드포인트
+    # 모델별 누적 사용량(요청 수/토큰) — opt-in(--usage). "지금 부하"와는 다른 축이다.
     if settings.get("usage") and settings.get("litellm_url") and snap["litellm"]:
         try:
             snap["usage"] = collect_usage(
@@ -1156,17 +1347,17 @@ def build_snapshot(settings, with_health=True):
             snap["usage"] = {"models": {}, "totals": {}, "source": None,
                              "errors": ["%s: %s" % (type(e).__name__, e)]}
 
-    # 현재 부하(live): 백엔드 /metrics 직접 probe (엔진 게이지)
-    if settings.get("probe_metrics") and snap["litellm"]:
+    # 현재 부하: 백엔드 엔진 게이지(Pod 별 /metrics). 이 도구의 1급 지표.
+    if settings.get("load") and snap["litellm"]:
         deps = snap["litellm"].get("deployments") or []
-        bases = [_strip_openai_suffix(d["api_base"]) for d in deps if d.get("api_base")]
         try:
-            live = collect_live_metrics(bases, settings["timeout"],
-                                        max_threads=settings.get("metrics_threads", 8))
-            snap["live_metrics_enabled"] = True
-            snap["litellm"]["deployments"] = attach_live_to_deployments(deps, live)
-        except Exception as e:  # noqa: BLE001
-            snap["live_metrics_error"] = "%s: %s" % (type(e).__name__, e)
+            targets = load_targets(deps)
+            loads = collect_load(targets, settings.get("load_timeout", 3.0),
+                                 thresholds=settings.get("load_thresholds"))
+            snap["load_enabled"] = True
+            snap["litellm"]["deployments"] = attach_load_to_deployments(deps, loads)
+        except Exception as e:  # noqa: BLE001  (부하 수집 실패가 전체를 막지 않게)
+            snap["load_error"] = "%s: %s" % (type(e).__name__, e)
 
     snap["summary"] = summarize(snap)
     return snap
@@ -1229,10 +1420,17 @@ def summarize(snap):
         "usage_rpm": 0.0,
         "usage_models_used": 0,
         "usage_window_hours": None,
-        # 현재 부하(백엔드 /metrics 게이지)
-        "live_known": False,
-        "live_running": 0,
-        "live_waiting": 0,
+        # 현재 부하(백엔드 엔진 게이지) — "지금 바쁜가"
+        "load_known": False,
+        "running": 0,          # 지금 처리 중인 요청 합
+        "queued": 0,           # 지금 대기 중인 요청 합
+        "models_busy": 0,      # busy + saturated 인 모델 수
+        "models_saturated": 0,
+        "models_idle": 0,
+        "kv_max_pct": None,    # 가장 붐비는 Pod 의 KV 사용률
+        "busiest": None,       # {model_name, state, reason}
+        "pods_sampled": 0,
+        "pods_failed": 0,
     }
     ll = snap.get("litellm")
     if ll:
@@ -1280,22 +1478,46 @@ def summarize(snap):
         s["usage_models_used"] = int(totals.get("models_used") or 0)
         s["usage_window_hours"] = usage.get("window_hours")
 
-    # 현재 부하: 같은 api_base(LB)를 공유하는 행이 있으면 한 번만 센다
-    seen_live = set()
+    # 현재 부하: 같은 Service(api_base)를 공유하는 행은 한 번만 센다
+    seen_load = set()
+    busiest = None
     for d in (ll.get("deployments") or []) if ll else []:
-        live = d.get("live")
-        if not live or live.get("error"):
+        load = d.get("load")
+        if not load:
             continue
-        key = live.get("url") or d.get("api_base")
-        if key in seen_live:
+        state = load.get("state", "unknown")
+        # 모델 수 집계는 행 단위(모델별로 바쁜지 알고 싶으니까)
+        if state == "saturated":
+            s["models_saturated"] += 1
+            s["models_busy"] += 1
+        elif state == "busy":
+            s["models_busy"] += 1
+        elif state == "idle":
+            s["models_idle"] += 1
+        rank = LOAD_RANK.get(state, -1)
+        if rank >= 1 and (busiest is None or rank > busiest[0]):
+            busiest = (rank, {"model_name": d.get("model_name"), "state": state,
+                              "reason": load.get("state_reason")})
+        # 요청 수/Pod 수는 Service 단위(중복 방지)
+        key = tuple(sorted(p.get("url") or "" for p in (load.get("per_pod") or []))) \
+            or d.get("api_base")
+        if key in seen_load:
             continue
-        seen_live.add(key)
-        if live.get("running") is not None:
-            s["live_running"] += live["running"]
-            s["live_known"] = True
-        if live.get("waiting") is not None:
-            s["live_waiting"] += live["waiting"]
-            s["live_known"] = True
+        seen_load.add(key)
+        s["pods_sampled"] += load.get("pods_sampled") or 0
+        s["pods_failed"] += load.get("pods_failed") or 0
+        if load.get("running") is not None:
+            s["running"] += load["running"]
+            s["load_known"] = True
+        if load.get("waiting") is not None:
+            s["queued"] += load["waiting"]
+            s["load_known"] = True
+        kv = load.get("kv_cache_pct")
+        if kv is not None:
+            s["kv_max_pct"] = kv if s["kv_max_pct"] is None else max(s["kv_max_pct"], kv)
+            s["load_known"] = True
+    if busiest:
+        s["busiest"] = busiest[1]
 
     backends = snap.get("backends") or []
     s["backends_total"] = len(backends)
@@ -1394,45 +1616,97 @@ def _fmt_rate(d):
                       c("(%.0f%%)" % (util * 100), _util_color(util)))
 
 
-def _fmt_live(d):
-    """현재 실행/대기 요청 (백엔드 /metrics 게이지). 'run+wait' 표기."""
-    live = d.get("live")
-    if not live:
+_LOAD_LABEL = {"saturated": ("FULL", "red"), "busy": ("BUSY", "yellow"),
+               "ok": ("ok", "green"), "idle": ("idle", "dim"),
+               "unknown": ("?", "dim")}
+
+
+def _short_reason(reason):
+    """긴 에러 문자열을 표에 넣을 짧은 사유로. 원문은 JSON/웹 툴팁에 남는다."""
+    r = (reason or "").lower()
+    if "connection" in r or "timed out" in r or "timeout" in r:
+        return "unreachable"
+    if "게이지" in r or "metric" in r:
+        return "no gauge"
+    if "http 4" in r or "http 5" in r:
+        return r.split()[0] + " " + r.split()[1] if len(r.split()) > 1 else "http err"
+    return (reason or "?")[:14]
+
+
+def _fmt_load(d):
+    """부하 등급 + 근거 한 줄. "지금 바쁜가"에 대한 답."""
+    load = d.get("load")
+    if not load:
         return c("-", "dim")
-    if live.get("error"):
+    state = load.get("state", "unknown")
+    label, color = _LOAD_LABEL.get(state, ("?", "dim"))
+    if state == "unknown":
+        return c("? %s" % _short_reason(load.get("state_reason")), "dim")
+    return "%s %s" % (c(label, color), c(load.get("state_reason") or "", "dim"))
+
+
+def _fmt_running(d):
+    load = d.get("load") or {}
+    if load.get("running") is None:
         return c("?", "dim")
-    run, wait = live.get("running"), live.get("waiting")
-    if run is None and wait is None:
+    return c(str(load["running"]), "green" if load["running"] else "dim")
+
+
+def _fmt_queue(d):
+    """대기 큐 — 이게 0 보다 크면 이미 사용자가 기다리고 있다는 뜻."""
+    load = d.get("load") or {}
+    q = load.get("waiting")
+    if q is None:
         return c("?", "dim")
-    body = "%s" % (run if run is not None else "?")
-    if wait:
-        return "%s %s" % (c(body, "green"), c("+%d wait" % wait, "yellow"))
-    return c(body, "green" if run else "dim")
+    if not q:
+        return c("0", "dim")
+    return c(str(q), "red" if q >= LOAD_THRESHOLDS["queue_saturated"] else "yellow")
 
 
 def _fmt_kv(d):
-    """KV 캐시 사용률(%) — GPU 메모리가 얼마나 물려 있는지 = 진짜 '사용률'."""
-    live = d.get("live") or {}
-    pct = live.get("kv_cache_pct")
+    """KV 캐시 사용률(%) — GPU 가 실제로 얼마나 물려 있는지."""
+    load = d.get("load") or {}
+    pct = load.get("kv_cache_pct")
     if pct is None:
-        return c("?", "dim") if live else c("-", "dim")
+        return c("?", "dim") if load else c("-", "dim")
     return c("%.0f%%" % pct, _util_color(pct / 100.0))
+
+
+def _fmt_tput(d):
+    load = d.get("load") or {}
+    t = load.get("throughput")
+    if t is None:
+        return c("-", "dim")
+    return c("%.0f" % t, "cyan" if t else "dim")
+
+
+def _fmt_pods(d):
+    """부하를 몇 개 Pod 에서 실제로 읽었는지 — 표본을 숨기지 않는다."""
+    load = d.get("load") or {}
+    if not load:
+        return c("-", "dim")
+    if load.get("scope") == "lb-sample":
+        return c("LB", "yellow")     # Pod 주소를 몰라 LB 로 1개만 샘플링
+    n, bad = load.get("pods_sampled") or 0, load.get("pods_failed") or 0
+    if bad:
+        return c("%d/%d" % (n, n + bad), "yellow")
+    return c(str(n), "dim" if not n else "green")
 
 
 def _table(headers, rows, aligns=None):
     """간단한 모노스페이스 테이블 렌더."""
     cols = len(headers)
     aligns = aligns or ["l"] * cols
-    widths = [len(str(h)) for h in headers]
+    widths = [_cell_width(str(h)) for h in headers]
     for row in rows:
         for i in range(cols):
-            widths[i] = max(widths[i], len(_plain(str(row[i]))))
+            widths[i] = max(widths[i], _cell_width(str(row[i])))
 
     def fmt(cells, bold=False):
         parts = []
         for i in range(cols):
             cell = str(cells[i])
-            pad = widths[i] - len(_plain(cell))
+            pad = widths[i] - _cell_width(cell)
             if aligns[i] == "r":
                 parts.append(" " * pad + cell)
             else:
@@ -1445,6 +1719,15 @@ def _table(headers, rows, aligns=None):
     for row in rows:
         out.append(fmt(row))
     return "\n".join(out)
+
+
+def _cell_width(text):
+    """터미널 표시 폭. 한글/전각 문자는 2칸을 차지한다."""
+    import unicodedata
+    width = 0
+    for ch in _plain(text):
+        width += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return width
 
 
 def _plain(s):
@@ -1491,18 +1774,33 @@ def render(snap, settings):
         win = s.get("usage_window_hours") or 24
         summary_bits.append(
             "requests(%gh): %s" % (win, c(_fmt_num(s["usage_requests"]), "cyan")))
-        summary_bits.append("rpm: %s" % c("%.1f" % s["usage_rpm"], "cyan"))
-    if s.get("live_known"):
-        live_bit = c(str(s["live_running"]), "green")
-        if s["live_waiting"]:
-            live_bit += c(" +%d wait" % s["live_waiting"], "yellow")
-        summary_bits.append("in-flight: %s" % live_bit)
     if settings["probe_backends"]:
         summary_bits.append(
             "backends up: %s/%s" % (
                 c(str(s["backends_up"]), "green"), s["backends_total"])
         )
     lines.append("  " + "   ".join(summary_bits))
+    if s.get("load_known"):
+        busy = s.get("models_busy") or 0
+        total = s.get("deployments_registered") or 0
+        head = c("지금 바쁜 모델: %d/%d" % (busy, total),
+                 "red" if s.get("models_saturated") else
+                 ("yellow" if busy else "green"))
+        bits = [head,
+                "처리 중 %s" % c(str(s.get("running") or 0), "green")]
+        q = s.get("queued") or 0
+        bits.append("대기 %s" % c(str(q), "red" if q else "dim"))
+        if s.get("kv_max_pct") is not None:
+            bits.append("KV 최대 %s"
+                        % c("%.0f%%" % s["kv_max_pct"],
+                            _util_color(s["kv_max_pct"] / 100.0)))
+        if s.get("busiest") and (s.get("models_busy") or 0):
+            bits.append(c("← %s (%s)" % (s["busiest"]["model_name"],
+                                         s["busiest"]["reason"]), "dim"))
+        lines.append("  " + "   ".join(bits))
+    if s.get("pods_failed"):
+        lines.append(c("  ! Pod %d 곳의 /metrics 조회 실패 (부하가 과소 집계될 수 있음)"
+                       % s["pods_failed"], "yellow"))
     lines.append("")
 
     ll = snap.get("litellm")
@@ -1533,9 +1831,17 @@ def render(snap, settings):
             #              + LB 뒤 backend Pod 개수
             merged = merge_deployments_with_health(ll)
             show_backends = snap.get("backend_count_enabled")
+            # 표시 순서: 부하 높은 순(기본). 스냅샷 자체는 이름순으로 두고
+            # 정렬은 렌더 단계에서만 한다(JSON 순서는 안정적으로 유지).
+            if snap.get("load_enabled") and settings.get("sort", "load") != "name":
+                merged = sorted(merged, key=lambda d: (
+                    -LOAD_RANK.get((d.get("load") or {}).get("state"), -1),
+                    -((d.get("load") or {}).get("waiting") or 0),
+                    -((d.get("load") or {}).get("running") or 0),
+                    str(d.get("model_name") or "").lower()))
             usage = snap.get("usage") or {}
             show_usage = bool(usage.get("models"))
-            show_live = bool(snap.get("live_metrics_enabled"))
+            show_load = bool(snap.get("load_enabled"))
             win = usage.get("window_hours") or 24
             if merged:
                 drows = []
@@ -1544,36 +1850,40 @@ def render(snap, settings):
                     row = [
                         c(d["status"], color),
                         d.get("model_name", "?"),
-                        d.get("type", "-"),
                     ]
+                    if show_load:
+                        row.append(_fmt_load(d))
+                        row.append(_fmt_running(d))
+                        row.append(_fmt_queue(d))
+                        row.append(_fmt_kv(d))
+                        row.append(_fmt_tput(d))
+                        row.append(_fmt_pods(d))
                     if show_backends:
                         row.append(_fmt_backends(d))
                     if show_usage:
                         row.append(_fmt_requests(d))
                         row.append(_fmt_rate(d))
-                    if show_live:
-                        row.append(_fmt_live(d))
-                        row.append(_fmt_kv(d))
-                    if show_backends:
-                        row.append(c(d.get("backend_source", "-"), "dim"))
+                    row.append(d.get("type", "-"))
                     row.append(d.get("api_base") or "-")
                     drows.append(row)
-                hdr = ["STATUS", "MODEL_NAME", "TYPE"]
+                hdr = ["STATUS", "MODEL_NAME"]
+                if show_load:
+                    hdr += ["LOAD", "RUN", "QUEUE", "KV%", "TOK/S", "PODS"]
                 if show_backends:
                     hdr.append("BACKENDS")
                 if show_usage:
                     hdr += ["REQ/%gH" % win, "RPM"]
-                if show_live:
-                    hdr += ["IN-FLIGHT", "KV%"]
-                if show_backends:
-                    hdr.append("SRC")
-                hdr.append("API_BASE")
-                title = ("  [Deployments] (/model/info api_base + /health status"
+                hdr += ["TYPE", "API_BASE"]
+                # 숫자 열은 우측 정렬(자릿수 비교가 쉬워진다)
+                aligns = ["l" if h not in ("RUN", "QUEUE", "KV%", "TOK/S", "PODS",
+                                           "BACKENDS")
+                          else "r" for h in hdr]
+                title = ("  [Deployments] (지금 부하 = 백엔드 엔진 게이지"
+                         + (" · Pod 별 /metrics, PODS=LB 면 단일 샘플" if show_load else "")
                          + (" + LB backend pods" if show_backends else "")
-                         + (" + usage" if show_usage else "")
-                         + (" + live" if show_live else "") + ")")
+                         + (" + 누적 usage" if show_usage else "") + ")")
                 lines.append(c(title, "bold"))
-                lines.append(indent(_table(hdr, drows), 2))
+                lines.append(indent(_table(hdr, drows, aligns), 2))
                 lines.append("")
             else:
                 # /model/info 가 없으면 /health 의 raw 엔드포인트라도 표시
@@ -1627,7 +1937,7 @@ def indent(text, n):
 # ----------------------------------------------------------------------------
 
 
-def demo_snapshot():
+def demo_snapshot(with_usage=False):
     snap = {
         "version": __version__,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1653,7 +1963,10 @@ def demo_snapshot():
                  "backends_ready": 3, "backends_desired": 3,
                  "backend_source": "endpointslice", "mode": "RawDeployment",
                  "scale_to_zero": False, "namespace": "kserve",
-                 "service": "qwen36-35b-predictor"},
+                 "service": "qwen36-35b-predictor",
+                 "backend_pods": [{"ip": "10.42.1.11", "port": 8080, "pod": "p-0"},
+                                  {"ip": "10.42.1.12", "port": 8080, "pod": "p-1"},
+                                  {"ip": "10.42.2.7", "port": 8080, "pod": "p-2"}]},
                 {"model_name": "SGlang-Qwen3.6-27B-FP8",
                  "underlying": "hosted_vllm/Qwen3.6-27B-FP8",
                  "api_base": "http://qwen36-27b-sglang.serving.svc:30000/v1",
@@ -1717,7 +2030,7 @@ def demo_snapshot():
          "url": "http://qwen3-32b-vllm.serving.svc:8000",
          "type": "vllm", "up": False, "models": [], "error": "connection error"},
     ]
-    # 사용량(요청 수/토큰) — 실제로는 LiteLLM /global/activity/model 등에서 온다.
+    # 누적 사용량(요청 수/토큰) — opt-in(--usage) 일 때만. 기본은 "지금 부하"만 본다.
     minutes = 24 * 60.0
     demo_usage = {
         "KServe-Qwen3.6-35B-A3B-FP8": (12840, 4820000, 0.0),
@@ -1732,7 +2045,7 @@ def demo_snapshot():
             "requests_per_min": round(req / minutes, 3),
             "tokens_per_min": round(tok / minutes, 1),
         }
-    snap["usage"] = {
+    snap["usage"] = None if not with_usage else {
         "source": "/global/activity/model (demo)",
         "granularity": "day",
         "window_hours": 24.0,
@@ -1749,27 +2062,49 @@ def demo_snapshot():
         },
         "errors": [],
     }
-    # 현재 부하(live) — 실제로는 백엔드 /metrics(vLLM/SGLang 게이지)에서 온다.
-    demo_live = {
-        "http://qwen36-35b-predictor.kserve.svc:8080": {
-            "engine": "vllm", "running": 7, "waiting": 2, "kv_cache_pct": 63.4},
-        "http://qwen36-27b-sglang.serving.svc:30000": {
-            "engine": "sglang", "running": 3, "waiting": 0, "kv_cache_pct": 28.9},
-        "http://qwen3-32b-vllm.serving.svc:8000": {
-            "engine": None, "running": None, "waiting": None, "kv_cache_pct": None,
-            "error": "connection error: [Errno 111] Connection refused"},
+    # 현재 부하 — 실제로는 Pod 마다 /metrics 를 읽어 aggregate 한 결과다.
+    # 데모도 같은 함수를 통과시켜(집계·등급 판정) 화면과 로직이 어긋나지 않게 한다.
+    demo_samples = {
+        # 3개 Pod 모두 붐비고 큐까지 쌓인 상태 -> FULL
+        "http://qwen36-35b-predictor.kserve.svc:8080": ("pods", [
+            {"url": "http://10.42.1.11:8080", "engine": "vllm", "running": 5,
+             "waiting": 3, "kv_cache_pct": 88.0, "throughput": 410.0},
+            {"url": "http://10.42.1.12:8080", "engine": "vllm", "running": 4,
+             "waiting": 2, "kv_cache_pct": 91.5, "throughput": 380.0},
+            {"url": "http://10.42.2.7:8080", "engine": "vllm", "running": 6,
+             "waiting": 4, "kv_cache_pct": 94.0, "throughput": 445.0},
+        ]),
+        # 여유 있게 처리 중 -> ok
+        "http://qwen36-27b-sglang.serving.svc:30000": ("pods", [
+            {"url": "http://10.42.3.4:30000", "engine": "sglang", "running": 2,
+             "waiting": 0, "kv_cache_pct": 31.0, "throughput": 120.0},
+        ]),
+        # scale-to-zero: Pod 가 없어 LB 로 찔러도 응답 없음 -> unknown
+        "http://qwen3-embd-predictor.kserve.svc:8080": ("lb-sample", [
+            {"url": "http://qwen3-embd-predictor.kserve.svc:8080",
+             "error": "connection error: [Errno 111] Connection refused"},
+        ]),
+        # DOWN 인 모델 -> unknown
+        "http://qwen3-32b-vllm.serving.svc:8000": ("lb-sample", [
+            {"url": "http://qwen3-32b-vllm.serving.svc:8000",
+             "error": "connection error: [Errno 111] Connection refused"},
+        ]),
     }
-    for base, live in demo_live.items():
-        live["url"] = base + "/metrics"
+    demo_load = {}
+    for base, (scope, samples) in demo_samples.items():
+        agg = aggregate_pod_loads(samples, scope)
+        agg["state"], agg["state_reason"] = classify_load(agg)
+        demo_load[base] = agg
 
     snap["litellm"]["groups"].sort(
         key=lambda g: str(g.get("model_group") or "").lower())
     snap["litellm"]["deployments"] = merge_deployments_with_health(snap["litellm"])
-    snap["litellm"]["deployments"] = attach_usage_to_deployments(
-        snap["litellm"], snap["usage"])
-    snap["litellm"]["deployments"] = attach_live_to_deployments(
-        snap["litellm"]["deployments"], demo_live)
-    snap["live_metrics_enabled"] = True
+    if snap["usage"]:
+        snap["litellm"]["deployments"] = attach_usage_to_deployments(
+            snap["litellm"], snap["usage"])
+    snap["litellm"]["deployments"] = attach_load_to_deployments(
+        snap["litellm"]["deployments"], demo_load)
+    snap["load_enabled"] = True
     snap["summary"] = summarize(snap)
     return snap
 
@@ -1900,6 +2235,15 @@ _DASHBOARD_HTML = r"""<!doctype html>
   .use.good .bar i{background:var(--up)} .use.warn .bar i{background:var(--warn)}
   .use.bad .bar i{background:var(--down)}
   .wait{font-family:var(--mono);font-size:11px;color:var(--warn)}
+  .load{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .load .lv{font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 8px;
+    border-radius:20px;border:1px solid transparent}
+  .load .why{font-size:11px;color:var(--faint)}
+  .lv.full{color:var(--down);background:rgba(248,81,73,.12);border-color:rgba(248,81,73,.35)}
+  .lv.busy{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
+  .lv.ok{color:var(--up);background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.28)}
+  .lv.idle{color:var(--faint);background:var(--surface2);border-color:var(--border)}
+  .lv.unk{color:var(--muted);background:var(--surface2);border-color:var(--border)}
   .idle{color:var(--faint)}
 
   .empty{color:var(--muted);padding:18px;text-align:center;font-style:italic}
@@ -1943,6 +2287,18 @@ _DASHBOARD_HTML = r"""<!doctype html>
           <option value="UP">UP</option>
           <option value="DOWN">DOWN</option>
           <option value="?">?</option>
+        </select>
+        <label for="f-load">load</label>
+        <select id="f-load">
+          <option value="">all</option>
+          <option value="busy">바쁨(BUSY+FULL)</option>
+          <option value="saturated">FULL</option>
+          <option value="idle">idle</option>
+        </select>
+        <label for="f-sort">sort</label>
+        <select id="f-sort">
+          <option value="load">부하순</option>
+          <option value="name">이름순</option>
         </select>
         <label for="f-type">type</label>
         <select id="f-type">
@@ -2032,27 +2388,76 @@ function rateCell(d){
     +html+'</div>';
 }
 
-// 지금 처리 중/대기 중인 요청 (백엔드 /metrics 게이지)
-function liveCell(d){
-  const l=d.live;
-  if(!l) return '<span class="srccol">-</span>';
-  if(l.error) return '<span class="srccol" title="'+esc(l.error)+'">? ⚠</span>';
-  if(l.running==null && l.waiting==null) return '<span class="srccol">?</span>';
-  let html='<span class="num">'+(l.running==null?"?":l.running)+'</span>';
-  if(l.waiting) html+='<span class="wait">+'+l.waiting+' wait</span>';
-  return '<div class="use '+(l.waiting?"warn":(l.running?"good":""))
-    +'" title="engine '+esc(l.engine||"?")+' · LB 뒤 Pod 1개 샘플">'+html+'</div>';
+// 지금 바쁜가 — 등급 + 근거
+const LOAD_LV = {saturated:["FULL","full"], busy:["BUSY","busy"],
+                 ok:["ok","ok"], idle:["idle","idle"], unknown:["?","unk"]};
+function podTip(l){
+  if(!l) return "";
+  const scope = l.scope==="pods"
+    ? ("Pod "+(l.pods_sampled||0)+"개 직접 조회")
+    : "LB 경유 1개 샘플 (Pod 주소 미확인)";
+  const rows=(l.per_pod||[]).map(p=> p.error
+    ? ((p.url||"")+" — "+p.error)
+    : ((p.url||"")+" — run "+(p.running!=null?p.running:"?")
+       +", queue "+(p.waiting!=null?p.waiting:"?")
+       +", kv "+(p.kv_cache_pct!=null?p.kv_cache_pct+"%":"?")));
+  return scope + (rows.length? ("\n"+rows.join("\n")) : "");
 }
-
-// KV 캐시 사용률 = GPU 메모리가 실제로 얼마나 물려 있는지
-function kvCell(d){
-  const l=d.live;
+function loadCell(d){
+  const l=d.load;
   if(!l) return '<span class="srccol">-</span>';
-  if(l.kv_cache_pct==null) return '<span class="srccol">?</span>';
+  const [label,cls] = LOAD_LV[l.state||"unknown"]||LOAD_LV.unknown;
+  let why = l.state_reason||"";
+  if(l.state==="unknown"){                    // 긴 에러는 줄이고 원문은 툴팁으로
+    const r=why.toLowerCase();
+    why = (r.includes("connection")||r.includes("timed out")) ? "연결 안 됨"
+        : (r.includes("게이지")||r.includes("metric")) ? "게이지 없음" : why.slice(0,28);
+  }
+  const tip = (l.state==="unknown" && l.state_reason ? l.state_reason+"\n" : "")+podTip(l);
+  return '<div class="load" title="'+esc(tip)+'">'
+    +'<span class="lv '+cls+'">'+label+'</span>'
+    +'<span class="why">'+esc(why)+'</span></div>';
+}
+function runCell(d){
+  const l=d.load||{};
+  if(l.running==null) return '<span class="srccol">?</span>';
+  return '<span class="mono"'+(l.running?'':' style="color:var(--faint)"')+'>'
+    +l.running+'</span>';
+}
+function queueCell(d){
+  const l=d.load||{};
+  if(l.waiting==null) return '<span class="srccol">?</span>';
+  if(!l.waiting) return '<span class="mono" style="color:var(--faint)">0</span>';
+  const cls = l.waiting>=5 ? "bad" : "warn";
+  return '<div class="use '+cls+'" title="지금 기다리고 있는 요청">'
+    +'<span class="num">'+l.waiting+'</span></div>';
+}
+// KV 캐시 사용률 = GPU 가 실제로 얼마나 물려 있는지 (Pod 중 최댓값)
+function kvCell(d){
+  const l=d.load;
+  if(!l || l.kv_cache_pct==null) return '<span class="srccol">'+(l?"?":"-")+'</span>';
   const pct=Math.min(100, Math.round(l.kv_cache_pct));
-  return '<div class="use '+utilCls(pct/100)+'" title="KV cache 사용률">'
+  const tip = l.kv_cache_avg_pct!=null
+    ? ("Pod 최대 "+l.kv_cache_pct+"% · 평균 "+l.kv_cache_avg_pct+"%") : "KV 사용률";
+  return '<div class="use '+utilCls(pct/100)+'" title="'+esc(tip)+'">'
     +'<span class="num">'+pct+'%</span>'
     +'<span class="bar"><i style="width:'+pct+'%"></i></span></div>';
+}
+function tputCell(d){
+  const l=d.load||{};
+  if(l.throughput==null)
+    return '<span class="srccol" title="두 번째 갱신부터 표시(카운터 차분)">-</span>';
+  return '<span class="mono">'+Math.round(l.throughput)+'</span>';
+}
+function podsCell(d){
+  const l=d.load;
+  if(!l) return '<span class="srccol">-</span>';
+  if(l.scope!=="pods")
+    return '<span class="srccol" style="color:var(--warn)" title="'+esc(podTip(l))
+      +'">LB</span>';
+  const bad=l.pods_failed||0, n=l.pods_sampled||0;
+  return '<span class="mono"'+(bad?' style="color:var(--warn)"':'')
+    +' title="'+esc(podTip(l))+'">'+(bad? (n+"/"+(n+bad)) : n)+'</span>';
 }
 
 function statusPill(s){
@@ -2085,6 +2490,23 @@ function render(snap){
   lastSnap = snap;
   // summary cards
   let cards = "";
+  if(s.load_known){
+    const busy=s.models_busy||0, sat=s.models_saturated||0;
+    cards += card("지금 바쁜 모델",
+      busy+'<span style="color:var(--faint);font-size:16px"> / '
+      +(s.deployments_registered||0)+'</span>',
+      sat?"bad":(busy?"warn":"good"),
+      s.busiest&&busy ? esc(s.busiest.model_name)+" · "+esc(s.busiest.reason||"")
+                      : "큐 없음 · 여유");
+    cards += card("처리 중", s.running||0, (s.running?"good":""),
+      "in-flight 요청 합");
+    cards += card("대기", s.queued||0, (s.queued?"bad":""),
+      s.queued? "지금 기다리는 요청" : "대기 없음");
+    if(s.kv_max_pct!=null)
+      cards += card("KV 최대", Math.round(s.kv_max_pct)+"%",
+        s.kv_max_pct>=95?"bad":(s.kv_max_pct>=80?"warn":"good"),
+        "가장 붐비는 Pod");
+  }
   cards += card("Model Groups", s.model_groups||0, "accent");
   cards += card("Registered", s.deployments_registered||0, "");
   cards += card("Running (healthy)", s.deployments_healthy||0, "good",
@@ -2112,35 +2534,55 @@ function render(snap){
   const showBk = !!snap.backend_count_enabled;
   const usage = snap.usage||{};
   const showUse = !!(usage.models && Object.keys(usage.models).length);
-  const showLive = !!snap.live_metrics_enabled;
+  const showLoad = !!snap.load_enabled;
   const win = usage.window_hours||24;
   const srcEl=$("#dep-src");
-  if(srcEl) srcEl.textContent = "/model/info api_base · /health status"
+  if(srcEl) srcEl.textContent = (showLoad ? "지금 부하 = 백엔드 엔진 게이지(Pod 별 /metrics) · " : "")
+    + "/model/info api_base · /health status"
     + (showBk ? " · k8s backend pods" : "")
-    + (showUse ? " · usage "+(usage.source||"") : "")
-    + (showLive ? " · live /metrics" : "");
+    + (showUse ? " · 누적 usage "+(usage.source||"") : "");
   const dt = $("#deployments");
   if(ll && ll.deployments && ll.deployments.length){
     const all = ll.deployments;
     const fS = $("#f-status").value, fT = $("#f-type").value;
+    const fL = $("#f-load") ? $("#f-load").value : "";
+    const sortBy = $("#f-sort") ? $("#f-sort").value : "load";
+    const RANK = {saturated:3, busy:2, ok:1, idle:0, unknown:-1};
     const merged = all.filter(d=>
-      (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT));
-    $("#f-count").textContent = (fS||fT)
+      (!fS || (d.status||"?")===fS) && (!fT || (d.type||"-")===fT)
+      && (!fL || (fL==="busy"
+            ? ["busy","saturated"].includes((d.load||{}).state)
+            : (d.load||{}).state===fL)));
+    // 기본은 부하순 — "지금 바쁜 것"이 항상 맨 위로 온다
+    if(showLoad && sortBy==="load") merged.sort((a,b)=>{
+      const ra=RANK[(a.load||{}).state]??-1, rb=RANK[(b.load||{}).state]??-1;
+      if(ra!==rb) return rb-ra;
+      const qa=(a.load||{}).waiting||0, qb=(b.load||{}).waiting||0;
+      if(qa!==qb) return qb-qa;
+      const na=(a.load||{}).running||0, nb=(b.load||{}).running||0;
+      if(na!==nb) return nb-na;
+      return String(a.model_name||"").localeCompare(String(b.model_name||""));
+    });
+    $("#f-count").textContent = (fS||fT||fL)
       ? merged.length+" / "+all.length : all.length+"";
-    let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
+    let head = "<tr><th>STATUS</th><th>MODEL_NAME</th>";
+    if(showLoad) head += '<th>LOAD</th><th class="num">RUN</th><th class="num">QUEUE</th>'
+      +'<th class="num">KV CACHE</th><th class="num">TOK/S</th><th class="num">PODS</th>';
     if(showBk) head += '<th>BACKENDS (ready/desired)</th>';
     if(showUse) head += '<th class="num">REQ ('+win+'h)</th><th class="num">RPM</th>';
-    if(showLive) head += '<th class="num">IN-FLIGHT</th><th class="num">KV CACHE</th>';
+    head += "<th>TYPE</th>";
     if(showBk) head += '<th>MODE</th><th>SRC</th>';
     head += "<th>API_BASE</th></tr>";
     dt.querySelector("thead").innerHTML = head;
     dt.querySelector("tbody").innerHTML = merged.length ? merged.map(d=>{
       let row = "<tr><td>"+statusPill(d.status||"?")+"</td>"
-        +'<td class="name">'+esc(d.model_name)+"</td>"
-        +'<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
+        +'<td class="name">'+esc(d.model_name)+"</td>";
+      if(showLoad) row += "<td>"+loadCell(d)+"</td><td>"+runCell(d)+"</td>"
+        +"<td>"+queueCell(d)+"</td><td>"+kvCell(d)+"</td>"
+        +"<td>"+tputCell(d)+"</td><td>"+podsCell(d)+"</td>";
       if(showBk) row += "<td>"+backendCell(d)+"</td>";
       if(showUse) row += "<td>"+reqCell(d)+"</td><td>"+rateCell(d)+"</td>";
-      if(showLive) row += "<td>"+liveCell(d)+"</td><td>"+kvCell(d)+"</td>";
+      row += '<td><span class="chip">'+esc(d.type||"-")+"</span></td>";
       if(showBk) row +=
         '<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(d.mode||"-")+"</td>"
         +'<td class="srccol">'+esc(d.backend_source||"-")+"</td>";
@@ -2154,6 +2596,11 @@ function render(snap){
   }
   let depErr = (ll && ll.errors && ll.errors.length)
     ? ll.errors.map(e=>'<div class="err">! '+esc(e)+'</div>').join("") : "";
+  if(s.pods_failed)
+    depErr += '<div class="note-banner" style="margin-top:8px">Pod '+s.pods_failed
+      +' 곳의 /metrics 조회 실패 — 부하가 과소 집계될 수 있습니다(PODS 열에 마우스를 올리면 원인).</div>';
+  if(snap.load_error)
+    depErr += '<div class="err">부하 수집 실패: '+esc(snap.load_error)+'</div>';
   if(!showUse && usage.errors && usage.errors.length)
     depErr += '<div class="note-banner" style="margin-top:8px">사용량(요청 수) 수집 실패 — '
       +'LiteLLM 분석 엔드포인트 응답 없음/권한 부족: '+esc(usage.errors.slice(0,2).join("; "))
@@ -2216,8 +2663,9 @@ function loop(){ if(window.__SNAPSHOT__) return;   // frozen: 폴링 안 함
   if($("#auto").checked){ timer=setInterval(tick, REFRESH_MS); } }
 $("#auto").addEventListener("change", ()=>{ loop(); if($("#auto").checked) tick(); });
 // 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더
-$("#f-status").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
-$("#f-type").addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+["#f-status","#f-type","#f-load","#f-sort"].forEach(sel=>{
+  const el=$(sel); if(el) el.addEventListener("change", ()=>{ if(lastSnap) render(lastSnap); });
+});
 tick(); loop();
 </script>
 </body>
@@ -2252,7 +2700,8 @@ def serve_dashboard(settings, host, port, interval, demo):
 
     def collect_once():
         # 메인 수집은 health 없이(빠름). backend 개수·모델 목록은 interval 마다 갱신.
-        snap = demo_snapshot() if demo else build_snapshot(settings, with_health=False)
+        snap = (demo_snapshot(settings.get("usage")) if demo
+                else build_snapshot(settings, with_health=False))
         snap["demo"] = bool(demo)
         if not demo and snap.get("litellm"):
             with hlock:
@@ -2374,7 +2823,7 @@ def clear_screen():
 
 
 def run_once(settings, as_json, demo):
-    snap = (demo_snapshot() if demo
+    snap = (demo_snapshot(settings.get("usage")) if demo
             else build_snapshot(settings, with_health=settings.get("health", True)))
     if as_json:
         print(json.dumps(snap, ensure_ascii=False, indent=2))
@@ -2402,13 +2851,17 @@ def main():
     p.add_argument("--no-health", action="store_true",
                    help="LiteLLM /health 호출 안 함 (status 는 k8s backend readiness 로 판정)")
     p.add_argument("--demo", action="store_true", help="샘플 데이터로 미리보기")
-    # 사용량 / 현재 부하
-    p.add_argument("--no-usage", action="store_true",
-                   help="모델별 사용량(요청 수/토큰) 수집 안 함")
+    # 현재 부하 / 누적 사용량
+    p.add_argument("--no-load", action="store_true",
+                   help="현재 부하(백엔드 엔진 게이지) 수집 안 함")
+    p.add_argument("--load-timeout", type=float,
+                   help="Pod /metrics 조회 타임아웃(초, 기본 3)")
+    p.add_argument("--sort", choices=("load", "name"), default="load",
+                   help="터미널 표 정렬: load(바쁜 순, 기본) | name")
+    p.add_argument("--usage", action="store_true",
+                   help="누적 사용량(요청 수/토큰) 열 추가 — LiteLLM DB 필요")
     p.add_argument("--usage-window", type=float,
-                   help="사용량 집계 구간(시간, 기본 24)")
-    p.add_argument("--probe-metrics", action="store_true",
-                   help="백엔드 /metrics 를 직접 읽어 현재 실행/대기 요청·KV 캐시 사용률 표시")
+                   help="누적 사용량 집계 구간(시간, 기본 24)")
     # 웹 UI
     p.add_argument("--serve", action="store_true",
                    help="웹 대시보드 모드 (브라우저로 조회)")
