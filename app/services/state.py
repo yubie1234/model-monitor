@@ -290,8 +290,19 @@ class Refresher:
             return None    # 전부 모름 — 직전 값 유지
         return loads, alias
 
+    def _load_period(self):
+        """부하 조회 주기. 기본은 스냅샷 갱신 주기와 같다("지금 바쁜가"는 빨리 낡는다).
+
+        MONITOR_LOAD_INTERVAL 로 따로 늘리면 Pod /metrics 팬아웃만 줄일 수 있다.
+        """
+        try:
+            v = float(self.settings.get("load_interval") or 0)
+        except (TypeError, ValueError):
+            v = 0
+        return max(1.0, v) if v > 0 else self.interval
+
     async def _load_loop(self):
-        """부하 수집 루프. 주기는 refresh interval — "지금 바쁜가"는 빨리 낡는다."""
+        """부하 수집 루프. 수집 -> 대기 순서라 첫 값은 시작 직후에 나온다."""
         while True:
             try:
                 got = await self._fetch_load()
@@ -302,7 +313,7 @@ class Refresher:
                 raise
             except Exception:  # noqa: BLE001
                 pass
-            await asyncio.sleep(self.interval)
+            await asyncio.sleep(self._load_period())
 
     async def start(self):
         """첫 스냅샷을 동기로 1회 채운 뒤(즉시 화면에 데이터), 백그라운드 루프 가동."""

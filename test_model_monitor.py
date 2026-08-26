@@ -2455,7 +2455,7 @@ def _settings_ns(**over):
         user_view=False, user_view_show_internal=False,
         user_view_cache_ttl=30.0, metrics=True, metrics_token=None,
         load=True, load_timeout=3.0, load_threads=12,
-        load_routing="least-busy",
+        load_routing="least-busy", load_interval=None,
         prometheus_url=None, prometheus_first=False, prometheus_lookback="2m",
         config_file=None,
     )

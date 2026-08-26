@@ -85,6 +85,11 @@ class Settings(BaseSettings):
     load: bool = Field(True, validation_alias=AliasChoices("MONITOR_LOAD"))
     # 죽은 Pod 하나가 사이클을 잡아먹지 않게 짧게. 한 라운드 최악 =
     # ceil(Pod수/load_threads) * load_timeout.
+    # 부하 조회 주기(초). 비우면 스냅샷 갱신 주기(MONITOR_INTERVAL)를 따른다.
+    # Pod 마다 /metrics 를 읽는 팬아웃이라, 백엔드 부담을 줄이려면 여기만 늘리면 된다
+    # (스냅샷 갱신은 그대로 두고).
+    load_interval: Optional[float] = Field(
+        None, validation_alias=AliasChoices("MONITOR_LOAD_INTERVAL"))
     load_timeout: float = Field(
         3.0, validation_alias=AliasChoices("MONITOR_LOAD_TIMEOUT"))
     load_threads: int = Field(
@@ -257,6 +262,9 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
         "load_threads": int(_pick(
             _env_set("MONITOR_LOAD_THREADS"),
             settings.load_threads, ld.get("threads"), 12)),
+        "load_interval": _pick(
+            _env_set("MONITOR_LOAD_INTERVAL"),
+            settings.load_interval, ld.get("interval"), None),
         "load_thresholds": ld.get("thresholds") or {},
         "load_routing": _pick(
             _env_set("MONITOR_LOAD_ROUTING"),
