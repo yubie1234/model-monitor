@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v1.2.0** — 관리자 일시중지(`model_info.blocked`) 를 `PAUSED` 로 구분 · 장애 원인·수집 신뢰도 가시화 · 대시보드 UX · 시스템 부하 개선
+**버전: v1.2.0** — **지금 부하**(backend 엔진 게이지로 "이 모델 지금 바쁜가") · 부하 조회 주기 분리(60초)와 수동 새로고침 · per-user 뷰 부하 노출 단계(`off`/`summary`/`detail`) · Pod 조회가 막힌 환경용 Prometheus 폴백
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
