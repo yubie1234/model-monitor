@@ -25,7 +25,6 @@ LiteLLM 누적 집계로는 알 수 없고, vLLM/SGLang 이 지금 이 순간 �
       안 접으면 TP=4 에서 실행 요청이 4배로 부풀려진다.
 """
 
-import threading
 import urllib.parse
 
 from app.core.http import http_get_json, http_get_text

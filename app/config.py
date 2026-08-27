@@ -83,8 +83,6 @@ class Settings(BaseSettings):
     # Pod 주소는 GPU 집계가 이미 받아오는 Pod 목록에서 나오므로 k8s 호출이 늘지 않고,
     # 백엔드에는 Pod 당 사이클마다 1회 GET 이 추가된다(응답은 보통 수십 KB).
     load: bool = Field(True, validation_alias=AliasChoices("MONITOR_LOAD"))
-    # 죽은 Pod 하나가 사이클을 잡아먹지 않게 짧게. 한 라운드 최악 =
-    # ceil(Pod수/load_threads) * load_timeout.
     # 부하 조회 주기(초). Pod 마다 /metrics 를 읽는 팬아웃이라 스냅샷 갱신(5s)과
     # 분리해 **60초**로 둔다 — 백엔드 부담을 낮추고, 급할 때는 대시보드의 수동
     # 새로고침 버튼(POST /api/load/refresh, 최소 간격 10s)으로 즉시 당겨 읽는다.
@@ -92,10 +90,12 @@ class Settings(BaseSettings):
     # 오해하지 않게).
     load_interval: float = Field(
         60.0, validation_alias=AliasChoices("MONITOR_LOAD_INTERVAL"))
+    # 죽은 Pod 하나가 라운드를 잡아먹지 않게 짧게. 한 라운드 최악 =
+    # ceil(Pod수 / Refresher._LOAD_PARALLEL) * load_timeout.
+    # 동시 조회 수는 설정이 아니라 상수다 — 공용 수집 스레드 예산(8)을 나눠 쓰는
+    # 값이라 임의로 올리면 다른 수집(스냅샷 빌드·유저뷰)이 굶는다.
     load_timeout: float = Field(
         3.0, validation_alias=AliasChoices("MONITOR_LOAD_TIMEOUT"))
-    load_threads: int = Field(
-        12, validation_alias=AliasChoices("MONITOR_LOAD_THREADS"))
     # Pod 직접 조회가 막힌 환경(NetworkPolicy·mTLS)에서 같은 게이지를 대신 읽을
     # 외부 Prometheus. 출처가 같아 정확도는 동일하고 스크레이프 주기만큼 늦다.
     prometheus_url: Optional[str] = Field(
@@ -261,9 +261,6 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
         "load_timeout": float(_pick(
             _env_set("MONITOR_LOAD_TIMEOUT"),
             settings.load_timeout, ld.get("timeout"), 3.0)),
-        "load_threads": int(_pick(
-            _env_set("MONITOR_LOAD_THREADS"),
-            settings.load_threads, ld.get("threads"), 12)),
         "load_interval": _pick(
             _env_set("MONITOR_LOAD_INTERVAL"),
             settings.load_interval, ld.get("interval"), 60.0),
