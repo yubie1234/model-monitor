@@ -161,11 +161,45 @@ env (`LITELLM_BASE_URL`, `LITELLM_API_KEY`, `MONITOR_*`) > config file (`MONITOR
 - **`product`** → `v<version>` — immutable release tag. **Fails the workflow if the tag already exists**, forcing a `__version__` bump before a product release.
 - **`develop`** → `v<version>-develop` — floating pre-release tag, **force-moved** to the latest commit on each develop merge (so it always points at the newest develop snapshot for that version).
 
-So: bump `__version__` for a product release; develop merges just re-point the `-develop` tag. Tag pushes don't re-trigger the branch workflow (no loop).
+Tag pushes don't re-trigger the branch workflow (no loop).
+
+### Version bump — REQUIRED on every merge into `develop` or `product`
+
+**Bump the version as part of the change, before the PR is opened.** This is a
+project rule, not a suggestion, and it applies to *every* merge into `develop` —
+not only product releases.
+
+Note what the automation does and does not catch, because it is asymmetric and
+has already let a mistake through:
+
+- `product` → the workflow **fails** if `v<version>` already exists. Enforced.
+- `develop` → the floating `v<version>-develop` tag is **force-moved**. A stale
+  version merges silently, and two develop snapshots then share one tag.
+- `TestVersionConsistency` compares **numbers only**, across the four files
+  below. Prose is never checked.
+
+So on `develop` nothing will stop you. Do the checklist by hand:
+
+1. **`app/__init__.py` `__version__`** — the single source of truth for the
+   *runtime*: Docker image tag (`ci.sh`/`push.sh` grep it), FastAPI app
+   `version`, the `version` field in `/api/snapshot`, `model_monitor_build_info`.
+   Feature → minor (`1.1.0` → `1.2.0`); fix-only → patch.
+2. **README header number** — `**버전: vX.Y.Z**` (manually mirrored, not derived).
+3. **`deploy/k8s.yaml`** — `app.kubernetes.io/version` label, **2 occurrences**.
+4. **README header prose** — the clause after the `—` on that same line
+   (`**버전: v1.2.0** — 지금 부하 · …`). It summarizes *that release's*
+   highlights, so **rewrite it to describe this release**. Changing only the
+   number on that line leaves the previous release's summary in place; every
+   test still passes and the README then describes the wrong release. This is
+   exactly the mistake that shipped in v1.2.0 — the line read "v1.2.0 — 관리자
+   일시중지…", which was v1.1.0's content.
+5. `python3 -m unittest` — `TestVersionConsistency` catches drift in 1–3 only.
+   Step 4 is on you: re-read the finished line and ask whether it describes the
+   work in *this* branch.
 
 ## Conventions
 
-- **Versioning:** `__version__` in `app/__init__.py` is the single source of truth for the *runtime* — it drives the Docker image tag (`ci.sh`/`push.sh` grep it), the FastAPI app `version`, the `version` field in `/api/snapshot`, and `model_monitor_build_info`. But two files carry a **manually-mirrored copy** that is *not* auto-derived and must be bumped by hand alongside it: the README header (`**버전: vX.Y.Z**`) and `deploy/k8s.yaml`'s `app.kubernetes.io/version` label (**2 occurrences**). `TestVersionConsistency` (in `test_model_monitor.py`) fails if any of these drift from `__version__` — run `python3 -m unittest` after a bump. **The test compares numbers only.** The README header line also carries a prose summary of that release's highlights (`**버전: v1.2.0** — 지금 부하 · …`); bumping the number while leaving the previous release's summary passes every test and ships a README that describes the wrong release. Rewrite that clause as part of the bump.
+- **Versioning:** every merge into `develop`/`product` requires a version bump across **four places** (`__version__`, README header number, `deploy/k8s.yaml` ×2) **plus the README header's prose summary** — see [Version bump](#version-bump--required-on-every-merge-into-develop-or-product) under Branch strategy for the checklist and what the tests do *not* catch. Don't open a PR without it.
 - **Schemas vs. dicts:** the snapshot is built and tested as plain dicts; `schemas/snapshot.py` Pydantic models only document/validate at the API boundary (all fields Optional, `extra="allow"` so nothing is dropped). Don't push Pydantic into the collectors.
 ### Per-user view cost
 `filter_snapshot_for_user` **filters before it copies**. It used to `deepcopy` the whole snapshot and then filter, which made the cost proportional to the *total* deployment count regardless of what the key could see — paid once per poll per user (measured: 1000 deployments / 50 accessible, 13.7ms → 0.24ms; 5.5× even at full access). The tradeoff is that isolation is no longer automatic: anything carried over from the shared snapshot must be deep-copied if it is a container, or every user's view aliases the one snapshot every other request reads. Two regression tests pin that (mutate the view, assert the global is byte-identical; assert nested `gpu_products` dicts are not shared). Do not "optimize" this into a cross-user cache — `backend_ref` is salted per user (`sha256(admin_key + key)`) precisely so two users cannot correlate their views, so a shared cache would either break that or need the salt applied after the shared work.
