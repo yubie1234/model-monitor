@@ -146,7 +146,12 @@ def _backend_ref(d, seed=None):
     return hashlib.sha256((salt + basis).encode("utf-8")).hexdigest()[:8]
 
 
-def _redact_deployment_for_user(d, ref_seed=None):
+# per-user 뷰의 부하 노출 단계. 정식 값은 config.normalize_user_load 가 만든다 —
+# 여기서는 모르는 값이 흘러와도 **더 적게 보여주는 쪽**(summary)으로 떨어뜨린다.
+USER_LOAD_MODES = ("off", "summary", "detail")
+
+
+def _redact_deployment_for_user(d, ref_seed=None, load_mode="detail"):
     """per-user 뷰에서 내부 토폴로지(api_base/underlying/namespace/내부 URL)를 떼고
     상태·종류·backend Pod 수만 남긴다(비-admin 에 클러스터 구조 비노출).
     백엔드 식별은 익명 backend_ref 로만 제공한다."""
@@ -175,30 +180,61 @@ def _redact_deployment_for_user(d, ref_seed=None):
     # 지금 부하도 내부 토폴로지가 아니라 "지금 이 모델을 쓸 수 있나"의 답이라 남긴다.
     # 단 **평탄한 스칼라로만** — load dict 안의 per_pod 에는 조회한 Pod 주소가 들어
     # 있어 그대로 넘기면 클러스터 내부가 새어 나간다. 사유도 원문 대신 정규화 코드로.
+    #
+    # 어디까지 보여줄지는 운영자가 정한다(load_mode):
+    #   off     — 키 자체를 만들지 않는다. 대시보드에서도 컬럼이 사라진다.
+    #   summary — 등급 + 사유 코드 + 부분표본 여부만. 사용자의 질문에는 답하되
+    #             처리중/대기/KV/표본 수 같은 운영 수치는 내보내지 않는다.
+    #   detail  — 아래 수치까지(그래도 per_pod/Pod 주소는 절대 나가지 않는다).
     lo = d.get("load")
-    if isinstance(lo, dict) and lo.get("state"):
+    if load_mode != "off" and isinstance(lo, dict) and lo.get("state"):
         out["load_state"] = lo["state"]
         code = load_reason_code(lo)
         if code:
             out["load_reason_code"] = code
-        elif lo.get("state_reason"):
-            # 정상 등급의 근거("대기 9건")는 숫자와 상태뿐이라 그대로 보여도 된다.
+        elif lo.get("state_reason") and load_mode == "detail":
+            # 정상 등급의 근거("대기 9건")는 숫자와 상태뿐이라 detail 에서는 그대로.
+            # summary 에서는 이것도 수치라 뺀다 — 등급만 남기는 것이 이 모드의 뜻이다.
             out["load_reason"] = lo["state_reason"]
-        if lo.get("scope"):
-            out["load_scope"] = lo["scope"]
-        # 값이 없는 항목은 키 자체를 만들지 않는다 — 무조건 None 을 넣으면
-        # "측정했는데 0" 과 "모름" 이 구분되지 않는다(blocked 와 같은 이유).
-        for src, dst in (("running", "load_running"), ("waiting", "load_waiting"),
-                         ("kv_cache_pct", "load_kv_pct"),
-                         ("pods_sampled", "load_pods_sampled"),
-                         ("pods_failed", "load_pods_failed")):
-            if lo.get(src) is not None:
-                out[dst] = lo[src]
+        if load_mode == "detail":
+            if lo.get("scope"):
+                out["load_scope"] = lo["scope"]
+            # 값이 없는 항목은 키 자체를 만들지 않는다 — 무조건 None 을 넣으면
+            # "측정했는데 0" 과 "모름" 이 구분되지 않는다(blocked 와 같은 이유).
+            for src, dst in (("running", "load_running"),
+                             ("waiting", "load_waiting"),
+                             ("kv_cache_pct", "load_kv_pct"),
+                             ("pods_sampled", "load_pods_sampled"),
+                             ("pods_failed", "load_pods_failed")):
+                if lo.get(src) is not None:
+                    out[dst] = lo[src]
+        elif lo.get("pods_failed"):
+            # summary 라도 "일부 Pod 을 못 읽고 낸 등급" 이라는 사실은 남긴다 —
+            # 표본 수(수치) 대신 불리언으로. 불완전한 값을 완전한 척 보여주지 않는다.
+            out["load_partial"] = True
+    return out
+
+
+# 스냅샷 최상위의 부하 관련 키. load_mode="off" 면 통째로 빠진다 —
+# load_enabled 가 대시보드의 LOAD 컬럼 스위치라 이것만 내려도 화면에서 사라진다.
+_LOAD_TOP_KEYS = ("load_enabled", "load_routing", "load_ts_epoch",
+                  "load_interval")
+
+
+def _slim_load(lo):
+    """show_internal 뷰용 summary 축약 — 등급만 남기고 수치/Pod 은 버린다."""
+    if not isinstance(lo, dict) or not lo.get("state"):
+        return None
+    out = {"state": lo["state"], "per_pod": []}
+    if load_reason_code(lo):
+        out["state_reason"] = lo.get("state_reason") or ""
+    if lo.get("pods_failed"):
+        out["partial"] = True
     return out
 
 
 def filter_snapshot_for_user(global_snap, access, hide_internal=True,
-                             ref_seed=None):
+                             ref_seed=None, load_mode="detail"):
     """global 스냅샷을 사용자가 접근 가능한 모델로 필터한 per-user 뷰를 만든다.
 
     핵심: 상태·Pod 수는 **deployment 단위라 키와 무관** → global 값을 그대로 join 하고,
@@ -215,6 +251,9 @@ def filter_snapshot_for_user(global_snap, access, hide_internal=True,
     실측: 배포 1000개 중 50개 접근 가능한 사용자 13.9ms -> 0.21ms.
     """
     accessible = set(access.get("accessible") or [])
+    # 모르는 값이 흘러와도 더 적게 보여주는 쪽으로 (정식화는 config 계층의 몫).
+    if load_mode not in USER_LOAD_MODES:
+        load_mode = "summary"
 
     def _cp(v):
         """global 과 객체를 공유하지 않게: 컨테이너만 deepcopy, 스칼라는 그대로."""
@@ -230,6 +269,8 @@ def filter_snapshot_for_user(global_snap, access, hide_internal=True,
         if k == "summary":
             snap[k] = None               # 아래에서 필터 결과로 재계산 (자리만 예약)
             continue
+        if load_mode == "off" and k in _LOAD_TOP_KEYS:
+            continue                     # 부하 비노출: 갱신 시각·주기까지 안 준다
         if k != "litellm":
             snap[k] = _cp(v)
             continue
@@ -249,9 +290,21 @@ def filter_snapshot_for_user(global_snap, access, hide_internal=True,
                 if d.get("model_name") in accessible]
         # 리댁션은 새 dict 를 만들고 값이 전부 스칼라라 별도 복사가 필요 없다.
         # hide_internal=False(관리자 의도)면 원본 행을 쓰므로 deepcopy 가 필수다.
-        new_ll["deployments"] = ([_redact_deployment_for_user(d, ref_seed)
-                                  for d in deps]
-                                 if hide_internal else copy.deepcopy(deps))
+        if hide_internal:
+            new_ll["deployments"] = [
+                _redact_deployment_for_user(d, ref_seed, load_mode) for d in deps]
+        else:
+            # show_internal 뷰는 원본 행을 그대로 쓰므로 deepcopy 가 필수다.
+            # 부하 단계는 여기서도 지킨다 — "내부까지 보여준다"와 "부하를 어디까지
+            # 보여준다"는 별개의 결정이고, 운영자가 off/summary 를 골랐으면 그 뜻이다.
+            rows = copy.deepcopy(deps)
+            if load_mode != "detail":
+                for r in rows:
+                    lo = r.pop("load", None)
+                    slim = _slim_load(lo) if load_mode == "summary" else None
+                    if slim:
+                        r["load"] = slim
+            new_ll["deployments"] = rows
         new_ll["groups"] = copy.deepcopy(
             [g for g in (ll.get("groups") or [])
              if g.get("model_group") in accessible])

@@ -572,8 +572,11 @@ function downTip(d){
 function renderLoadAge(snap){
   const btn=$("#load-refresh"), lbl=$("#load-age");
   if(!btn||!lbl) return;
+  // 즉시 갱신은 백엔드 팬아웃을 유발해 admin 전용이다(서버가 403). 비-admin 키에
+  // 버튼만 보이면 눌러도 실패하는 UI 가 되므로 아예 숨긴다. 나이 표시는 남긴다.
   const on = !!snap.load_enabled && !snap.demo;
-  btn.hidden = !on; lbl.hidden = !on;
+  const mayRefresh = on && (!snap.user_view || !!snap.admin_view);
+  btn.hidden = !mayRefresh; lbl.hidden = !on;
   if(!on) return;
   const ts = snap.load_ts_epoch;
   if(ts==null){ lbl.textContent="부하 수집 대기"; lbl.classList.remove("stale"); return; }
@@ -801,6 +804,8 @@ function loadOf(d){
           state_reason:d.load_reason||LOAD_CODE_TEXT[d.load_reason_code]||"",
           running:d.load_running, waiting:d.load_waiting, kv_cache_pct:d.load_kv_pct,
           pods_sampled:d.load_pods_sampled||0, pods_failed:d.load_pods_failed||0,
+          // summary 모드는 표본 수 대신 불리언만 온다(수치 비노출).
+          partial:!!d.load_partial,
           scope:d.load_scope, per_pod:[]};
 }
 const LOAD_LV = {saturated:["FULL","full"], busy:["BUSY","busy"],
@@ -835,7 +840,9 @@ function podTip(l, uHide){
 // 일부 Pod 만 응답했으면 그 사실을 등급 옆에 적는다 — 숫자의 근거를 숨기지 않는다.
 function partialNote(l){
   const bad=(l||{}).pods_failed||0;
-  if(!bad) return "";
+  // 표본 수를 안 주는 모드(per-user summary)에서도 "일부만 보고 낸 등급"이라는
+  // 사실은 숨기지 않는다 — 불완전한 값을 완전한 척 보여주지 않는 것이 우선이다.
+  if(!bad) return (l||{}).partial ? " (일부 Pod)" : "";
   const ok=l.pods_sampled||0;
   return " ("+ok+"/"+(ok+bad)+" Pod)";
 }
@@ -1188,7 +1195,10 @@ function render(snap){
   lastSnap = snap;
   // summary cards
   let cards = "";
-  if(s.load_known){
+  // 등급 카드와 수치 카드의 게이트는 **다르다**. per-user 뷰의 summary 모드는
+  // 등급만 오고 처리중/대기/KV 는 오지 않는다 — 한 플래그로 묶으면 그 모드에서
+  // 카드가 통째로 사라져 "부하를 아예 모른다"처럼 보인다.
+  if(s.load_state_known || s.load_known){
     const busy=s.models_busy||0, sat=s.models_saturated||0;
     cards += card("지금 바쁜 모델",
       busy+'<span style="color:var(--faint);font-size:16px"> / '
@@ -1196,6 +1206,8 @@ function render(snap){
       sat?"bad":(busy?"warn":"good"),
       s.busiest ? esc(s.busiest.model_name)+" · "+esc(s.busiest.reason||"")
                 : "큐 없음 · 여유");
+  }
+  if(s.load_known){
     cards += card("처리 중", s.running||0, (s.running?"good":""), "in-flight 요청 합");
     cards += card("대기", s.queued||0, (s.queued?"bad":""),
       s.queued? "지금 기다리는 요청" : "대기 없음");

@@ -127,6 +127,14 @@ tok/s · 등급(idle/ok/BUSY/FULL)을 deployment 행에 붙인다. Pod 주소는
   하나**이므로 보는 사람이 늘어도 백엔드 조회는 늘지 않는다.
 - per-user 뷰에는 평탄한 스칼라(`load_state`/`load_running`/...)로만 나간다 — `per_pod` 에 Pod 주소가
   있어 그대로 넘기면 내부가 샌다. 사유도 원문 대신 정규화 코드(`load_reason_code`).
+  **노출 단계는 설정**(`MONITOR_USER_VIEW_LOAD` / `user_view.load`): `off`(키 자체 없음 + 최상위
+  `load_enabled` 등 `_LOAD_TOP_KEYS` 도 제거 → 대시보드 LOAD 컬럼이 사라진다) / `summary`(등급 +
+  `load_reason_code` + `load_partial` 불리언만) / `detail`(수치까지). **기본은 `summary`** — 오타 등
+  모르는 값도 `summary` 로 떨어진다(`config.normalize_user_load`, fail-safe 방향). 화면에서 가리는
+  것이 아니라 **서버에서 빼는 것**이고, `show_internal` 뷰(원본 행)에도 같은 규칙이 적용된다
+  (`_slim_load`). `summarize` 의 **`load_state_known` 은 `load_known`(수치)과 분리**돼 있다 —
+  summary 모드는 수치가 없어 한 플래그로 묶으면 등급 카드까지 사라진다. `⟳ 부하`(수동 갱신)는
+  백엔드 팬아웃이라 admin 전용이고 비-admin 화면에서는 버튼 자체를 숨긴다.
 
 ### Per-user (key) view — `MONITOR_USER_VIEW=true` (off by default; demo disables it)
 "Key-required mode": the user enters their own LiteLLM key (header `X-LiteLLM-Key` only — never query/logs/server-store; browser `sessionStorage`). `POST /api/snapshot/user` filters the shared snapshot per key via `services/user_access.filter_snapshot_for_user` (access set from that key's `GET /v1/models`, cached with a short TTL in `AccessCache` — sha256 of the key, success-only). A normal key sees only its models with internal `api_base`/namespace **redacted**; the admin key (= the monitor's own `api_key`, constant-time compared in `auth.is_admin_key`) sees the full view + exports. **fail-closed**: an invalid key never falls back to global. When on, `GET /api/snapshot` is 403-locked and `/snapshot.json`, `/snapshot.html`, `/metrics` require the admin key header. Template placeholder `__USER_VIEW__` is injected by `web/routes.load_dashboard_html` (alongside `__INTERVAL_MS__`).

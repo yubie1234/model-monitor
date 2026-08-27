@@ -197,6 +197,23 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   (폴링 주기 × 사용자 수만큼 반복). 실측: 배포 1000개 중 50개 접근 사용자 **13.7ms → 0.24ms**,
   전체 접근이어도 **5.5배**. 남기는 값은 컨테이너면 deepcopy 해 공유 스냅샷과 객체를 공유하지
   않습니다(뷰를 변형해도 다른 사용자 뷰가 깨지지 않음 — 회귀 테스트로 고정).
+- **지금 부하 노출 단계 (v1.2.0)**: `MONITOR_USER_VIEW_LOAD`(= config `user_view.load`) 로
+  **off / summary / detail** 중 고릅니다(기본 `summary`).
+
+  | 값 | 사용자에게 보이는 것 | 쓰임 |
+  | --- | --- | --- |
+  | `off` | 없음 — LOAD 컬럼·부하 카드가 사라집니다 | 사용자에게 부하를 아예 알리지 않을 때 |
+  | `summary` | 등급만 (`idle`/`ok`/`BUSY`/`FULL`/`?`) + `?` 의 사유 코드 | "지금 쓸 수 있나"에는 답하되 운영 수치는 감출 때 (**기본**) |
+  | `detail` | 등급 + 처리 중/대기/KV·표본 수 | 사용자도 수치를 봐야 할 때(사내 팀 등) |
+
+  - 이건 **서버에서 값을 빼는 것**이지 화면에서 가리는 것이 아닙니다 — `POST /api/snapshot/user`
+    응답을 직접 열어도 없는 값은 없습니다.
+  - `summary` 라도 일부 Pod 을 못 읽고 낸 등급이면 `(일부 Pod)` 로 표시합니다(표본 수는 숨긴 채) —
+    불완전한 값을 완전한 척 보여주지 않습니다.
+  - 어느 모드에서도 **Pod 주소(`per_pod`)는 나가지 않습니다**. 오타 등 모르는 값은 `detail` 이
+    아니라 `summary` 로 떨어집니다(과다 노출 쪽으로 실패하지 않게).
+  - `MONITOR_LOAD=false`(수집 자체 off)면 이 값도 자동으로 `off` 입니다.
+  - `⟳ 부하`(즉시 갱신)는 백엔드 팬아웃을 유발하므로 **admin 키에만** 보입니다.
 - **접근 캐시**: 같은 키의 `/v1/models` 결과를 **짧은 TTL(기본 30s)** 캐시해 폴링 중복 호출을 제거
   (해시만 보관, 원문 키 비저장). 성공만 캐시 → 무효 키는 매번 재검증. 취소/만료 키는 최대 TTL 동안 stale.
   config `user_view.cache_ttl` 로 조절.
@@ -308,6 +325,7 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_METRICS_TOKEN` | 키 필수 모드에서 `/metrics` 스크레이프용 Bearer 토큰 (미설정=admin 키만) |
 | `MONITOR_USER_VIEW` | 키 필수(per-user) 모드 — 키 입력해야 조회, admin 키는 전체 뷰 (false) |
 | `MONITOR_USER_VIEW_SHOW_INTERNAL` | per-user 뷰에서 내부 api_base/namespace 도 표시 (false=숨김) |
+| `MONITOR_USER_VIEW_LOAD` | per-user 뷰에 **지금 부하**를 어디까지 보여줄지 — `off` \| `summary` \| `detail` (**기본 `summary`**). `off`=아예 안 보냄(LOAD 컬럼도 사라짐), `summary`=등급(idle/ok/BUSY/FULL/?)만, `detail`=처리중/대기/KV 수치까지. 어느 모드든 **Pod 주소는 나가지 않는다**. `MONITOR_LOAD=false` 면 자동으로 `off` |
 | `MONITOR_USER_VIEW_CACHE_TTL` | 키별 접근(/v1/models) 캐시 TTL 초 (30) |
 | `MONITOR_K8S_API_SERVER` / `MONITOR_K8S_TOKEN_FILE` / `MONITOR_K8S_CA_FILE` | k8s 접근 오버라이드 |
 | `MONITOR_K8S_INSECURE` / `MONITOR_K8S_TIMEOUT` | k8s API TLS 검증 비활성 / 타임아웃 초 (false / 5) |

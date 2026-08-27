@@ -39,9 +39,11 @@ from app.services import user_access as _ua
 # 나머지 테스트는 돌아가도록 import 를 보호하고, 없으면 해당 클래스만 skip 한다.
 try:
     from app.config import build_collector_settings as _build_cs
+    from app.config import normalize_user_load as _norm_uload
     _HAS_PYDANTIC = True
 except Exception:  # pragma: no cover - web 스택 미설치 환경
     _build_cs = None
+    _norm_uload = None
     _HAS_PYDANTIC = False
 
 m = types.SimpleNamespace(
@@ -89,6 +91,7 @@ m = types.SimpleNamespace(
     SnapshotStore=_state.SnapshotStore,
     Refresher=_state.Refresher,
     build_collector_settings=_build_cs,
+    normalize_user_load=_norm_uload,
     _deployment_health_safe=_ll._deployment_health_safe,
     select_health_check_models=_ll.select_health_check_models,
     health_check_allowed_bases=_ll.health_check_allowed_bases,
@@ -2453,7 +2456,8 @@ def _settings_ns(**over):
         k8s_api_server=None, k8s_token_file="/t/token", k8s_ca_file="/t/ca",
         k8s_insecure=False, k8s_timeout=5.0,
         user_view=False, user_view_show_internal=False,
-        user_view_cache_ttl=30.0, metrics=True, metrics_token=None,
+        user_view_cache_ttl=30.0, user_view_load="summary",
+        metrics=True, metrics_token=None,
         load=True, load_timeout=3.0,
         load_routing="least-busy", load_interval=60.0,
         prometheus_url=None, prometheus_first=False, prometheus_lookback="2m",
@@ -3394,6 +3398,164 @@ class TestPerUserLoadRedaction(unittest.TestCase):
         self.assertTrue(s["load_known"])
         self.assertEqual((s["running"], s["queued"]), (4, 2))
         self.assertEqual(s["models_busy"], 1)
+
+
+class TestPerUserLoadModes(unittest.TestCase):
+    """per-user 뷰의 부하 노출 단계(off/summary/detail) — 설정으로 고른다.
+
+    이 선택은 **서버에서 실제로 값을 빼는 것**이어야 한다. 화면에서만 가리면
+    사용자가 /api/snapshot/user 응답을 직접 열어 그대로 볼 수 있다.
+    """
+
+    LOAD = {"state": "busy", "state_reason": "대기 2건", "running": 4,
+            "waiting": 2, "kv_cache_pct": 88.0, "kv_cache_avg_pct": 70.0,
+            "scope": "pods", "pods_sampled": 2, "pods_failed": 1,
+            "throughput": 120.5,
+            "per_pod": [{"url": "http://10.42.1.11:8080", "running": 4}]}
+
+    def _row(self, load=None):
+        return {"model_name": "A", "api_base": "http://a.ns.svc:8080/v1",
+                "namespace": "ns", "service": "svc", "status": "UP",
+                "backends_ready": 2, "load": copy.deepcopy(load or self.LOAD)}
+
+    def _view(self, mode, hide_internal=True):
+        snap = {"litellm": {"deployments": [self._row()], "groups": [],
+                            "models": ["A"], "health": None},
+                "backends": [], "load_enabled": True, "load_routing": "least-busy",
+                "load_ts_epoch": 1000.0, "load_interval": 60.0}
+        return _ua.filter_snapshot_for_user(
+            snap, {"accessible": ["A"], "key_info": {}},
+            hide_internal, "seed", mode)
+
+    # --- off ---------------------------------------------------------------
+    def test_off_removes_every_load_field(self):
+        v = self._view("off")
+        d = v["litellm"]["deployments"][0]
+        self.assertEqual([k for k in d if k.startswith("load")], [])
+        # 최상위 스위치도 빠져야 대시보드에서 LOAD 컬럼이 사라진다.
+        for k in ("load_enabled", "load_routing", "load_ts_epoch", "load_interval"):
+            self.assertNotIn(k, v)
+        # summary 블록의 load_* 집계 카운터(전부 0/False)는 남지만, 그건 "아는 게
+        # 없다"는 사실 자체라 노출이 아니다. 실제 값이 새지 않았는지만 못박는다.
+        blob = json.dumps(v["litellm"], ensure_ascii=False)
+        self.assertNotIn("load", blob)
+        self.assertNotIn("10.42.1.11", blob)
+
+    def test_off_applies_to_show_internal_view_too(self):
+        # "내부까지 보여준다"와 "부하를 보여준다"는 별개의 결정이다.
+        v = self._view("off", hide_internal=False)
+        self.assertNotIn("load", v["litellm"]["deployments"][0])
+
+    # --- summary -----------------------------------------------------------
+    def test_summary_keeps_grade_only(self):
+        d = self._view("summary")["litellm"]["deployments"][0]
+        self.assertEqual(d["load_state"], "busy")
+        for k in ("load_running", "load_waiting", "load_kv_pct",
+                  "load_pods_sampled", "load_pods_failed", "load_scope",
+                  "load_reason"):
+            self.assertNotIn(k, d, k + " 는 summary 에서 나가면 안 된다")
+
+    def test_summary_keeps_partial_sample_flag_without_numbers(self):
+        # 일부 Pod 을 못 읽고 낸 등급이라는 사실은 남긴다 — 표본 수는 빼고.
+        d = self._view("summary")["litellm"]["deployments"][0]
+        self.assertIs(d["load_partial"], True)
+        self.assertNotIn("load_pods_failed", d)
+
+    def test_summary_explains_unknown_with_a_code(self):
+        # 등급이 '?' 일 때 이유가 없으면 사용자는 고장으로 읽는다.
+        snap = {"litellm": {"deployments": [self._row(
+                    {"state": "unknown", "scope": "skipped",
+                     "error": "깨울 위험(serverless/scale-to-zero) — 조회 생략",
+                     "pods_sampled": 0, "pods_failed": 0, "per_pod": []})],
+                            "groups": [], "models": ["A"], "health": None},
+                "backends": [], "load_enabled": True}
+        v = _ua.filter_snapshot_for_user(
+            snap, {"accessible": ["A"], "key_info": {}}, True, "seed", "summary")
+        d = v["litellm"]["deployments"][0]
+        self.assertEqual(d["load_reason_code"], "skipped_wake_risk")
+        self.assertNotIn("load_reason", d)      # 원문은 여전히 안 나간다
+
+    def test_summary_still_fills_the_busy_card(self):
+        # summary 는 수치가 없다 -> load_known 은 False 지만 등급 카드는 살아야 한다.
+        s = self._view("summary")["summary"]
+        self.assertFalse(s["load_known"])
+        self.assertTrue(s["load_state_known"])
+        self.assertEqual(s["models_busy"], 1)
+        self.assertEqual((s["running"], s["queued"]), (0, 0))
+
+    def test_summary_show_internal_view_is_slimmed_too(self):
+        d = self._view("summary", hide_internal=False)["litellm"]["deployments"][0]
+        self.assertEqual(d["load"]["state"], "busy")
+        self.assertNotIn("running", d["load"])
+        self.assertEqual(d["load"]["per_pod"], [])
+        self.assertNotIn("10.42.1.11", json.dumps(d, ensure_ascii=False))
+
+    # --- detail ------------------------------------------------------------
+    def test_detail_keeps_numbers_but_never_pod_addresses(self):
+        d = self._view("detail")["litellm"]["deployments"][0]
+        self.assertEqual((d["load_running"], d["load_waiting"]), (4, 2))
+        self.assertEqual(d["load_kv_pct"], 88.0)
+        self.assertNotIn("10.42.1.11",
+                         json.dumps(self._view("detail"), ensure_ascii=False))
+
+    def test_unknown_mode_falls_back_to_summary_not_detail(self):
+        # 오타가 과다 노출로 이어지면 안 된다.
+        d = self._view("detaill")["litellm"]["deployments"][0]
+        self.assertEqual(d["load_state"], "busy")
+        self.assertNotIn("load_running", d)
+
+    def test_view_does_not_alias_the_shared_snapshot(self):
+        # 리댁션 경로가 바뀌었으므로 격리 회귀를 다시 못박는다.
+        snap = {"litellm": {"deployments": [self._row()], "groups": [],
+                            "models": ["A"], "health": None},
+                "backends": [], "load_enabled": True}
+        before = json.dumps(snap, ensure_ascii=False, sort_keys=True)
+        v = _ua.filter_snapshot_for_user(
+            snap, {"accessible": ["A"], "key_info": {}}, False, "seed", "summary")
+        v["litellm"]["deployments"][0]["load"]["state"] = "MUTATED"
+        self.assertEqual(json.dumps(snap, ensure_ascii=False, sort_keys=True), before)
+
+
+@unittest.skipUnless(_HAS_PYDANTIC, "pydantic 미설치")
+class TestUserLoadSetting(unittest.TestCase):
+
+    def test_aliases(self):
+        for v in ("off", "OFF", "false", "none", "0", "hide"):
+            self.assertEqual(m.normalize_user_load(v), "off")
+        for v in ("summary", "state", "basic"):
+            self.assertEqual(m.normalize_user_load(v), "summary")
+        for v in ("detail", "detailed", "full", "true", "on", "1"):
+            self.assertEqual(m.normalize_user_load(v), "detail")
+
+    def test_unknown_and_none_fall_back_to_summary(self):
+        self.assertEqual(m.normalize_user_load("nonsense"), "summary")
+        self.assertEqual(m.normalize_user_load(None), "summary")
+
+    def test_default_is_summary_and_load_off_forces_off(self):
+        c = m.build_collector_settings(_settings_ns())
+        self.assertEqual(c["user_view_load"], "summary")
+        # 부하 수집 자체가 꺼지면 노출 단계도 접힌다(env 로 꺼야 반영된다 —
+        # _pick 은 env 가 명시됐을 때만 Settings 값을 본다).
+        with mock.patch.dict(os.environ, {"MONITOR_LOAD": "false"}):
+            c = m.build_collector_settings(_settings_ns(load=False,
+                                                        user_view_load="detail"))
+        self.assertEqual(c["user_view_load"], "off")
+
+    def test_env_beats_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                         encoding="utf-8") as f:
+            json.dump({"user_view": {"load": "off"}}, f)
+            path = f.name
+        try:
+            c = m.build_collector_settings(_settings_ns(config_file=path))
+            self.assertEqual(c["user_view_load"], "off")
+            with mock.patch.dict(os.environ,
+                                 {"MONITOR_USER_VIEW_LOAD": "detail"}):
+                c = m.build_collector_settings(
+                    _settings_ns(config_file=path, user_view_load="detail"))
+            self.assertEqual(c["user_view_load"], "detail")
+        finally:
+            os.unlink(path)
 
 
 class TestDemoLoad(unittest.TestCase):

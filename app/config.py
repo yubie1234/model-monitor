@@ -119,6 +119,15 @@ class Settings(BaseSettings):
         False, validation_alias=AliasChoices("MONITOR_USER_VIEW_SHOW_INTERNAL"))
     user_view_cache_ttl: float = Field(
         30.0, validation_alias=AliasChoices("MONITOR_USER_VIEW_CACHE_TTL"))
+    # per-user 뷰에 "지금 부하"를 어디까지 보여줄지. off / summary / detail.
+    #  off     — 아예 내보내지 않는다(컬럼도 사라진다).
+    #  summary — 등급(idle/ok/BUSY/FULL/?)만. 사용자의 질문("지금 쓸 수 있나")에는
+    #            답하면서 처리중/대기/KV 같은 운영 수치는 내보내지 않는다. **기본값**.
+    #  detail  — admin 뷰와 같은 수치까지(단 Pod 주소는 어느 모드에서도 제외).
+    # 기본을 summary 로 둔 이유: per-user 뷰의 원칙은 "필요한 만큼만" 이고,
+    # 잘못 켜서 과다 노출되는 쪽이 덜 보여서 불편한 쪽보다 되돌리기 어렵다.
+    user_view_load: str = Field(
+        "summary", validation_alias=AliasChoices("MONITOR_USER_VIEW_LOAD"))
 
     # --- Prometheus /metrics ---
     metrics: bool = Field(
@@ -176,6 +185,25 @@ def _pick(env_present: bool, env_value, file_value, default):
     if file_value is not None:
         return file_value
     return default
+
+
+# 오타·표기 흔들림을 흡수한다. **모르는 값은 detail 이 아니라 summary 로** 떨어진다
+# — 오타 하나로 per-user 뷰가 조용히 과다 노출되면 안 된다(fail-safe 방향).
+_USER_LOAD_ALIASES = {
+    "off": "off", "false": "off", "no": "off", "none": "off", "0": "off",
+    "disabled": "off", "hide": "off",
+    "summary": "summary", "state": "summary", "basic": "summary",
+    "brief": "summary", "level": "summary",
+    "detail": "detail", "detailed": "detail", "full": "detail", "all": "detail",
+    "true": "detail", "on": "detail", "1": "detail", "yes": "detail",
+}
+
+
+def normalize_user_load(value, default="summary"):
+    """MONITOR_USER_VIEW_LOAD 값 -> off/summary/detail."""
+    if value is None:
+        return default
+    return _USER_LOAD_ALIASES.get(str(value).strip().lower(), default)
 
 
 def build_collector_settings(settings: Settings) -> Dict[str, Any]:
@@ -282,6 +310,12 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
         "prometheus_api_key": pm.get("api_key"),
         "user_view": user_view,
         "user_view_hide_internal": not show_internal,
+        # 부하 수집 자체가 꺼져 있으면 노출 단계도 off 로 접는다 — 켜둔 채로
+        # 두면 "요약은 나온다"고 오해하기 쉽다(gpu_info/load 종속 규칙과 같은 태도).
+        "user_view_load": normalize_user_load(_pick(
+            _env_set("MONITOR_USER_VIEW_LOAD"),
+            settings.user_view_load, uv.get("load"), "summary"),
+        ) if load_enabled else "off",
         "user_view_cache_ttl": float(_pick(
             _env_set("MONITOR_USER_VIEW_CACHE_TTL"),
             settings.user_view_cache_ttl, uv.get("cache_ttl"), 30.0)),

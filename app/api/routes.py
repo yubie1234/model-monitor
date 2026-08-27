@@ -108,7 +108,8 @@ async def api_snapshot_user(request: Request):
     # CPU 작업이고 클라이언트 수×폴링 주기만큼 반복되므로 이벤트 루프에서 직접
     # 돌리지 않는다 — 단일 루프가 막히면 모든 응답·프로브가 같이 밀린다.
     view = await asyncio.to_thread(
-        filter_snapshot_for_user, snap, access, st.hide_internal, ref_seed)
+        filter_snapshot_for_user, snap, access, st.hide_internal, ref_seed,
+        st.user_load_mode)
     return JSONResponse(view)
 
 

@@ -243,6 +243,10 @@ def summarize(snap):
         "gpu_errors": 0,             # GPU 정보 수집 실패 deployment 수
         # --- 지금 부하 ("바쁜가") ---
         "load_known": False,
+        # 등급(idle/ok/BUSY/FULL)을 아는가 — 수치(load_known)와 **따로** 둔다.
+        # per-user 뷰의 summary 모드는 등급만 오고 수치는 오지 않는다. 한 플래그로
+        # 묶으면 그 모드에서 "지금 바쁜 모델" 카드까지 통째로 사라진다.
+        "load_state_known": False,
         "running": 0,                # 지금 처리 중인 요청 합
         "queued": 0,                 # 지금 대기 중인 요청 합
         "models_busy": 0,            # busy + saturated 인 model_name 수
@@ -340,6 +344,8 @@ def summarize(snap):
             if not load:
                 continue
             state = load.get("state", "unknown")
+            if state and state != "unknown":
+                s["load_state_known"] = True
             name = d.get("model_name") or "?"
             cur = by_model.setdefault(name, {"rank": None, "state": "unknown",
                                              "reason": None})

@@ -39,6 +39,13 @@ user_view:
   enabled: false        # true 면 "키 필수 모드" 활성 (또는 --enable-user-view)
   show_internal: false  # true 면 per-user 뷰에도 내부 api_base/namespace 표시(기본 숨김)
   cache_ttl: 30         # 키별 접근(/v1/models) 캐시 TTL(초). 폴링 중복 호출 제거
+  # "지금 부하"를 사용자에게 어디까지 보여줄지: off | summary | detail
+  #   off     — 안 보냄(대시보드 LOAD 컬럼도 사라진다)
+  #   summary — 등급(idle/ok/BUSY/FULL/?)만. "지금 쓸 수 있나"에는 답하고
+  #             처리중/대기/KV 같은 운영 수치는 내보내지 않는다 (기본값)
+  #   detail  — 수치까지. 어느 모드든 Pod 주소는 나가지 않는다.
+  # env MONITOR_USER_VIEW_LOAD 우선. load.enabled: false 면 자동으로 off.
+  load: summary
 
 # --- Prometheus 메트릭(/metrics) ---
 # --serve 면 기본 ON. 캐시 스냅샷을 노출만 하므로 /api/snapshot 과 같은 수준의 정보.
