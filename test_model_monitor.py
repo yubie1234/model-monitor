@@ -3211,6 +3211,73 @@ class TestSummarizeLoad(unittest.TestCase):
         self.assertEqual(s["models_busy"], 2)
 
 
+class TestPodTargetsFromK8s(unittest.TestCase):
+    """부하 조회의 출발점 — k8s Pod 목록에서 IP/포트를 뽑는 이음새.
+
+    이 경로는 실제 클러스터에서만 도는 부분이라 FakeClient 로 고정한다.
+    Pod 목록은 GPU 집계가 어차피 받아오는 것이므로 **k8s 호출이 늘지 않는다**.
+    """
+
+    def _pods_payload(self, items):
+        return (True, {"items": items}, None)
+
+    def _pod(self, name, ip, port=8000, gpu="1", ready=True, node="n1"):
+        ctr = {"image": "vllm/vllm-openai:v0.8", "ports": [
+            {"name": "http", "containerPort": port}]}
+        if gpu:
+            ctr["resources"] = {"limits": {"nvidia.com/gpu": gpu}}
+        return {"metadata": {"name": name},
+                "spec": {"containers": [ctr], "nodeName": node},
+                "status": {"phase": "Running" if ready else "Pending",
+                           "podIP": ip,
+                           "conditions": [{"type": "Ready",
+                                           "status": "True" if ready else "False"}]}}
+
+    def test_ready_pods_yield_ip_and_port(self):
+        client = FakeClient([
+            ("/pods?", self._pods_payload([
+                self._pod("p-0", "10.42.1.11"),
+                self._pod("p-1", "10.42.1.12"),
+                # 아직 Ready 가 아닌 Pod 은 부하 조회 대상이 아니다
+                self._pod("p-2", "10.42.1.13", ready=False),
+            ])),
+            ("/nodes/", (True, {"metadata": {"labels": {
+                "nvidia.com/gpu.product": "NVIDIA-H100-80GB-HBM3"}}}, None)),
+        ])
+        out = m.collect_gpu_for_service(client, "kserve", "svc", "isvc", True, {}, {})
+        self.assertEqual([t["ip"] for t in out["pod_targets"]],
+                         ["10.42.1.11", "10.42.1.12"])
+        self.assertEqual(out["pod_targets"][0]["port"], 8000)
+        self.assertEqual(out["pod_targets"][0]["pod"], "p-0")
+        self.assertEqual(out["gpu_ready"], 2)          # GPU 집계는 그대로 동작
+
+    def test_pod_without_ip_or_port_is_skipped_not_guessed(self):
+        noport = self._pod("p-0", "10.42.1.11")
+        noport["spec"]["containers"][0]["ports"] = []
+        noip = self._pod("p-1", None)
+        client = FakeClient([
+            ("/pods?", self._pods_payload([noport, noip])),
+            ("/nodes/", (True, {"metadata": {"labels": {}}}, None)),
+        ])
+        out = m.collect_gpu_for_service(client, "kserve", "svc", "isvc", True, {}, {})
+        self.assertEqual(out["pod_targets"], [])       # 추측하지 않는다
+
+    def test_targets_flow_into_load_urls(self):
+        # 이 목록이 그대로 load_targets 의 Pod URL 이 된다(LB 폴백 아님)
+        client = FakeClient([
+            ("/pods?", self._pods_payload([self._pod("p-0", "10.42.1.11", 30000)])),
+            ("/nodes/", (True, {"metadata": {"labels": {}}}, None)),
+        ])
+        out = m.collect_gpu_for_service(client, "ns", "svc", "isvc", True, {}, {})
+        dep = {"model_name": "A", "api_base": "http://svc.ns.svc:8080/v1",
+               "namespace": "ns", "service": "svc",
+               "backend_pods": out["pod_targets"]}
+        targets, _alias = m.load_targets([dep], m._strip_openai_suffix)
+        spec = targets["http://svc.ns.svc:8080"]
+        self.assertEqual(spec["scope"], "pods")
+        self.assertEqual(spec["urls"], ["http://10.42.1.11:30000"])
+
+
 class TestManualLoadRefresh(unittest.TestCase):
     """수동 새로고침 — 버튼 하나가 백엔드 팬아웃이라 서버가 직렬화·제한한다."""
 
