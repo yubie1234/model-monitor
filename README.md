@@ -213,6 +213,12 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   - 어느 모드에서도 **Pod 주소(`per_pod`)는 나가지 않습니다**. 오타 등 모르는 값은 `detail` 이
     아니라 `summary` 로 떨어집니다(과다 노출 쪽으로 실패하지 않게).
   - `MONITOR_LOAD=false`(수집 자체 off)면 이 값도 자동으로 `off` 입니다.
+  - **적용**: env(`MONITOR_USER_VIEW_LOAD`) 또는 설정 파일 `user_view.load`. k8s 는
+    ConfigMap 의 `config.json` 을 고친 뒤 `kubectl -n dashboard rollout restart
+    deployment/model-monitor` — 예시는 [deploy/k8s.yaml](deploy/k8s.yaml) ConfigMap 위 주석에
+    있습니다. 확인은 사용자 키로 직접:
+    `curl -s -X POST -H "X-LiteLLM-Key: <사용자 키>" <base>/api/snapshot/user | grep load`
+    (`off`=키 없음 · `summary`=`load_state` 만 · `detail`=`load_running`/`load_kv_pct` 까지)
   - `⟳ 부하`(즉시 갱신)는 백엔드 팬아웃을 유발하므로 **admin 키에만** 보입니다.
 - **접근 캐시**: 같은 키의 `/v1/models` 결과를 **짧은 TTL(기본 30s)** 캐시해 폴링 중복 호출을 제거
   (해시만 보관, 원문 키 비저장). 성공만 캐시 → 무효 키는 매번 재검증. 취소/만료 키는 최대 TTL 동안 stale.
