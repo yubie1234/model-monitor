@@ -35,6 +35,25 @@ async def api_snapshot(request: Request):
     return JSONResponse(await request.app.state.store.get())
 
 
+@router.post("/api/load/refresh", summary="지금 부하 즉시 재조회(수동 새로고침)")
+async def api_load_refresh(request: Request):
+    """부하만 즉시 1회 다시 읽는다(스냅샷 전체 재수집이 아님).
+
+    이 엔드포인트는 **요청 경로에서 실제로 수집하는 유일한 예외**다 — 사용자가
+    버튼을 눌렀을 때만 도는 팬아웃이라, 서버가 최소 간격(10s)과 진행 중 락으로
+    직렬화한다. 화면을 여러 명이 보고 있어도 백엔드로 나가는 조회는 그만큼
+    늘어나지 않는다(백그라운드 루프는 세션 수와 무관하게 하나다).
+    """
+    st = request.app.state
+    # 키 필수 모드에서는 admin 키만 — 아무나 백엔드 팬아웃을 유발할 수 있으면 안 된다.
+    if st.user_view_on and not is_admin_key(st.admin_key, request_key(request)):
+        return JSONResponse(
+            {"ok": False, "error": "admin 키가 필요합니다."}, status_code=403)
+    result = await st.refresher.refresh_load_now()
+    return JSONResponse(result, status_code=200 if result.get("ok") else 429
+                        if result.get("retry_after") else 503)
+
+
 @router.post("/api/snapshot/user", summary="키별(per-user) 필터 스냅샷")
 async def api_snapshot_user(request: Request):
     """키별 per-user 뷰. 키는 헤더(X-LiteLLM-Key) 전용(쿼리 금지), 저장·로그 없이
@@ -89,7 +108,8 @@ async def api_snapshot_user(request: Request):
     # CPU 작업이고 클라이언트 수×폴링 주기만큼 반복되므로 이벤트 루프에서 직접
     # 돌리지 않는다 — 단일 루프가 막히면 모든 응답·프로브가 같이 밀린다.
     view = await asyncio.to_thread(
-        filter_snapshot_for_user, snap, access, st.hide_internal, ref_seed)
+        filter_snapshot_for_user, snap, access, st.hide_internal, ref_seed,
+        st.user_load_mode)
     return JSONResponse(view)
 
 

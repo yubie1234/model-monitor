@@ -78,6 +78,40 @@ class Settings(BaseSettings):
         False, validation_alias=AliasChoices("MONITOR_K8S_INSECURE"))
     k8s_timeout: float = Field(5.0, validation_alias=AliasChoices("MONITOR_K8S_TIMEOUT"))
 
+    # --- 지금 부하(백엔드 엔진 게이지) ---
+    # vLLM/SGLang 이 노출하는 /metrics 를 Pod 마다 읽어 "지금 바쁜가"를 판정한다.
+    # Pod 주소는 GPU 집계가 이미 받아오는 Pod 목록에서 나오므로 k8s 호출이 늘지 않고,
+    # 백엔드에는 Pod 당 사이클마다 1회 GET 이 추가된다(응답은 보통 수십 KB).
+    load: bool = Field(True, validation_alias=AliasChoices("MONITOR_LOAD"))
+    # 부하 조회 주기(초). Pod 마다 /metrics 를 읽는 팬아웃이라 스냅샷 갱신(5s)과
+    # 분리해 **60초**로 둔다 — 백엔드 부담을 낮추고, 급할 때는 대시보드의 수동
+    # 새로고침 버튼(POST /api/load/refresh, 최소 간격 10s)으로 즉시 당겨 읽는다.
+    # 화면에는 "N초 전"으로 신선도를 함께 표시한다(1분 낡은 값을 실시간으로
+    # 오해하지 않게).
+    load_interval: float = Field(
+        60.0, validation_alias=AliasChoices("MONITOR_LOAD_INTERVAL"))
+    # 죽은 Pod 하나가 라운드를 잡아먹지 않게 짧게. 한 라운드 최악 =
+    # ceil(Pod수 / Refresher._LOAD_PARALLEL) * load_timeout.
+    # 동시 조회 수는 설정이 아니라 상수다 — 공용 수집 스레드 예산(8)을 나눠 쓰는
+    # 값이라 임의로 올리면 다른 수집(스냅샷 빌드·유저뷰)이 굶는다.
+    load_timeout: float = Field(
+        3.0, validation_alias=AliasChoices("MONITOR_LOAD_TIMEOUT"))
+    # Pod 직접 조회가 막힌 환경(NetworkPolicy·mTLS)에서 같은 게이지를 대신 읽을
+    # 외부 Prometheus. 출처가 같아 정확도는 동일하고 스크레이프 주기만큼 늦다.
+    prometheus_url: Optional[str] = Field(
+        None, validation_alias=AliasChoices("MONITOR_PROMETHEUS_URL",
+                                            "PROMETHEUS_URL"))
+    # 한 model_name 에 backend 가 여러 개일 때 모델 등급을 무엇으로 볼지.
+    # least-busy(기본): 다음 요청이 갈 가장 한가한 backend 기준.
+    # shuffle: LiteLLM 기본 라우팅(simple-shuffle)처럼 요청이 흩어지면 가장 나쁜
+    #          backend 기준이 정직하다. LiteLLM 의 routing_strategy 에 맞춘다.
+    load_routing: str = Field(
+        "least-busy", validation_alias=AliasChoices("MONITOR_LOAD_ROUTING"))
+    prometheus_first: bool = Field(
+        False, validation_alias=AliasChoices("MONITOR_PROMETHEUS_FIRST"))
+    prometheus_lookback: str = Field(
+        "2m", validation_alias=AliasChoices("MONITOR_PROMETHEUS_LOOKBACK"))
+
     # --- per-user(키별) 뷰 ---
     user_view: bool = Field(
         False, validation_alias=AliasChoices("MONITOR_USER_VIEW"))
@@ -85,6 +119,15 @@ class Settings(BaseSettings):
         False, validation_alias=AliasChoices("MONITOR_USER_VIEW_SHOW_INTERNAL"))
     user_view_cache_ttl: float = Field(
         30.0, validation_alias=AliasChoices("MONITOR_USER_VIEW_CACHE_TTL"))
+    # per-user 뷰에 "지금 부하"를 어디까지 보여줄지. off / summary / detail.
+    #  off     — 아예 내보내지 않는다(컬럼도 사라진다).
+    #  summary — 등급(idle/ok/BUSY/FULL/?)만. 사용자의 질문("지금 쓸 수 있나")에는
+    #            답하면서 처리중/대기/KV 같은 운영 수치는 내보내지 않는다. **기본값**.
+    #  detail  — admin 뷰와 같은 수치까지(단 Pod 주소는 어느 모드에서도 제외).
+    # 기본을 summary 로 둔 이유: per-user 뷰의 원칙은 "필요한 만큼만" 이고,
+    # 잘못 켜서 과다 노출되는 쪽이 덜 보여서 불편한 쪽보다 되돌리기 어렵다.
+    user_view_load: str = Field(
+        "summary", validation_alias=AliasChoices("MONITOR_USER_VIEW_LOAD"))
 
     # --- Prometheus /metrics ---
     metrics: bool = Field(
@@ -144,6 +187,25 @@ def _pick(env_present: bool, env_value, file_value, default):
     return default
 
 
+# 오타·표기 흔들림을 흡수한다. **모르는 값은 detail 이 아니라 summary 로** 떨어진다
+# — 오타 하나로 per-user 뷰가 조용히 과다 노출되면 안 된다(fail-safe 방향).
+_USER_LOAD_ALIASES = {
+    "off": "off", "false": "off", "no": "off", "none": "off", "0": "off",
+    "disabled": "off", "hide": "off",
+    "summary": "summary", "state": "summary", "basic": "summary",
+    "brief": "summary", "level": "summary",
+    "detail": "detail", "detailed": "detail", "full": "detail", "all": "detail",
+    "true": "detail", "on": "detail", "1": "detail", "yes": "detail",
+}
+
+
+def normalize_user_load(value, default="summary"):
+    """MONITOR_USER_VIEW_LOAD 값 -> off/summary/detail."""
+    if value is None:
+        return default
+    return _USER_LOAD_ALIASES.get(str(value).strip().lower(), default)
+
+
 def build_collector_settings(settings: Settings) -> Dict[str, Any]:
     """Settings(env) + 설정 파일을 합쳐 수집기가 쓰는 평범한 dict 로 변환.
 
@@ -154,6 +216,8 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
     bc = cfg.get("backend_count") if isinstance(cfg.get("backend_count"), dict) else {}
     uv = cfg.get("user_view") if isinstance(cfg.get("user_view"), dict) else {}
     mt = cfg.get("metrics") if isinstance(cfg.get("metrics"), dict) else {}
+    ld = cfg.get("load") if isinstance(cfg.get("load"), dict) else {}
+    pm = cfg.get("prometheus") if isinstance(cfg.get("prometheus"), dict) else {}
 
     backend_count = _pick(
         _env_set("MONITOR_BACKEND_COUNT"),
@@ -162,6 +226,11 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
     gpu_info = backend_count and _pick(
         _env_set("MONITOR_GPU_INFO"),
         settings.gpu_info, bc.get("gpu_info"), True)
+    # 부하 수집은 Pod 주소(=k8s 조회)에 기댄다. backend_count 가 꺼지면 Pod 주소를
+    # 못 얻어 LB 폴백만 남는데, 그건 scale-to-zero 를 깨울 수 있어 허용하지 않는다.
+    # -> gpu_info 와 같은 종속 규칙.
+    load_enabled = backend_count and _pick(
+        _env_set("MONITOR_LOAD"), settings.load, ld.get("enabled"), True)
     user_view = _pick(
         _env_set("MONITOR_USER_VIEW"),
         settings.user_view, uv.get("enabled"), False)
@@ -215,8 +284,38 @@ def build_collector_settings(settings: Settings) -> Dict[str, Any]:
         "namespace_overrides": bc.get("namespace_overrides", {}) or {},
         "activator_namespace": bc.get("activator_namespace", "knative-serving"),
         # --- per-user(키별) 뷰 ---
+        # --- 지금 부하 ---
+        "load": load_enabled,
+        "load_timeout": float(_pick(
+            _env_set("MONITOR_LOAD_TIMEOUT"),
+            settings.load_timeout, ld.get("timeout"), 3.0)),
+        "load_interval": _pick(
+            _env_set("MONITOR_LOAD_INTERVAL"),
+            settings.load_interval, ld.get("interval"), 60.0),
+        "load_thresholds": ld.get("thresholds") or {},
+        "load_routing": _pick(
+            _env_set("MONITOR_LOAD_ROUTING"),
+            settings.load_routing, ld.get("routing"), "least-busy"),
+        "prometheus_url": _pick(
+            _env_set("MONITOR_PROMETHEUS_URL", "PROMETHEUS_URL"),
+            settings.prometheus_url, pm.get("url"), None),
+        "prometheus_first": _pick(
+            _env_set("MONITOR_PROMETHEUS_FIRST"),
+            settings.prometheus_first, pm.get("first"), False),
+        "prometheus_lookback": _pick(
+            _env_set("MONITOR_PROMETHEUS_LOOKBACK"),
+            settings.prometheus_lookback, pm.get("lookback"), "2m"),
+        "prometheus_timeout": float(pm.get("timeout") or 10.0),
+        "prometheus_labels": pm.get("labels") or {},
+        "prometheus_api_key": pm.get("api_key"),
         "user_view": user_view,
         "user_view_hide_internal": not show_internal,
+        # 부하 수집 자체가 꺼져 있으면 노출 단계도 off 로 접는다 — 켜둔 채로
+        # 두면 "요약은 나온다"고 오해하기 쉽다(gpu_info/load 종속 규칙과 같은 태도).
+        "user_view_load": normalize_user_load(_pick(
+            _env_set("MONITOR_USER_VIEW_LOAD"),
+            settings.user_view_load, uv.get("load"), "summary"),
+        ) if load_enabled else "off",
         "user_view_cache_ttl": float(_pick(
             _env_set("MONITOR_USER_VIEW_CACHE_TTL"),
             settings.user_view_cache_ttl, uv.get("cache_ttl"), 30.0)),

@@ -9,15 +9,26 @@
 """
 
 import asyncio
+import time
 
 from app import __version__
 from app.services.demo import demo_snapshot
 from app.services.litellm import (
+    _deployment_health_safe,
+    _strip_openai_suffix,
     aggregate_selective_health,
     fetch_health,
     fetch_health_for_model,
     health_check_allowed_bases,
     select_health_check_models,
+)
+from app.services.load import (
+    aggregate_targets,
+    attach_load_to_deployments,
+    collect_load_via_prometheus,
+    load_targets,
+    merge_load_sources,
+    probe_pod_load,
 )
 from app.services.snapshot import (
     build_snapshot,
@@ -74,6 +85,18 @@ class Refresher:
         # node_cache 와 같은 이유로 프로세스 수명이다 — 사이클마다 새로
         # 만들면(bc_cache 처럼) 사이클 간 절감이 0 이다.
         self._meta_cache = {}
+        # 지금 부하(엔진 게이지). health 와 같은 계약: None 을 주면 직전 값을 유지해
+        # 실패 라운드가 마지막 정상 결과를 지우지 않는다.
+        self._load = None
+        self._load_alias = {}
+        self._load_at = None          # 마지막 부하 수집 시각(epoch) — 화면의 "N초 전"
+        self._load_lock = asyncio.Lock()
+        # 수동 새로고침 버튼용 — 동시에 여러 번 눌러도 팬아웃이 겹치지 않게 직렬화.
+        self._load_refresh_lock = asyncio.Lock()
+        self._load_mono = 0.0         # 최소 간격 판정용(monotonic)
+        # 생성 토큰 카운터 차분용 — 사이클 간 유지돼야 tok/s 가 나온다
+        # (node_cache 와 같은 이유로 프로세스 수명).
+        self._tput_cache = {}
 
     async def collect_once(self):
         """스냅샷 1회 수집(메인은 health 없이 빠르게) 후 비동기 health 주입."""
@@ -103,6 +126,22 @@ class Refresher:
                                    % (len(herrs) - 3))
                 snap["litellm"]["deployments"] = merge_deployments_with_health(
                     snap["litellm"])
+                snap["summary"] = summarize(snap)
+            # 비동기로 모아둔 '지금 부하'를 주입 — health 와 같은 이유로 별도
+            # 주기다(Pod 팬아웃이라 수집 사이클에 넣으면 갱신이 늘어진다).
+            async with self._load_lock:
+                loads, alias, load_at = self._load, self._load_alias, self._load_at
+            if loads:
+                snap["load_ts_epoch"] = load_at
+                snap["load_interval"] = self._load_period()
+                snap["litellm"]["deployments"] = attach_load_to_deployments(
+                    snap["litellm"]["deployments"], loads,
+                    _strip_openai_suffix, alias)
+                snap["load_enabled"] = True
+                # 모델 등급 판정 규칙(라우팅 방식)은 summarize·대시보드가 같은
+                # 값을 봐야 카드와 표가 어긋나지 않는다 -> 스냅샷에 실어 보낸다.
+                snap["load_routing"] = self.settings.get("load_routing",
+                                                         "least-busy")
                 snap["summary"] = summarize(snap)
         await self.store.set(snap, None)
         return snap
@@ -209,6 +248,122 @@ class Refresher:
         results = await asyncio.gather(*(one(n) for n in names))
         return aggregate_selective_health(list(results), allowed)
 
+    # 부하 조회 동시 실행 수 — 선택적 health 와 같은 이유로 공용 수집 스레드
+    # 예산(_COLLECT_THREADS=8)의 절반만 쓴다. 자체 스레드풀 금지.
+    _LOAD_PARALLEL = 4
+
+    async def _fetch_load(self):
+        """지금 부하 1회: Pod 마다 /metrics 를 병렬 조회해 base 별로 집계.
+
+        Pod 주소는 **직전 스냅샷**에서 읽는다(선택적 health 와 같은 방식) — 이미
+        backend_count 가 GPU 집계와 같은 Pod 목록에서 얻어둔 값이라 k8s 재조회가 없다.
+        전 대상이 실패하면 None 을 돌려 직전 값을 유지한다.
+        """
+        snap = await self.store.get()
+        deps = ((snap.get("litellm") or {}).get("deployments")) or []
+        if not deps:
+            return None    # 첫 스냅샷 전 — 아무것도 바꾸지 않음
+        targets, alias = load_targets(deps, _strip_openai_suffix,
+                                      _deployment_health_safe)
+        jobs = [(base, url) for base, spec in targets.items()
+                for url in (spec.get("urls") or [])]
+        timeout = self.settings.get("load_timeout", 3.0)
+        now = time.monotonic()
+        sem = asyncio.Semaphore(self._LOAD_PARALLEL)
+
+        async def one(base, url):
+            async with sem:
+                return base, await asyncio.to_thread(
+                    probe_pod_load, url, timeout, now, self._tput_cache)
+
+        samples = {}
+        for base, sample in await asyncio.gather(*(one(b, u) for b, u in jobs)):
+            samples.setdefault(base, []).append(sample)
+        loads = aggregate_targets(targets, samples,
+                                  self.settings.get("load_thresholds"))
+        if self.settings.get("prometheus_url"):
+            # Pod 직접 조회가 막힌 대상만 Prometheus 로 보강하고, **표본이 더
+            # 많을 때만** 교체한다(폴백이 원래 값을 더 나쁘게 만들지 않게).
+            weak = set(b for b, l in loads.items()
+                       if l.get("state") == "unknown"
+                       or (l.get("pods_failed") or 0) > 0)
+            if weak:
+                prom = await asyncio.to_thread(
+                    collect_load_via_prometheus, targets, self.settings, now,
+                    weak, self._tput_cache)
+                loads = merge_load_sources(loads, prom)
+        if not any(l.get("state") != "unknown" for l in loads.values()):
+            return None    # 전부 모름 — 직전 값 유지
+        return loads, alias
+
+    def _load_period(self):
+        """부하 조회 주기. 기본은 스냅샷 갱신 주기와 같다("지금 바쁜가"는 빨리 낡는다).
+
+        MONITOR_LOAD_INTERVAL 로 따로 늘리면 Pod /metrics 팬아웃만 줄일 수 있다.
+        """
+        try:
+            v = float(self.settings.get("load_interval") or 0)
+        except (TypeError, ValueError):
+            v = 0
+        return max(1.0, v) if v > 0 else self.interval
+
+    async def _store_load(self, got):
+        """수집 결과와 **수집 시각**을 함께 보관한다(화면이 신선도를 표시할 수 있게)."""
+        async with self._load_lock:
+            self._load, self._load_alias = got
+            self._load_at = time.time()
+        self._load_mono = time.monotonic()
+
+    # 수동 새로고침 최소 간격(초). 버튼 한 번 = 모든 Pod 에 GET 팬아웃이라
+    # 연타로 백엔드를 두들기지 않게 서버가 막는다.
+    _LOAD_REFRESH_MIN_GAP = 10.0
+
+    async def refresh_load_now(self):
+        """버튼용: 지금 즉시 부하 1회 수집 후 캐시 스냅샷에 반영.
+
+        -> {"ok": bool, "retry_after": float|None, "load_ts_epoch": float|None}
+        """
+        if self.demo or not self.settings.get("load", True):
+            return {"ok": False, "error": "부하 수집이 꺼져 있습니다."}
+        if self._load_refresh_lock.locked():
+            return {"ok": False, "error": "이미 조회 중입니다.", "retry_after": 2.0}
+        async with self._load_refresh_lock:
+            gap = time.monotonic() - (self._load_mono or 0.0)
+            if self._load_mono and gap < self._LOAD_REFRESH_MIN_GAP:
+                return {"ok": False, "retry_after": round(
+                    self._LOAD_REFRESH_MIN_GAP - gap, 1),
+                    "error": "너무 잦은 요청입니다(백엔드 보호)."}
+            got = await self._fetch_load()
+            if got is None:
+                return {"ok": False, "error": "부하를 읽지 못했습니다(직전 값 유지)."}
+            await self._store_load(got)
+        # 다음 폴링을 기다리지 않고 캐시 스냅샷에 바로 반영한다.
+        snap = await self.store.get()
+        if snap and snap.get("litellm"):
+            loads, alias = got
+            snap["litellm"]["deployments"] = attach_load_to_deployments(
+                snap["litellm"]["deployments"], loads, _strip_openai_suffix, alias)
+            snap["load_enabled"] = True
+            snap["load_routing"] = self.settings.get("load_routing", "least-busy")
+            snap["load_ts_epoch"] = self._load_at
+            snap["load_interval"] = self._load_period()
+            snap["summary"] = summarize(snap)
+            await self.store.set(snap, None)
+        return {"ok": True, "load_ts_epoch": self._load_at}
+
+    async def _load_loop(self):
+        """부하 수집 루프. 수집 -> 대기 순서라 첫 값은 시작 직후에 나온다."""
+        while True:
+            try:
+                got = await self._fetch_load()
+                if got is not None:
+                    await self._store_load(got)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(self._load_period())
+
     async def start(self):
         """첫 스냅샷을 동기로 1회 채운 뒤(즉시 화면에 데이터), 백그라운드 루프 가동."""
         try:
@@ -229,6 +384,9 @@ class Refresher:
             elif self.settings.get("selective_health", True):
                 self._tasks.append(asyncio.create_task(
                     self._health_loop(self._fetch_selective_health)))
+            # 지금 부하(엔진 게이지) — Pod 주소가 있는 백엔드만 직접 조회한다.
+            if self.settings.get("load", True):
+                self._tasks.append(asyncio.create_task(self._load_loop()))
 
     async def stop(self):
         for t in self._tasks:

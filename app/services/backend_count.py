@@ -300,7 +300,7 @@ def resolve_backend_count(deployment, client, settings, cache=None,
     스냅샷 주기를 넘어 재사용한다(라벨은 노드 수명 동안 불변). 미지정이면
     client 수명(=한 사이클) 캐시로 폴백한다.
     """
-    out = {"backends_ready": None, "backends_desired": None,
+    out = {"backend_pods": [], "backends_ready": None, "backends_desired": None,
            "backend_source": "none", "mode": "Unknown",
            "scale_to_zero": False, "namespace": None, "service": None,
            "network_type": "-",     # kserve | service | external | '-'(판정 불가)
@@ -429,8 +429,11 @@ def resolve_backend_count(deployment, client, settings, cache=None,
         out["k8s_error"] = "; ".join(errors)
 
     # GPU 개수 + 장치명 (기본 ON; gpu_info=False 면 건너뜀).
+    # 부하(load) 수집이 켜져 있으면 gpu_info 가 꺼져 있어도 이 블록을 돈다 —
+    # 같은 Pod 목록 한 번으로 GPU 집계와 Pod 주소(pod_targets)를 둘 다 얻기 때문에
+    # k8s 호출이 늘지 않는다.
     # 한 건 실패가 전체를 막지 않게 try/except -> gpu_ready=None(=?) 폴백.
-    if settings.get("gpu_info"):
+    if settings.get("gpu_info") or settings.get("load"):
         try:
             # 노드 GPU 장치명 라벨(nvidia.com/gpu.product)은 노드 수명 동안 불변이라
             # 매 사이클 Node 오브젝트(status.images 포함 수십 KB)를 다시 받을 이유가
@@ -444,9 +447,12 @@ def resolve_backend_count(deployment, client, settings, cache=None,
                     setattr(client, "_node_cache", nc)
             g = collect_gpu_for_service(
                 client, ns, svc, isvc, info["found"], nc, meta_cache)
-            out["gpu_ready"] = g["gpu_ready"]
-            out["gpu_products"] = g["gpu_products"]
-            out["gpu_error"] = g["gpu_error"]
+            if settings.get("gpu_info"):
+                out["gpu_ready"] = g["gpu_ready"]
+                out["gpu_products"] = g["gpu_products"]
+                out["gpu_error"] = g["gpu_error"]
+            # Pod 주소는 부하 수집(load)이 Pod 별 /metrics 를 읽는 데 쓴다.
+            out["backend_pods"] = g.get("pod_targets") or []
             # Pod 컨테이너(이미지/커맨드) 기반 엔진 판정 — 이름 휴리스틱보다
             # 정확하므로 있으면 litellm 쪽 backend_type 을 덮어쓴다.
             if g.get("engine"):

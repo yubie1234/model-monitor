@@ -105,6 +105,37 @@ Collectors are synchronous (blocking `urllib`). The FastAPI **lifespan** starts 
 ### Model-grouped view & Model↔Backend graph (web only)
 The dashboard JS groups deployments by `model_name` (composite `UP`/`DEGRADED`/`DOWN` + `Σ ready/desired`, child rows per backend), flags shared backends (`⇄`), and draws a pure-SVG bipartite **Model ↔ Backend** graph. This logic lives entirely in `web/templates/dashboard.html` (no extra snapshot data; derived from `model_name`/`namespace`/`service`/`status`). The old single-file had Python TUI equivalents — those were **not** ported (no TUI).
 
+### 지금 부하 (`app/services/load.py`, `MONITOR_LOAD`, 기본 ON)
+backend Pod 마다 `/metrics`(vLLM/SGLang 게이지)를 읽어 처리 중/대기 요청 · KV 캐시 사용률 ·
+tok/s · 등급(idle/ok/BUSY/FULL)을 deployment 행에 붙인다. Pod 주소는 `gpu.collect_gpu_for_service`
+가 이미 받아오는 Pod 목록(`pod_targets`)에서 나오므로 **k8s 호출이 늘지 않는다**.
+
+- **깨울 위험이 있으면 조회하지 않는다.** Pod 주소가 없을 때 LB(api_base)로 폴백하면 activator 를
+  거쳐 scale-to-zero 백엔드를 깨운다 — 전량 `/health` 를 기본 off 로 둔 것과 같은 이유다.
+  `litellm._deployment_health_safe` 로 판정하고, external 백엔드도 제외한다. 제외된 대상은 0 이
+  아니라 **이유를 단 `unknown`**(`scope="skipped"`).
+- **자체 스레드풀 금지.** `Refresher._fetch_load` 가 공용 스레드 예산(semaphore 4) 안에서 모아
+  느린 `/health` 와 같은 방식으로 주입한다. tok/s 카운터 차분 캐시(`_tput_cache`)도 Refresher 수명.
+- **엔진 차이는 `_PROM_SPECS` 한 곳에서** — `:`↔`_` 접두사 정규화(SGLang), alias 는 합산 아닌 택일
+  (vLLM V0/V1 동시 노출 시 2배 방지), `tp_rank`/`pp_rank`/`moe_ep_rank` 는 복제 보고라 max 로 접고
+  `dp_rank`/`engine` 만 합산(TP=4 에서 4배 부풀림 방지).
+- **모델 등급은 라우팅 방식에 따른다**(`MONITOR_LOAD_ROUTING`): least-busy(기본)=가장 한가한 backend,
+  shuffle=가장 나쁜 backend. `summarize` 와 대시보드가 **같은 규칙**을 써야 카드와 표가 안 어긋난다.
+- **주기 60초**(`MONITOR_LOAD_INTERVAL`, 스냅샷 갱신 5초와 분리) + 화면에 `N초 전` 표기. 즉시
+  갱신은 `POST /api/load/refresh`(`Refresher.refresh_load_now`) — 요청 경로에서 실제 수집하는
+  유일한 예외라 최소 간격 10초 + 진행 중 락으로 직렬화한다. 백그라운드 루프는 **세션 수와 무관하게
+  하나**이므로 보는 사람이 늘어도 백엔드 조회는 늘지 않는다.
+- per-user 뷰에는 평탄한 스칼라(`load_state`/`load_running`/...)로만 나간다 — `per_pod` 에 Pod 주소가
+  있어 그대로 넘기면 내부가 샌다. 사유도 원문 대신 정규화 코드(`load_reason_code`).
+  **노출 단계는 설정**(`MONITOR_USER_VIEW_LOAD` / `user_view.load`): `off`(키 자체 없음 + 최상위
+  `load_enabled` 등 `_LOAD_TOP_KEYS` 도 제거 → 대시보드 LOAD 컬럼이 사라진다) / `summary`(등급 +
+  `load_reason_code` + `load_partial` 불리언만) / `detail`(수치까지). **기본은 `summary`** — 오타 등
+  모르는 값도 `summary` 로 떨어진다(`config.normalize_user_load`, fail-safe 방향). 화면에서 가리는
+  것이 아니라 **서버에서 빼는 것**이고, `show_internal` 뷰(원본 행)에도 같은 규칙이 적용된다
+  (`_slim_load`). `summarize` 의 **`load_state_known` 은 `load_known`(수치)과 분리**돼 있다 —
+  summary 모드는 수치가 없어 한 플래그로 묶으면 등급 카드까지 사라진다. `⟳ 부하`(수동 갱신)는
+  백엔드 팬아웃이라 admin 전용이고 비-admin 화면에서는 버튼 자체를 숨긴다.
+
 ### Per-user (key) view — `MONITOR_USER_VIEW=true` (off by default; demo disables it)
 "Key-required mode": the user enters their own LiteLLM key (header `X-LiteLLM-Key` only — never query/logs/server-store; browser `sessionStorage`). `POST /api/snapshot/user` filters the shared snapshot per key via `services/user_access.filter_snapshot_for_user` (access set from that key's `GET /v1/models`, cached with a short TTL in `AccessCache` — sha256 of the key, success-only). A normal key sees only its models with internal `api_base`/namespace **redacted**; the admin key (= the monitor's own `api_key`, constant-time compared in `auth.is_admin_key`) sees the full view + exports. **fail-closed**: an invalid key never falls back to global. When on, `GET /api/snapshot` is 403-locked and `/snapshot.json`, `/snapshot.html`, `/metrics` require the admin key header. Template placeholder `__USER_VIEW__` is injected by `web/routes.load_dashboard_html` (alongside `__INTERVAL_MS__`).
 
@@ -130,11 +161,45 @@ env (`LITELLM_BASE_URL`, `LITELLM_API_KEY`, `MONITOR_*`) > config file (`MONITOR
 - **`product`** → `v<version>` — immutable release tag. **Fails the workflow if the tag already exists**, forcing a `__version__` bump before a product release.
 - **`develop`** → `v<version>-develop` — floating pre-release tag, **force-moved** to the latest commit on each develop merge (so it always points at the newest develop snapshot for that version).
 
-So: bump `__version__` for a product release; develop merges just re-point the `-develop` tag. Tag pushes don't re-trigger the branch workflow (no loop).
+Tag pushes don't re-trigger the branch workflow (no loop).
+
+### Version bump — REQUIRED on every merge into `develop` or `product`
+
+**Bump the version as part of the change, before the PR is opened.** This is a
+project rule, not a suggestion, and it applies to *every* merge into `develop` —
+not only product releases.
+
+Note what the automation does and does not catch, because it is asymmetric and
+has already let a mistake through:
+
+- `product` → the workflow **fails** if `v<version>` already exists. Enforced.
+- `develop` → the floating `v<version>-develop` tag is **force-moved**. A stale
+  version merges silently, and two develop snapshots then share one tag.
+- `TestVersionConsistency` compares **numbers only**, across the four files
+  below. Prose is never checked.
+
+So on `develop` nothing will stop you. Do the checklist by hand:
+
+1. **`app/__init__.py` `__version__`** — the single source of truth for the
+   *runtime*: Docker image tag (`ci.sh`/`push.sh` grep it), FastAPI app
+   `version`, the `version` field in `/api/snapshot`, `model_monitor_build_info`.
+   Feature → minor (`1.1.0` → `1.2.0`); fix-only → patch.
+2. **README header number** — `**버전: vX.Y.Z**` (manually mirrored, not derived).
+3. **`deploy/k8s.yaml`** — `app.kubernetes.io/version` label, **2 occurrences**.
+4. **README header prose** — the clause after the `—` on that same line
+   (`**버전: v1.2.0** — 지금 부하 · …`). It summarizes *that release's*
+   highlights, so **rewrite it to describe this release**. Changing only the
+   number on that line leaves the previous release's summary in place; every
+   test still passes and the README then describes the wrong release. This is
+   exactly the mistake that shipped in v1.2.0 — the line read "v1.2.0 — 관리자
+   일시중지…", which was v1.1.0's content.
+5. `python3 -m unittest` — `TestVersionConsistency` catches drift in 1–3 only.
+   Step 4 is on you: re-read the finished line and ask whether it describes the
+   work in *this* branch.
 
 ## Conventions
 
-- **Versioning:** `__version__` in `app/__init__.py` is the single source of truth for the *runtime* — it drives the Docker image tag (`ci.sh`/`push.sh` grep it), the FastAPI app `version`, the `version` field in `/api/snapshot`, and `model_monitor_build_info`. But two files carry a **manually-mirrored copy** that is *not* auto-derived and must be bumped by hand alongside it: the README header (`**버전: vX.Y.Z**`) and `deploy/k8s.yaml`'s `app.kubernetes.io/version` label (**2 occurrences**). `TestVersionConsistency` (in `test_model_monitor.py`) fails if any of these drift from `__version__` — run `python3 -m unittest` after a bump.
+- **Versioning:** every merge into `develop`/`product` requires a version bump across **four places** (`__version__`, README header number, `deploy/k8s.yaml` ×2) **plus the README header's prose summary** — see [Version bump](#version-bump--required-on-every-merge-into-develop-or-product) under Branch strategy for the checklist and what the tests do *not* catch. Don't open a PR without it.
 - **Schemas vs. dicts:** the snapshot is built and tested as plain dicts; `schemas/snapshot.py` Pydantic models only document/validate at the API boundary (all fields Optional, `extra="allow"` so nothing is dropped). Don't push Pydantic into the collectors.
 ### Per-user view cost
 `filter_snapshot_for_user` **filters before it copies**. It used to `deepcopy` the whole snapshot and then filter, which made the cost proportional to the *total* deployment count regardless of what the key could see — paid once per poll per user (measured: 1000 deployments / 50 accessible, 13.7ms → 0.24ms; 5.5× even at full access). The tradeoff is that isolation is no longer automatic: anything carried over from the shared snapshot must be deep-copied if it is a container, or every user's view aliases the one snapshot every other request reads. Two regression tests pin that (mutate the view, assert the global is byte-identical; assert nested `gpu_products` dicts are not shared). Do not "optimize" this into a cross-user cache — `backend_ref` is salted per user (`sha256(admin_key + key)`) precisely so two users cannot correlate their views, so a shared cache would either break that or need the salt applied after the shared work.

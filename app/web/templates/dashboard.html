@@ -163,6 +163,44 @@
 
   /* 모델 기준 그룹 뷰 */
   .pill.deg{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
+  /* 지금 부하 — 등급 pill + 근거 */
+  .lrefresh{font-family:var(--sans);font-size:12px;color:var(--muted);cursor:pointer;
+    background:var(--surface2);border:1px solid var(--border);border-radius:6px;
+    padding:3px 9px}
+  .lrefresh:hover:not(:disabled){color:var(--text);border-color:var(--accent)}
+  .lrefresh:disabled{opacity:.5;cursor:default}
+  .lage{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .lage.stale{color:var(--warn)}
+  .load{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .load .lv{font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 8px;
+    border-radius:20px;border:1px solid transparent}
+  .load .why{font-size:11px;color:var(--faint)}
+  .lv.full{color:var(--down);background:rgba(248,81,73,.12);border-color:rgba(248,81,73,.35)}
+  .lv.busy{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
+  .lv.ok{color:var(--up);background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.28)}
+  .lv.idle{color:var(--faint);background:var(--surface2);border-color:var(--border)}
+  .lv.unk{color:var(--muted);background:var(--surface2);border-color:var(--border)}
+  .load .lnum{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px;
+    color:var(--text)}
+  .load .kv{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);
+    font-size:11px}
+  .load .kvbar{display:inline-block;width:30px;height:5px;border-radius:3px;
+    background:var(--surface2);border:1px solid var(--border);overflow:hidden}
+  .load .kv i{display:block;height:100%;width:0}
+  .load .kv b{font-weight:600}
+  .load .kv.good i{background:var(--up)} .load .kv.good b{color:var(--up)}
+  .load .kv.warn i{background:var(--warn)} .load .kv.warn b{color:var(--warn)}
+  .load .kv.bad i{background:var(--down)} .load .kv.bad b{color:var(--down)}
+  .use{display:flex;align-items:center;gap:7px;white-space:nowrap}
+  .use .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px}
+  .use .bar{width:46px;height:5px;border-radius:3px;background:var(--surface2);
+    overflow:hidden;border:1px solid var(--border)}
+  .use .bar i{display:block;height:100%}
+  .use.good .num{color:var(--up)} .use.good .bar i{background:var(--up)}
+  .use.warn .num{color:var(--warn)} .use.warn .bar i{background:var(--warn)}
+  .use.bad .num{color:var(--down)} .use.bad .bar i{background:var(--down)}
+  .use.idle .num{color:var(--faint)}
+
   tr.grp-row td{background:var(--surface);border-top:2px solid var(--border)}
   tr.grp-row:first-child td{border-top:none}
   tr.grp-row td.name{font-weight:600}
@@ -178,7 +216,10 @@
     padding:0 5px;margin-left:8px;letter-spacing:.02em;white-space:nowrap}
 
   /* Model ↔ Backend 그래프 + Deployments 를 한 섹션에서 좌우로 (필터 공유) */
-  .topo-split{display:grid;grid-template-columns:minmax(340px,5fr) 7fr;gap:16px;align-items:start}
+  /* 그래프 SVG 는 max-width 600px 라 그 이상은 여백이 된다 — 컬럼을 상한으로 묶고
+     남는 폭은 전부 표에 준다(부하·replicas·GPU 컬럼이 스크롤 밖으로 밀리지 않게). */
+  .topo-split{display:grid;grid-template-columns:minmax(320px,440px) 1fr;gap:16px;
+    align-items:start}
   /* 그래프 컬럼이 없을 때(숨김·유저뷰·데이터 없음) 표가 전체 폭을 차지 */
   .topo-split.no-graph{grid-template-columns:1fr}
   /* 좁은 화면에선 좌우 분할을 접어 위(그래프)-아래(표)로 쌓는다 */
@@ -290,6 +331,9 @@
                aria-label="모델·백엔드 검색"
                placeholder="🔍 모델·백엔드 검색  ( / )"
                title="model_name·service·api_base 로 필터 — 표·그래프에 함께 적용. 단축키 &quot;/&quot;, 지우기 Esc">
+        <button class="lrefresh" id="load-refresh" type="button" hidden
+                title="지금 부하만 즉시 다시 읽습니다 — 백엔드 Pod 마다 /metrics 를 한 번씩 조회하므로 최소 10초 간격으로 제한됩니다">⟳ 부하</button>
+        <span class="lage" id="load-age" hidden></span>
         <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
@@ -524,6 +568,48 @@ function downTip(d){
   if(d.status_detail) parts.push(d.status_detail);
   return parts.join("\n");
 }
+// 부하 값의 나이. 주기가 60초라 "지금"이 아니다 — 언제 읽은 값인지 항상 같이 보여준다.
+function renderLoadAge(snap){
+  const btn=$("#load-refresh"), lbl=$("#load-age");
+  if(!btn||!lbl) return;
+  // 즉시 갱신은 백엔드 팬아웃을 유발해 admin 전용이다(서버가 403). 비-admin 키에
+  // 버튼만 보이면 눌러도 실패하는 UI 가 되므로 아예 숨긴다. 나이 표시는 남긴다.
+  const on = !!snap.load_enabled && !snap.demo;
+  const mayRefresh = on && (!snap.user_view || !!snap.admin_view);
+  btn.hidden = !mayRefresh; lbl.hidden = !on;
+  if(!on) return;
+  const ts = snap.load_ts_epoch;
+  if(ts==null){ lbl.textContent="부하 수집 대기"; lbl.classList.remove("stale"); return; }
+  const age = Math.max(0, Math.round(Date.now()/1000 - ts));
+  lbl.textContent = age<60 ? (age+"초 전") : (Math.floor(age/60)+"분 "+(age%60)+"초 전");
+  // 주기(기본 60s)의 2배를 넘으면 수집이 밀리는 중 -> 눈에 띄게.
+  lbl.classList.toggle("stale", age > 2*(snap.load_interval||60));
+  lbl.title = "부하를 마지막으로 읽은 시각 기준. 주기 "
+    + (snap.load_interval||60) + "초 · 버튼으로 즉시 갱신";
+}
+
+async function refreshLoadNow(){
+  const btn=$("#load-refresh"), lbl=$("#load-age");
+  if(!btn || btn.disabled) return;
+  btn.disabled = true; const prev=btn.textContent; btn.textContent="⟳ 조회 중…";
+  try{
+    const key = (typeof uvKey==="function") ? uvKey() : "";
+    const r = await fetch(BASE_PATH+"/api/load/refresh",
+      {method:"POST", cache:"no-store",
+       headers: key ? {"X-LiteLLM-Key": key} : {}});
+    const j = await r.json().catch(()=>({}));
+    if(!j.ok && lbl){
+      lbl.textContent = j.retry_after ? (Math.ceil(j.retry_after)+"초 뒤 가능")
+                                      : (j.error||"실패");
+      lbl.classList.add("stale");
+    }
+    await tick();          // 갱신된 스냅샷을 바로 가져와 다시 그린다
+  }catch(e){ if(lbl){ lbl.textContent="새로고침 실패"; lbl.classList.add("stale"); } }
+  finally{ btn.textContent=prev;
+    // 서버 최소 간격(10s)과 맞춰 연타를 막는다.
+    setTimeout(()=>{ btn.disabled=false; }, 10000); }
+}
+
 function statusPill(s, d){
   const cls = statusPillCls(s);
   // PAUSED 는 'PAUSED(UP)' 처럼 원래 health 판정을 괄호로 덧붙인다 — 다시 켰을 때
@@ -704,8 +790,150 @@ function gpuBar(products){
   const leg=keys.map(k=>'<span><i style="background:'+devColor(k)+'"></i>'+esc(k)+'×'+products[k]+'</span>').join("");
   return '<span class="gbar">'+segs+'</span><span class="glegend">'+leg+'</span>';
 }
+// ── 지금 부하 (백엔드 엔진 게이지) ───────────────────────────────────────
+// per-user 뷰는 리댁션 때문에 평탄한 스칼라(load_state/load_running/...)만 온다.
+// 셀/집계가 두 형태를 따로 다루지 않도록 여기서 admin 뷰와 같은 모양으로 되돌린다.
+const LOAD_CODE_TEXT = {timeout:"응답 없음(타임아웃)", refused:"연결 안 됨",
+  forbidden:"권한 없음", no_metrics:"게이지 없음",
+  skipped_wake_risk:"조회 안 함(깨울 위험)", skipped_external:"조회 안 함(외부 백엔드)",
+  no_sample:"표본 없음", error:"수집 실패"};
+function loadOf(d){
+  if(d.load) return d.load;
+  if(d.load_state==null) return null;
+  return {state:d.load_state,
+          state_reason:d.load_reason||LOAD_CODE_TEXT[d.load_reason_code]||"",
+          running:d.load_running, waiting:d.load_waiting, kv_cache_pct:d.load_kv_pct,
+          pods_sampled:d.load_pods_sampled||0, pods_failed:d.load_pods_failed||0,
+          // summary 모드는 표본 수 대신 불리언만 온다(수치 비노출).
+          partial:!!d.load_partial,
+          scope:d.load_scope, per_pod:[]};
+}
+const LOAD_LV = {saturated:["FULL","full"], busy:["BUSY","busy"],
+                 ok:["ok","ok"], idle:["idle","idle"], unknown:["?","unk"]};
+const LOAD_RANK = {saturated:3, busy:2, ok:1, idle:0, unknown:-1};
+
+// 실패 사유는 길다 -> 셀에는 짧게, 원문은 툴팁으로. 타임아웃과 연결 거부를
+// 구분한다: 타임아웃은 "엔진이 너무 바빠 /metrics 도 못 돌려주는 중"일 수 있어
+// 죽었거나 막힌 것과 뜻이 다르다.
+function loadWhyShort(reason){
+  const r=String(reason||"").toLowerCase();
+  if(r.includes("timed out")||r.includes("timeout")) return "응답 없음(타임아웃)";
+  if(r.includes("connection")||r.includes("refused")) return "연결 안 됨";
+  if(r.includes("게이지")||r.includes("metric")) return "게이지 없음";
+  if(r.includes("생략")||r.includes("external")) return "조회 안 함";
+  return String(reason||"").slice(0,28);
+}
+// 표본 출처 툴팁. per-user 뷰(uHide)에서는 Pod 주소를 노출하지 않는다.
+function podTip(l, uHide){
+  if(!l) return "";
+  const scope = l.scope==="pods" ? ("Pod "+(l.pods_sampled||0)+"개 직접 조회")
+    : l.scope==="prometheus" ? ("Prometheus 경유 — Pod "+(l.pods_sampled||0)+"개 (스크레이프 주기만큼 지연)")
+    : l.scope==="skipped" ? "조회하지 않음 — "+(l.error||"")
+    : "LB 경유 1개 샘플 (Pod 주소 미확인)";
+  if(uHide) return scope;
+  const rows=(l.per_pod||[]).map(p=> p.error ? ((p.url||"")+" — "+p.error)
+    : ((p.url||"")+" — run "+(p.running!=null?p.running:"?")
+       +", queue "+(p.waiting!=null?p.waiting:"?")
+       +", kv "+(p.kv_cache_pct!=null?p.kv_cache_pct+"%":"?")));
+  return scope + (rows.length? ("\n"+rows.join("\n")) : "");
+}
+// 일부 Pod 만 응답했으면 그 사실을 등급 옆에 적는다 — 숫자의 근거를 숨기지 않는다.
+function partialNote(l){
+  const bad=(l||{}).pods_failed||0;
+  // 표본 수를 안 주는 모드(per-user summary)에서도 "일부만 보고 낸 등급"이라는
+  // 사실은 숨기지 않는다 — 불완전한 값을 완전한 척 보여주지 않는 것이 우선이다.
+  if(!bad) return (l||{}).partial ? " (일부 Pod)" : "";
+  const ok=l.pods_sampled||0;
+  return " ("+ok+"/"+(ok+bad)+" Pod)";
+}
+// 처리 중/대기 숫자 조각. 대기가 있으면 노랑(>=5 빨강)으로 드러낸다.
+function inflightBit(l){
+  if(!l || (l.running==null && l.waiting==null)) return "";
+  const run = l.running!=null ? l.running : "?";
+  const q = l.waiting;
+  const qs = q ? '<b style="color:'+(q>=5?"var(--down)":"var(--warn)")+'">+'+q+'</b>' : "";
+  return '<span class="lnum" title="처리 중 '+run+' · 대기 '+(q!=null?q:"?")+'">'
+    +run+qs+'</span>';
+}
+// KV 사용률 조각(작은 막대 + %).
+function kvBit(l){
+  if(!l || l.kv_cache_pct==null) return "";
+  const pct=Math.min(100,Math.round(l.kv_cache_pct));
+  const tip = l.kv_cache_avg_pct!=null
+    ? ("KV 최대 "+l.kv_cache_pct+"% · 평균 "+l.kv_cache_avg_pct+"%") : "KV 캐시 사용률";
+  return '<span class="kv '+kvClass(pct)+'" title="'+esc(tip)+'">'
+    +'<span class="kvbar"><i style="width:'+pct+'%"></i></span><b>'+pct+'%</b></span>';
+}
+function loadCell(d, uHide){
+  const l=loadOf(d);
+  if(!l) return '<span class="srccol">-</span>';
+  const st=l.state||"unknown", lv=LOAD_LV[st]||LOAD_LV.unknown;
+  const why = st==="unknown" ? loadWhyShort(l.state_reason)
+                             : (l.state_reason||"")+partialNote(l);
+  const tip = (st==="unknown"&&l.state_reason ? l.state_reason+"\n" : "")+podTip(l,uHide);
+  return '<div class="load" title="'+esc(tip)+'"><span class="lv '+lv[1]+'">'+lv[0]+'</span>'
+    +'<span class="why">'+esc(why)+'</span>'+inflightBit(l)+kvBit(l)+'</div>';
+}
+// 처리 중 + 대기를 한 셀에 (표 폭이 귀하다 — 그래프와 좌우 분할).
+// tok/s 는 이 셀 툴팁으로 내린다: 있으면 좋지만 "바쁜가"의 1차 신호는 아니다.
+function kvClass(pct){ return pct>=95?"bad":(pct>=80?"warn":"good"); }
+// --- 그룹(모델) 단위 롤업 -------------------------------------------------
+// 모델 등급 = backend 중 **가장 나쁜 것**. LiteLLM 기본 라우팅(simple-shuffle)은
+// 여유 있는 backend 로만 보내주지 않으므로, 하나가 포화면 요청 일부는 기다린다.
+// 대신 등급 분포(FULL 1 · ok 2)를 함께 보여 과잉 경보가 되지 않게 한다.
+// 모델 등급 = 라우팅 방식에 달렸다. least-busy(기본)면 다음 요청이 갈 **가장
+// 한가한** backend 가 답이고, simple-shuffle 이면 포화된 backend 도 트래픽을 받으니
+// **가장 나쁜** 쪽이 정직하다. summarize 와 같은 규칙을 써야 카드와 표가 안 어긋난다.
+function compositeLoad(bes, leastBusy){
+  let pick=null, counts={};
+  bes.forEach(b=>{ const l=loadOf(b); if(!l) return;
+    const st=l.state||"unknown"; counts[st]=(counts[st]||0)+1;
+    const r=LOAD_RANK[st]??-1;
+    if(r<0) return;                       // 모름은 등급 후보가 아니다
+    const cur=pick?(LOAD_RANK[pick.state]??-1):null;
+    if(cur===null || (leastBusy ? r<cur : r>cur)) pick={state:st, load:l};
+  });
+  if(!pick){   // 전부 모름 -> 그 사실을 그대로
+    const any=bes.map(loadOf).find(Boolean);
+    if(any) pick={state:"unknown", load:any};
+  }
+  return {worst:pick, counts:counts};
+}
+function compositeLoadCell(bes, uHide, leastBusy){
+  const c=compositeLoad(bes, leastBusy);
+  if(!c.worst) return '<span class="srccol">-</span>';
+  const st=c.worst.state, lv=LOAD_LV[st]||LOAD_LV.unknown;
+  const order=["saturated","busy","ok","idle","unknown"];
+  const spread=order.filter(k=>c.counts[k]).map(k=>(LOAD_LV[k]||LOAD_LV.unknown)[0]+" "+c.counts[k]);
+  const n=bes.filter(b=>b.load).length;
+  const why = n>1 ? spread.join(" · ")
+    : (st==="unknown" ? loadWhyShort(c.worst.load.state_reason)
+                      : (c.worst.load.state_reason||"")+partialNote(c.worst.load));
+  const tip = n>1
+    ? (leastBusy
+       ? ("backend "+n+"개 중 **가장 한가한** 등급으로 표시 — least-busy 라우팅이면 "
+          +"다음 요청은 여유 있는 backend 로 간다. 분포로 부분 포화를 함께 표시.")
+       : ("backend "+n+"개 중 **가장 나쁜** 등급으로 표시 — simple-shuffle 라우팅이면 "
+          +"포화된 backend 도 요청 일부를 받는다."))
+    : podTip(c.worst.load, uHide);
+  const sl=sumLoad(bes).load;
+  return '<div class="load" title="'+esc(tip)+'"><span class="lv '+lv[1]+'">'+lv[0]+'</span>'
+    +'<span class="why">'+esc(why)+'</span>'+inflightBit(sl)+kvBit(sl)+'</div>';
+}
+// 요청 수는 합, 사용률은 최댓값(더하는 값이 아니다).
+function sumLoad(bes){
+  let run=null,q=null,kv=null,tp=null;
+  bes.forEach(b=>{ const l=loadOf(b); if(!l) return;
+    if(l.running!=null) run=(run||0)+l.running;
+    if(l.waiting!=null) q=(q||0)+l.waiting;
+    if(l.kv_cache_pct!=null) kv=(kv==null?l.kv_cache_pct:Math.max(kv,l.kv_cache_pct));
+    if(l.throughput!=null) tp=(tp||0)+l.throughput; });
+  return {load:{running:run, waiting:q, kv_cache_pct:kv, throughput:tp}};
+}
+
 // model_name 으로 묶은 tbody 행들(부모 그룹 행 + 자식 백엔드 행)
-function groupedRows(merged, shared, showBk, showGpu){
+function groupedRows(merged, shared, showBk, showGpu, showLoad, uHide,
+                    leastBusy){
   const order=[], groups={};
   merged.forEach(d=>{ if(!groups[d.model_name]){groups[d.model_name]=[];order.push(d.model_name);}
     groups[d.model_name].push(d); });
@@ -719,6 +947,7 @@ function groupedRows(merged, shared, showBk, showGpu){
     let html='<tr class="grp-row" data-model="'+attrId(name)+'" data-svcs="'+svcs+'"><td>'+compositePill(st,bes)+'</td>'
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
+      + (showLoad ? '<td>'+compositeLoadCell(bes,uHide,leastBusy)+'</td>' : '')
       +'<td>'+typeChips(net,eng)+'</td>';
     if(showBk){ html+='<td>'+aggCell(agg.r,agg.d)+'</td>';
       if(showGpu){const sg=sumGpu(bes); html+='<td>'+aggGpuCell(sg.g,sg.products)+'</td>';}
@@ -730,7 +959,8 @@ function groupedRows(merged, shared, showBk, showGpu){
       const svcLabel=svcLabelOf(b);
       html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?",b)+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
-          +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td><td></td>';
+          +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td>'
+        + (showLoad ? '<td>'+loadCell(b,uHide)+'</td>' : '') + '<td></td>';
       if(showBk){ html+='<td>'+backendCell(b)+'</td>';
         if(showGpu) html+='<td>'+gpuCell(b)+'</td>';
         html+='<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
@@ -965,6 +1195,26 @@ function render(snap){
   lastSnap = snap;
   // summary cards
   let cards = "";
+  // 등급 카드와 수치 카드의 게이트는 **다르다**. per-user 뷰의 summary 모드는
+  // 등급만 오고 처리중/대기/KV 는 오지 않는다 — 한 플래그로 묶으면 그 모드에서
+  // 카드가 통째로 사라져 "부하를 아예 모른다"처럼 보인다.
+  if(s.load_state_known || s.load_known){
+    const busy=s.models_busy||0, sat=s.models_saturated||0;
+    cards += card("지금 바쁜 모델",
+      busy+'<span style="color:var(--faint);font-size:16px"> / '
+      +(s.models_load_total||0)+'</span>',
+      sat?"bad":(busy?"warn":"good"),
+      s.busiest ? esc(s.busiest.model_name)+" · "+esc(s.busiest.reason||"")
+                : "큐 없음 · 여유");
+  }
+  if(s.load_known){
+    cards += card("처리 중", s.running||0, (s.running?"good":""), "in-flight 요청 합");
+    cards += card("대기", s.queued||0, (s.queued?"bad":""),
+      s.queued? "지금 기다리는 요청" : "대기 없음");
+    if(s.kv_max_pct!=null)
+      cards += card("KV 최대", Math.round(s.kv_max_pct)+"%",
+        s.kv_max_pct>=95?"bad":(s.kv_max_pct>=80?"warn":"good"), "가장 붐비는 Pod");
+  }
   // per-user 뷰: 맨 앞에 "내 키" 카드(접근 모델 수 / spend·예산 / rate limit·만료)
   if(snap.user_view){
     const ki = snap.key_info || {};
@@ -1019,6 +1269,14 @@ function render(snap){
   const showBk = !!snap.backend_count_enabled;
   const uHide = !!snap.user_view;   // per-user 뷰는 내부 컬럼(MODE/SRC/API_BASE) 숨김
   const showGpu = !!s.gpu_known && !uHide;   // GPU 컬럼도 내부정보 — user 뷰 숨김
+  // 부하 컬럼은 per-user 뷰에도 보여준다(내부 토폴로지가 아니라 "지금 쓸 수 있나" 정보).
+  // Pod 주소가 담긴 툴팁만 uHide 로 가린다(loadCell/podTip).
+  // 부하는 per-user 뷰에도 보여준다 — 내부 토폴로지가 아니라 "지금 이 모델을
+  // 쓸 수 있나"의 답이다. 리댁션은 평탄한 스칼라만 남기므로(Pod 주소 제외)
+  // loadOf 가 같은 모양으로 되돌린다.
+  const showLoad = !!snap.load_enabled;
+  renderLoadAge(snap);
+  const leastBusy = String(snap.load_routing||"least-busy") !== "shuffle";
   const dt = $("#deployments");
   // status/net/engine 필터는 표와 그래프에 똑같이 적용한다(그래프도 필터된 집합만 그림).
   const fS = $("#f-status").value, fN = $("#f-net").value, fE = $("#f-eng").value;
@@ -1059,13 +1317,15 @@ function render(snap){
     updatePinBadge(pinActive, pinLabel);
     $("#f-count").textContent = (fS||fN||fE||fQ)
       ? merged.length+" / "+all.length : all.length+"";
-    let head = "<tr><th>STATUS</th><th>MODEL_NAME</th><th>TYPE</th>";
+    let head = "<tr><th>STATUS</th><th>MODEL_NAME</th>";
+    if(showLoad) head += '<th title="지금 부하 — 등급 · 근거 · 처리중+대기 · KV">LOAD</th>';
+    head += "<th>TYPE</th>";
     if(showBk) head += '<th>REPLICAS (ready/desired)</th>';
     if(showBk && showGpu) head += '<th>GPU</th>';
     if(showBk && !uHide) head += '<th>MODE</th><th>SRC</th>';
     if(!uHide) head += "<th>API_BASE</th>";
     head += "</tr>";
-    const ncol = 3 + (showBk?1:0) + (showBk&&showGpu?1:0)
+    const ncol = 3 + (showLoad?1:0) + (showBk?1:0) + (showBk&&showGpu?1:0)
       + (showBk&&!uHide?2:0) + (uHide?0:1);
     dt.querySelector("thead").innerHTML = head;
     // per-user 뷰(uHide)는 내부 컬럼을 숨긴 평면 행으로 그린다(그룹핑은 admin 전용).
@@ -1082,12 +1342,14 @@ function render(snap){
     } else if(grouped){
       // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
       // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
-      body = groupedRows(tableDeps, sharedMap(all), showBk, showGpu);
+      body = groupedRows(tableDeps, sharedMap(all), showBk, showGpu, showLoad,
+                         uHide, leastBusy);
     } else {
       body = tableDeps.map(d=>{
         let row = '<tr data-model="'+attrId(d.model_name)+'" data-svc="'+attrId(svcKeyOf(d))+'"><td>'
           +statusPill(d.status||"?",d)+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
+          + (showLoad ? "<td>"+loadCell(d,uHide)+"</td>" : "")
           +'<td>'+typeChips(netOf(d),engOf(d))+"</td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
         if(showBk && showGpu) row += "<td>"+gpuCell(d)+"</td>";
@@ -1290,6 +1552,7 @@ $("#deployments").addEventListener("click", (e)=>{
     setTimeout(()=>td.classList.remove("copied"), 900); }).catch(()=>{});
 });
 // 📌 pin 칩 클릭 → pin 해제(표 전체 복원). 칩은 매 렌더마다 새로 그려지므로 위임으로 1회만.
+$("#load-refresh").addEventListener("click", refreshLoadNow);
 $("#dep-label").addEventListener("click", (e)=>{
   if(e.target.closest("#pin-badge") && graphPin){
     graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });

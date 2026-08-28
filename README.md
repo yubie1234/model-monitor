@@ -1,6 +1,6 @@
 # model-monitor
 
-**버전: v1.1.0** — 관리자 일시중지(`model_info.blocked`) 를 `PAUSED` 로 구분 · 장애 원인·수집 신뢰도 가시화 · 대시보드 UX · 시스템 부하 개선
+**버전: v1.2.0** — **지금 부하**(backend 엔진 게이지로 "이 모델 지금 바쁜가") · 부하 조회 주기 분리(60초)와 수동 새로고침 · per-user 뷰 부하 노출 단계(`off`/`summary`/`detail`) · Pod 조회가 막힌 환경용 Prometheus 폴백
 
 LiteLLM → KServe → vLLM/SGLang 백엔드에서 **실제로 떠 있는 모델 현황**과 **각 api_base(LB) 뒤에 떠 있는 backend Pod 개수**를 보여주는 **FastAPI 서비스**. 웹 대시보드(`/`)와 JSON API(`/api/snapshot`), Prometheus 메트릭(`/metrics`)을 제공합니다.
 
@@ -197,6 +197,29 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
   (폴링 주기 × 사용자 수만큼 반복). 실측: 배포 1000개 중 50개 접근 사용자 **13.7ms → 0.24ms**,
   전체 접근이어도 **5.5배**. 남기는 값은 컨테이너면 deepcopy 해 공유 스냅샷과 객체를 공유하지
   않습니다(뷰를 변형해도 다른 사용자 뷰가 깨지지 않음 — 회귀 테스트로 고정).
+- **지금 부하 노출 단계 (v1.2.0)**: `MONITOR_USER_VIEW_LOAD`(= config `user_view.load`) 로
+  **off / summary / detail** 중 고릅니다(기본 `summary`).
+
+  | 값 | 사용자에게 보이는 것 | 쓰임 |
+  | --- | --- | --- |
+  | `off` | 없음 — LOAD 컬럼·부하 카드가 사라집니다 | 사용자에게 부하를 아예 알리지 않을 때 |
+  | `summary` | 등급만 (`idle`/`ok`/`BUSY`/`FULL`/`?`) + `?` 의 사유 코드 | "지금 쓸 수 있나"에는 답하되 운영 수치는 감출 때 (**기본**) |
+  | `detail` | 등급 + 처리 중/대기/KV·표본 수 | 사용자도 수치를 봐야 할 때(사내 팀 등) |
+
+  - 이건 **서버에서 값을 빼는 것**이지 화면에서 가리는 것이 아닙니다 — `POST /api/snapshot/user`
+    응답을 직접 열어도 없는 값은 없습니다.
+  - `summary` 라도 일부 Pod 을 못 읽고 낸 등급이면 `(일부 Pod)` 로 표시합니다(표본 수는 숨긴 채) —
+    불완전한 값을 완전한 척 보여주지 않습니다.
+  - 어느 모드에서도 **Pod 주소(`per_pod`)는 나가지 않습니다**. 오타 등 모르는 값은 `detail` 이
+    아니라 `summary` 로 떨어집니다(과다 노출 쪽으로 실패하지 않게).
+  - `MONITOR_LOAD=false`(수집 자체 off)면 이 값도 자동으로 `off` 입니다.
+  - **적용**: env(`MONITOR_USER_VIEW_LOAD`) 또는 설정 파일 `user_view.load`. k8s 는
+    ConfigMap 의 `config.json` 을 고친 뒤 `kubectl -n dashboard rollout restart
+    deployment/model-monitor` — 예시는 [deploy/k8s.yaml](deploy/k8s.yaml) ConfigMap 위 주석에
+    있습니다. 확인은 사용자 키로 직접:
+    `curl -s -X POST -H "X-LiteLLM-Key: <사용자 키>" <base>/api/snapshot/user | grep load`
+    (`off`=키 없음 · `summary`=`load_state` 만 · `detail`=`load_running`/`load_kv_pct` 까지)
+  - `⟳ 부하`(즉시 갱신)는 백엔드 팬아웃을 유발하므로 **admin 키에만** 보입니다.
 - **접근 캐시**: 같은 키의 `/v1/models` 결과를 **짧은 TTL(기본 30s)** 캐시해 폴링 중복 호출을 제거
   (해시만 보관, 원문 키 비저장). 성공만 캐시 → 무효 키는 매번 재검증. 취소/만료 키는 최대 TTL 동안 stale.
   config `user_view.cache_ttl` 로 조절.
@@ -298,15 +321,35 @@ LiteLLM 가상 키마다 접근 가능한 모델이 다릅니다. 이 모드를 
 | `MONITOR_PROBE_BACKENDS` | 백엔드 직접 probe (false) |
 | `MONITOR_BACKEND_COUNT` | LB 뒤 backend Pod 개수 수집 (true) |
 | `MONITOR_GPU_INFO` | GPU 개수/장치명 수집 (true; Pod·Node 읽기 권한 필요) |
+| `MONITOR_LOAD` | **지금 부하** 수집 (true; `MONITOR_BACKEND_COUNT` 필요) — 각 backend Pod 의 `/metrics`(vLLM/SGLang 게이지)를 읽어 처리 중/대기 요청·KV 캐시 사용률·tok/s 를 표시. Pod 주소는 GPU 집계가 이미 받아오는 Pod 목록에서 나오므로 **k8s 호출이 늘지 않는다**. Pod 주소를 못 얻는 백엔드(scale-to-zero·external)는 **조회하지 않고** 이유와 함께 `?` — LB 로 찌르면 activator 를 거쳐 모델을 깨우기 때문 |
+| `MONITOR_LOAD_INTERVAL` | 부하 조회 주기 초 (**60**) — Pod 마다 `/metrics` 를 읽는 팬아웃이라 스냅샷 갱신(5초)과 분리했다. 화면에는 "N초 전"으로 신선도를 함께 표시하고, 급하면 대시보드의 **`⟳ 부하`** 버튼으로 즉시 당겨 읽는다(`POST /api/load/refresh`, 서버가 최소 10초 간격·진행 중 락으로 제한) |
+| `MONITOR_LOAD_TIMEOUT` | Pod `/metrics` 조회 타임아웃 초 (3) — 죽은 Pod 가 사이클을 잡아먹지 않게 짧게 |
+| `MONITOR_LOAD_ROUTING` | 한 `model_name` 에 backend 가 여러 개일 때 모델 등급 기준 (`least-busy` \| `shuffle`). **LiteLLM 의 `routing_strategy` 에 맞춘다** — least-busy 면 다음 요청이 갈 가장 한가한 backend 가 답이고, simple-shuffle 이면 포화된 backend 도 트래픽을 받으므로 가장 나쁜 쪽이 정직하다. 어느 쪽이든 화면에는 등급 분포(`FULL 1 · ok 1`)를 함께 표시 |
+| `MONITOR_PROMETHEUS_URL` | Pod 직접 조회가 막혔을 때(NetworkPolicy·mTLS) 같은 게이지를 대신 읽을 외부 Prometheus URL. 출처가 같아 정확도는 동일하고 스크레이프 주기만큼 늦다 |
+| `MONITOR_PROMETHEUS_FIRST` / `MONITOR_PROMETHEUS_LOOKBACK` | Pod 조회를 건너뛰고 Prometheus 만 사용 (false) / 조회 구간 (`2m` — 이보다 오래된 샘플은 '모름'으로 둔다) |
 | `MONITOR_METRICS` | Prometheus `/metrics` (true) |
 | `MONITOR_METRICS_TOKEN` | 키 필수 모드에서 `/metrics` 스크레이프용 Bearer 토큰 (미설정=admin 키만) |
 | `MONITOR_USER_VIEW` | 키 필수(per-user) 모드 — 키 입력해야 조회, admin 키는 전체 뷰 (false) |
 | `MONITOR_USER_VIEW_SHOW_INTERNAL` | per-user 뷰에서 내부 api_base/namespace 도 표시 (false=숨김) |
+| `MONITOR_USER_VIEW_LOAD` | per-user 뷰에 **지금 부하**를 어디까지 보여줄지 — `off` \| `summary` \| `detail` (**기본 `summary`**). `off`=아예 안 보냄(LOAD 컬럼도 사라짐), `summary`=등급(idle/ok/BUSY/FULL/?)만, `detail`=처리중/대기/KV 수치까지. 어느 모드든 **Pod 주소는 나가지 않는다**. `MONITOR_LOAD=false` 면 자동으로 `off` |
 | `MONITOR_USER_VIEW_CACHE_TTL` | 키별 접근(/v1/models) 캐시 TTL 초 (30) |
 | `MONITOR_K8S_API_SERVER` / `MONITOR_K8S_TOKEN_FILE` / `MONITOR_K8S_CA_FILE` | k8s 접근 오버라이드 |
 | `MONITOR_K8S_INSECURE` / `MONITOR_K8S_TIMEOUT` | k8s API TLS 검증 비활성 / 타임아웃 초 (false / 5) |
 
+> `load.thresholds`(등급 판정 기준: `queue_busy`/`queue_saturated`/`kv_busy`/`kv_saturated`)와
+> `prometheus.labels`(스크레이프 라벨 이름 교정)는 설정 파일에서 받습니다.
+
 > 중첩 설정(`backends`, `namespace_overrides`, `user_view.*`, `metrics.*` 등)은 `MONITOR_CONFIG_FILE` 가 가리키는 설정 파일에서 받습니다.
+
+### 부하 조회 주기와 수동 새로고침
+
+- **백그라운드 루프 하나**가 60초마다 조회한다. **화면을 보는 세션 수와 무관**하다 — 대시보드
+  폴링(`GET /api/snapshot`)은 캐시된 스냅샷을 그대로 돌려줄 뿐 수집하지 않는다(이 프로젝트의
+  기본 규칙: 요청 경로에서 수집하지 않는다). 10명이 보고 있어도 백엔드로 나가는 조회는 그대로다.
+- 값의 나이는 화면에 `N초 전` 으로 표시하고, 주기의 2배를 넘으면 노란색으로 바뀐다.
+- 즉시 보고 싶으면 `⟳ 부하` 버튼 → `POST /api/load/refresh`. **이것만이 요청 경로에서 실제로
+  수집하는 예외**라, 서버가 최소 간격 10초 + 진행 중 락으로 직렬화한다(여러 명이 눌러도 팬아웃이
+  겹치지 않는다). 키 필수 모드에서는 admin 키가 있어야 한다.
 
 ## 운영 배포
 

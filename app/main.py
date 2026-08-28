@@ -78,6 +78,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     # 키 필수 모드는 데모에선 끈다(데모는 라이브 키 검증이 없음).
     app.state.user_view_on = bool(collector_settings["user_view"]) and not settings.demo
     app.state.hide_internal = bool(collector_settings["user_view_hide_internal"])
+    # per-user 뷰의 부하 노출 단계(off/summary/detail) — 정식화는 config 에서 끝났다.
+    app.state.user_load_mode = str(collector_settings["user_view_load"])
     app.state.metrics_on = bool(collector_settings["metrics"])
     # 키 필수 모드에서 admin 키 없이 /metrics 스크레이프를 허용하는 전용 토큰(빈 값=비활성).
     app.state.metrics_token = collector_settings.get("metrics_token") or ""

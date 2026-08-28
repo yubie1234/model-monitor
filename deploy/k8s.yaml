@@ -71,6 +71,24 @@ kind: ConfigMap
 metadata:
   name: model-monitor-config
   namespace: dashboard
+# 중첩 설정은 여기(config.json)서 받는다. JSON 이라 파일 안에는 주석을 못 다니
+# 자주 쓰는 블록을 여기 적어 둔다 — 필요한 것만 아래 config.json 에 넣으면 된다.
+#
+#   "user_view": {                 # 키 필수(per-user) 모드
+#     "enabled": true,             #   켜기 전에 LiteLLM /v1/models 가 키별로
+#                                  #   필터되는지 반드시 확인(안 되면 전체 유출)
+#     "load": "summary",           #   사용자에게 "지금 부하"를 어디까지 보여줄지
+#                                  #     off     = 안 보냄(LOAD 컬럼도 사라짐)
+#                                  #     summary = 등급(BUSY/ok/…)만  ← 기본
+#                                  #     detail  = 처리중/대기/KV 수치까지
+#                                  #   어느 값이든 Pod 주소는 나가지 않는다.
+#                                  #   env MONITOR_USER_VIEW_LOAD 가 우선한다.
+#     "show_internal": false,      #   true 면 per-user 뷰에도 api_base/namespace 노출
+#     "cache_ttl": 30              #   키별 /v1/models 캐시 TTL(초)
+#   }
+#
+# 값을 바꾼 뒤에는 재기동해야 반영된다:
+#   kubectl -n dashboard rollout restart deployment/model-monitor
 data:
   config.json: |
     {
@@ -108,7 +126,7 @@ metadata:
   labels:
     app: model-monitor
     app.kubernetes.io/name: model-monitor
-    app.kubernetes.io/version: "1.1.0"
+    app.kubernetes.io/version: "1.2.0"
 spec:
   replicas: 1
   selector:
@@ -118,7 +136,7 @@ spec:
       labels:
         app: model-monitor
         app.kubernetes.io/name: model-monitor
-        app.kubernetes.io/version: "1.1.0"
+        app.kubernetes.io/version: "1.2.0"
     spec:
       serviceAccountName: model-monitor
       containers:
