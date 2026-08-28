@@ -2805,6 +2805,102 @@ class TestDashboardTemplateScopes(unittest.TestCase):
                 "위장한다. `all` 을 함수 스코프로 올릴 것." % (lineno, src))
 
 
+class TestDashboardTabSplit(unittest.TestCase):
+    """대시보드 상태/부하 탭 분리(v1.3.0)의 구조 회귀 검사.
+
+    파이썬은 JS 를 실행하지 않으므로(stdlib-only·에어갭) 렌더 결과가 아니라
+    **구조**를 본다. 여기서 잡으려는 회귀는 전부 실제로 하기 쉬운 실수다:
+    부하 위젯이 슬그머니 상태 탭으로 되돌아오는 것, 제거한 LOAD 셀 코드가
+    죽은 채 남는 것, pill CSS 가 사라진 셀에 한정된 채 방치되는 것.
+    """
+
+    ROOT = os.path.dirname(os.path.abspath(__file__))
+    TPL = ("app", "web", "templates", "dashboard.html")
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(cls.ROOT, *cls.TPL), encoding="utf-8") as f:
+            cls.html = f.read()
+
+    def _slice(self, start, end):
+        i = self.html.index(start)
+        j = self.html.index(end, i)
+        return self.html[i:j]
+
+    def test_two_panes_exist(self):
+        for pid in ('id="pane-status"', 'id="pane-load"'):
+            self.assertIn(pid, self.html, "%s pane 이 없다 — 탭 분리가 풀렸다" % pid)
+        self.assertIn('id="tab-status"', self.html)
+        self.assertIn('id="tab-load"', self.html)
+
+    def test_load_widgets_live_outside_status_pane(self):
+        """부하 카드·표는 상태 pane 밖에 있어야 한다.
+
+        상태 탭 안으로 되돌아오면 탭을 나눈 의미가 없고, 화면에는 두 벌이
+        겹쳐 보인다(둘 다 렌더되므로 조용히 중복된다).
+        """
+        pane = self._slice('id="pane-status"', "<!-- /#pane-status -->")
+        for marker in ('id="load-cards"', 'id="loadtable"', 'id="lf-search"'):
+            self.assertNotIn(marker, pane,
+                             "%s 가 상태 pane 안에 있다 — 부하 pane 으로 옮길 것" % marker)
+        pload = self._slice('id="pane-load"', "<!-- /#pane-load -->")
+        for marker in ('id="load-cards"', 'id="loadtable"', 'id="lf-search"'):
+            self.assertIn(marker, pload)
+
+    def test_refresh_button_is_not_in_status_filter_row(self):
+        """`⟳ 부하`·나이 표시는 탭 바(#load-tools)에 있어야 한다.
+
+        v1.2.0 에서는 상태 표의 필터 줄에 끼어 있어 컨트롤이 9개까지 늘었다.
+        """
+        self.assertIn('id="load-tools"', self.html)
+        topo = self._slice('id="topo-sec"', "</section>")
+        for marker in ('id="load-refresh"', 'id="load-age"'):
+            self.assertNotIn(marker, topo,
+                             "%s 가 상태 탭 필터 줄로 되돌아왔다" % marker)
+
+    def test_status_table_has_no_load_column(self):
+        """상태 표는 '떠 있나'만 답한다 — LOAD 셀 코드가 남아 있으면 안 된다.
+
+        showLoad 플래그를 false 로만 두고 셀 함수를 남기면 죽은 코드가 되고,
+        다음 사람이 그것을 되살려 다시 한 셀에 4조각을 넣게 된다.
+        """
+        for dead in ("loadCell(", "compositeLoadCell(", "inflightBit(", "kvBit(",
+                     "showLoad"):
+            self.assertNotIn(dead, self.html,
+                             "%s 가 남아 있다 — 상태 표의 LOAD 컬럼 잔재" % dead)
+        self.assertNotIn(">LOAD</th>", self.html)
+
+    def test_load_pill_css_is_not_scoped_to_removed_cell(self):
+        """등급 pill 의 기본 스타일이 `.load .lv` 에 갇혀 있으면 안 된다.
+
+        LOAD 셀(.load)을 없앴으므로 그 한정이 남으면 pill 이 색만 남고
+        모양(padding/radius)을 잃는다 — 화면은 뜨지만 조용히 망가진다.
+        """
+        css = self._slice("<style>", "</style>")
+        self.assertNotIn(".load .lv{", css)
+        self.assertIn(".lv{", css)
+
+    def test_render_draws_both_panes_every_cycle(self):
+        """render() 가 부하 pane 도 매번 그려야 탭 전환에 재렌더가 필요 없다.
+
+        (탭 점이 상태 탭에서도 최신이어야 한다는 요구와 같은 뿌리다.)
+        """
+        self.assertIn("renderLoadPane(", self.html)
+        i = self.html.index("function render(snap){")
+        j = self.html.index("function showUvError(", i)
+        self.assertIn("renderLoadPane(", self.html[i:j],
+                      "renderLoadPane 이 render() 안에서 호출되지 않는다")
+
+    def test_fail_closed_paths_clear_load_pane(self):
+        """키 미입력·키 검증 실패 화면에서 직전 뷰의 부하가 남으면 안 된다."""
+        self.assertIn("function clearLoadPane(", self.html)
+        for fn in ("function showNeedKey(", "function showUvError("):
+            i = self.html.index(fn)
+            j = self.html.index("\n}\n", i)
+            self.assertIn("clearLoadPane();", self.html[i:j],
+                          "%s 가 부하 pane 을 비우지 않는다 (fail-closed 위반)" % fn)
+
+
 class TestVersionConsistency(unittest.TestCase):
     """버전 문자열이 여러 파일에 흩어져 있고(단일 출처 __version__ 에 자동 연동되지
     않는 수동 복제본), 릴리스 때 한 곳을 빠뜨리기 쉽다 — 실제로 deploy/k8s.yaml 의

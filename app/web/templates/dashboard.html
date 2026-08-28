@@ -54,6 +54,34 @@
   .val.good{color:var(--up)} .val.bad{color:var(--down)} .val.warn{color:var(--warn)}
   .val.accent{color:var(--accent)}
 
+  /* ── 탭 (상태 | 부하) ──────────────────────────────────────────────────
+     "떠 있나"(상태: LiteLLM /health · k8s replicas · GPU)와 "지금 바쁜가"
+     (부하: backend 엔진 게이지)는 출처도 갱신 주기(5초 vs 60초)도 다르다.
+     한 화면에 섞으니 헤드라인 카드가 10장까지 늘어 장애와 혼잡이 구분되지
+     않았다 — 뷰를 갈라 각 탭이 한 가지 질문만 답하게 한다.
+     **데이터를 가르는 것이 아니라 뷰만 가른다** — 스냅샷도 폴링도 하나이고
+     두 pane 을 매 렌더마다 함께 그린다(숨김은 CSS 뿐). 그래서 정지 페이지
+     (/snapshot.html)도 같은 템플릿 하나로 그대로 동작한다. */
+  .tabs{display:flex;align-items:center;gap:2px;flex-wrap:wrap;
+    border-bottom:1px solid var(--border);margin-bottom:18px}
+  .tab{font-family:var(--sans);font-size:13px;font-weight:550;color:var(--muted);
+    background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;
+    padding:8px 14px;cursor:pointer;display:inline-flex;align-items:center;gap:7px}
+  .tab:hover{color:var(--text)}
+  .tab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
+  .tab:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;border-radius:5px}
+  /* 부하 탭의 요약 점 — 탭을 열지 않아도 "지금 바쁜 게 있나"는 보이게 한다.
+     탭으로 갈랐다고 해서 다른 탭의 이상 신호를 못 보게 만들면 안 된다. */
+  .tab .tdot{width:7px;height:7px;border-radius:50%;background:var(--border);flex:none}
+  .tab .tdot.full{background:var(--down)}
+  .tab .tdot.busy{background:var(--warn)}
+  .tab .tdot.ok{background:var(--up)}
+  .tab .tdot.idle{background:var(--faint)}
+  .tab .tdot.unk{background:var(--border)}
+  .tabtools{margin-left:auto;display:flex;align-items:center;gap:8px;
+    padding:0 2px 6px;flex-wrap:wrap}
+  .tabpane[hidden]{display:none}
+
   section{margin-bottom:26px}
   .sec-title{font-size:11px;text-transform:uppercase;letter-spacing:.08em;
     color:var(--muted);margin:0 0 10px;display:flex;align-items:center;gap:8px}
@@ -171,26 +199,15 @@
   .lrefresh:disabled{opacity:.5;cursor:default}
   .lage{font-family:var(--mono);font-size:11px;color:var(--faint)}
   .lage.stale{color:var(--warn)}
-  .load{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
-  .load .lv{font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 8px;
-    border-radius:20px;border:1px solid transparent}
-  .load .why{font-size:11px;color:var(--faint)}
+  /* 등급 pill — 부하 탭 표의 등급 컬럼. (v1.3.0 이전에는 상태 표의 LOAD 셀
+     안에서만 쓰여 `.load .lv` 로 한정돼 있었다. 셀이 사라졌으므로 한정을 푼다.) */
+  .lv{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:700;
+    padding:2px 8px;border-radius:20px;border:1px solid transparent}
   .lv.full{color:var(--down);background:rgba(248,81,73,.12);border-color:rgba(248,81,73,.35)}
   .lv.busy{color:var(--warn);background:rgba(210,153,34,.12);border-color:rgba(210,153,34,.35)}
   .lv.ok{color:var(--up);background:rgba(63,185,80,.10);border-color:rgba(63,185,80,.28)}
   .lv.idle{color:var(--faint);background:var(--surface2);border-color:var(--border)}
   .lv.unk{color:var(--muted);background:var(--surface2);border-color:var(--border)}
-  .load .lnum{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px;
-    color:var(--text)}
-  .load .kv{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);
-    font-size:11px}
-  .load .kvbar{display:inline-block;width:30px;height:5px;border-radius:3px;
-    background:var(--surface2);border:1px solid var(--border);overflow:hidden}
-  .load .kv i{display:block;height:100%;width:0}
-  .load .kv b{font-weight:600}
-  .load .kv.good i{background:var(--up)} .load .kv.good b{color:var(--up)}
-  .load .kv.warn i{background:var(--warn)} .load .kv.warn b{color:var(--warn)}
-  .load .kv.bad i{background:var(--down)} .load .kv.bad b{color:var(--down)}
   .use{display:flex;align-items:center;gap:7px;white-space:nowrap}
   .use .num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:13px}
   .use .bar{width:46px;height:5px;border-radius:3px;background:var(--surface2);
@@ -200,6 +217,17 @@
   .use.warn .num{color:var(--warn)} .use.warn .bar i{background:var(--warn)}
   .use.bad .num{color:var(--down)} .use.bad .bar i{background:var(--down)}
   .use.idle .num{color:var(--faint)}
+
+  /* 부하 탭 표 — 한 셀에 4조각(등급·근거·처리중+대기·KV)을 우겨넣던 LOAD 컬럼을
+     각자의 컬럼으로 펼친다. 좁은 셀에 맞추느라 줄였던 정보(tok/s·표본 Pod 수)도
+     여기서는 제자리를 갖는다. */
+  #loadtable td.num{font-family:var(--mono);font-variant-numeric:tabular-nums;
+    font-size:13px;white-space:nowrap}
+  #loadtable td.why{font-size:11.5px;color:var(--faint)}
+  #loadtable td.dim{color:var(--faint)}
+  #loadtable .q{color:var(--warn);font-weight:600}
+  #loadtable .q.hot{color:var(--down)}
+  #load-note:not(:empty){margin-top:8px}
 
   tr.grp-row td{background:var(--surface);border-top:2px solid var(--border)}
   tr.grp-row:first-child td{border-top:none}
@@ -321,6 +349,24 @@
 
   <div id="banner"></div>
 
+  <!-- 상태(떠 있나)와 부하(지금 바쁜가)는 출처도 주기도 다르다 — 뷰를 갈라
+       각 탭이 한 가지 질문만 답하게 한다. 데이터는 여전히 스냅샷 하나다. -->
+  <nav class="tabs" role="tablist" aria-label="대시보드 뷰">
+    <button class="tab" id="tab-status" type="button" role="tab" aria-selected="true"
+            aria-controls="pane-status"
+            title="떠 있나 — LiteLLM /health · backend Pod 수(ready/desired) · GPU">상태</button>
+    <button class="tab" id="tab-load" type="button" role="tab" aria-selected="false"
+            aria-controls="pane-load" hidden
+            title="지금 바쁜가 — backend Pod 의 엔진 게이지(/metrics)를 60초 주기로 조회">부하
+      <span class="tdot unk" id="tab-load-dot" aria-hidden="true"></span></button>
+    <span class="tabtools" id="load-tools" hidden>
+      <button class="lrefresh" id="load-refresh" type="button" hidden
+              title="지금 부하만 즉시 다시 읽습니다 — 백엔드 Pod 마다 /metrics 를 한 번씩 조회하므로 최소 10초 간격으로 제한됩니다">⟳ 부하</button>
+      <span class="lage" id="load-age" hidden></span>
+    </span>
+  </nav>
+
+  <div class="tabpane" id="pane-status" role="tabpanel" aria-labelledby="tab-status">
   <div class="cards" id="cards"></div>
 
   <!-- 그래프(토폴로지)와 Deployments 표를 한 섹션에서 좌우로 — 하나의 필터가 둘을 함께 제어 -->
@@ -331,9 +377,6 @@
                aria-label="모델·백엔드 검색"
                placeholder="🔍 모델·백엔드 검색  ( / )"
                title="model_name·service·api_base 로 필터 — 표·그래프에 함께 적용. 단축키 &quot;/&quot;, 지우기 Esc">
-        <button class="lrefresh" id="load-refresh" type="button" hidden
-                title="지금 부하만 즉시 다시 읽습니다 — 백엔드 Pod 마다 /metrics 를 한 번씩 조회하므로 최소 10초 간격으로 제한됩니다">⟳ 부하</button>
-        <span class="lage" id="load-age" hidden></span>
         <label class="toggle" id="f-graph-lbl"><input type="checkbox" id="f-graph" checked> show graph</label>
         <label class="toggle"><input type="checkbox" id="f-group" checked> group by model</label>
         <label for="f-status">status</label>
@@ -387,6 +430,38 @@
     </details>
   </section>
 
+  </div><!-- /#pane-status -->
+
+  <div class="tabpane" id="pane-load" role="tabpanel" aria-labelledby="tab-load" hidden>
+    <div class="cards" id="load-cards"></div>
+    <section id="load-sec">
+      <div class="sec-title">지금 부하
+        <span class="src">backend Pod /metrics</span>
+        <span class="filters">
+          <input type="search" id="lf-search" class="search" autocomplete="off" spellcheck="false"
+                 aria-label="모델·백엔드 검색"
+                 placeholder="🔍 모델·백엔드 검색"
+                 title="model_name·service·api_base 로 필터 — 상태 탭 검색과 별개다(다른 질문을 보고 있으므로)">
+          <label for="lf-state">등급</label>
+          <select id="lf-state" title="부하 등급으로 필터. '바쁜 것만'은 BUSY·FULL 을 한 번에 — 지금 손대야 할 것만 본다">
+            <option value="">all</option>
+            <option value="!idle">바쁜 것만 (BUSY·FULL)</option>
+            <option value="saturated">FULL (포화)</option>
+            <option value="busy">BUSY</option>
+            <option value="ok">ok</option>
+            <option value="idle">idle</option>
+            <option value="unknown">? (못 읽음)</option>
+          </select>
+          <span class="fcount" id="lf-count"></span>
+        </span>
+      </div>
+      <div class="tablewrap"><table id="loadtable">
+        <thead></thead><tbody></tbody>
+      </table></div>
+      <div id="load-note"></div>
+    </section>
+  </div><!-- /#pane-load -->
+
   <footer id="foot">model_monitor</footer>
 </div>
 
@@ -423,7 +498,11 @@ const FILTER_KEY = "mm_filters";
 function saveFilters(){
   try{ sessionStorage.setItem(FILTER_KEY, JSON.stringify({
     q:$("#f-search").value, s:$("#f-status").value, n:$("#f-net").value,
-    e:$("#f-eng").value, g:$("#f-group").checked, gr:$("#f-graph").checked })); }
+    e:$("#f-eng").value, g:$("#f-group").checked, gr:$("#f-graph").checked,
+    // 부하 탭은 자기 필터를 따로 쓴다 — 같은 표를 좁히는 것이 아니라 다른
+    // 질문("지금 바쁜 것")을 보고 있으므로 상태 탭 필터를 물려받으면 오히려
+    // 왜 비었는지 알 수 없다.
+    lq:$("#lf-search").value, ls:$("#lf-state").value, tab:curTab })); }
   catch(e){}
 }
 function loadFilters(){
@@ -435,6 +514,37 @@ function loadFilters(){
   if(f.e!=null) $("#f-eng").value = f.e;
   if(f.g!=null) $("#f-group").checked = !!f.g;
   if(f.gr!=null) $("#f-graph").checked = !!f.gr;
+  $("#lf-search").value = f.lq||"";
+  if(f.ls!=null) $("#lf-state").value = f.ls;
+  if(f.tab==="load") curTab = "load";
+}
+
+// ── 탭 (상태 | 부하) ────────────────────────────────────────────────────
+// 뷰만 가르고 데이터는 가르지 않는다: 스냅샷도 폴링도 하나이고 두 pane 을 매
+// 렌더마다 함께 그린다. 숨김은 [hidden] 뿐이라 탭 전환은 재수집도 재렌더도
+// 필요 없고, 정지 페이지(/snapshot.html)도 같은 템플릿 하나로 동작한다.
+// (그래프 좌표는 전부 JS 계산이라 숨은 pane 에서 그려도 어긋나지 않는다.)
+// curTab 은 **사용자가 고른** 탭이고, 실제로 그릴 탭은 effTab() 이다. 부하 탭이
+// 아직/영영 없을 때 curTab 을 덮어써 버리면 첫 렌더 전(탭 숨김 상태)에 저장된
+// 선택이 지워져 F5 복원이 깨진다 — 선택은 남기고 표시만 되돌린다.
+let curTab = "status";
+function loadTabAvailable(){ return !$("#tab-load").hidden; }
+function effTab(){ return (curTab==="load" && loadTabAvailable()) ? "load" : "status"; }
+function applyTab(){
+  // 부하가 꺼진 배포(MONITOR_LOAD=false·user_view load=off)에서는 탭 자체가
+  // 없다 — 저장된 선택이 '부하'였더라도 빈 화면 대신 상태 탭을 보여준다.
+  const isLoad = effTab()==="load";
+  $("#tab-status").setAttribute("aria-selected", isLoad ? "false" : "true");
+  $("#tab-load").setAttribute("aria-selected", isLoad ? "true" : "false");
+  $("#pane-status").hidden = isLoad;
+  $("#pane-load").hidden = !isLoad;
+  // ⟳ 부하·나이 표시는 부하 탭에서만 (상태 탭에 부하 컨트롤이 남으면 분리한
+  // 의미가 없다). 내부 표시 여부는 renderLoadAge 가 따로 판단한다.
+  $("#load-tools").hidden = !isLoad || !loadTabAvailable();
+}
+function setTab(name){
+  curTab = (name==="load") ? "load" : "status";
+  applyTab(); saveFilters();
 }
 
 // 서버 스냅샷 갱신 멈춤(stale) 감지: 폴링(fetch)이 성공해도 서버측 Refresher 가 멈추면
@@ -492,12 +602,27 @@ function showNeedKey(){
   dt.querySelector("tbody").innerHTML='<tr><td class="empty">키 입력 대기 중</td></tr>';
   $("#dep-err").innerHTML = "";
   hideGraph();   // 직전 뷰(특히 admin 전체 뷰)의 라우팅 그래프가 남지 않게
+  clearLoadPane();
   hideExports(); // 직전 뷰의 export/내 뷰 JSON 버튼도 잔류 금지
   const gt=$("#groups");
   gt.querySelector("thead").innerHTML="";
   gt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';
   const gc=$("#groups-count"); if(gc) gc.textContent="0";
   setUvStatus("", "");
+}
+
+// 화면을 비우는 경로(키 미입력·키 검증 실패)에서 부하 pane 도 함께 비운다.
+// fail-closed: 직전 admin 전체 뷰의 부하 수치가 남으면 그 자체가 유출이다.
+function clearLoadPane(){
+  $("#tab-load").hidden = true;      // 탭이 사라지므로 effTab() 이 상태 탭으로 되돌린다
+  applyTab();
+  $("#load-cards").innerHTML = "";
+  $("#lf-count").textContent = "";
+  $("#load-note").innerHTML = "";
+  const lt=$("#loadtable");
+  lt.querySelector("thead").innerHTML="";
+  lt.querySelector("tbody").innerHTML='<tr><td class="empty">—</td></tr>';
+  const dot=$("#tab-load-dot"); if(dot){ dot.className="tdot unk"; dot.title=""; }
 }
 
 // export 는 admin 키일 때만. 링크 클릭을 가로채 헤더에 키를 실어 fetch -> blob 다운로드/열기.
@@ -846,36 +971,6 @@ function partialNote(l){
   const ok=l.pods_sampled||0;
   return " ("+ok+"/"+(ok+bad)+" Pod)";
 }
-// 처리 중/대기 숫자 조각. 대기가 있으면 노랑(>=5 빨강)으로 드러낸다.
-function inflightBit(l){
-  if(!l || (l.running==null && l.waiting==null)) return "";
-  const run = l.running!=null ? l.running : "?";
-  const q = l.waiting;
-  const qs = q ? '<b style="color:'+(q>=5?"var(--down)":"var(--warn)")+'">+'+q+'</b>' : "";
-  return '<span class="lnum" title="처리 중 '+run+' · 대기 '+(q!=null?q:"?")+'">'
-    +run+qs+'</span>';
-}
-// KV 사용률 조각(작은 막대 + %).
-function kvBit(l){
-  if(!l || l.kv_cache_pct==null) return "";
-  const pct=Math.min(100,Math.round(l.kv_cache_pct));
-  const tip = l.kv_cache_avg_pct!=null
-    ? ("KV 최대 "+l.kv_cache_pct+"% · 평균 "+l.kv_cache_avg_pct+"%") : "KV 캐시 사용률";
-  return '<span class="kv '+kvClass(pct)+'" title="'+esc(tip)+'">'
-    +'<span class="kvbar"><i style="width:'+pct+'%"></i></span><b>'+pct+'%</b></span>';
-}
-function loadCell(d, uHide){
-  const l=loadOf(d);
-  if(!l) return '<span class="srccol">-</span>';
-  const st=l.state||"unknown", lv=LOAD_LV[st]||LOAD_LV.unknown;
-  const why = st==="unknown" ? loadWhyShort(l.state_reason)
-                             : (l.state_reason||"")+partialNote(l);
-  const tip = (st==="unknown"&&l.state_reason ? l.state_reason+"\n" : "")+podTip(l,uHide);
-  return '<div class="load" title="'+esc(tip)+'"><span class="lv '+lv[1]+'">'+lv[0]+'</span>'
-    +'<span class="why">'+esc(why)+'</span>'+inflightBit(l)+kvBit(l)+'</div>';
-}
-// 처리 중 + 대기를 한 셀에 (표 폭이 귀하다 — 그래프와 좌우 분할).
-// tok/s 는 이 셀 툴팁으로 내린다: 있으면 좋지만 "바쁜가"의 1차 신호는 아니다.
 function kvClass(pct){ return pct>=95?"bad":(pct>=80?"warn":"good"); }
 // --- 그룹(모델) 단위 롤업 -------------------------------------------------
 // 모델 등급 = backend 중 **가장 나쁜 것**. LiteLLM 기본 라우팅(simple-shuffle)은
@@ -899,27 +994,6 @@ function compositeLoad(bes, leastBusy){
   }
   return {worst:pick, counts:counts};
 }
-function compositeLoadCell(bes, uHide, leastBusy){
-  const c=compositeLoad(bes, leastBusy);
-  if(!c.worst) return '<span class="srccol">-</span>';
-  const st=c.worst.state, lv=LOAD_LV[st]||LOAD_LV.unknown;
-  const order=["saturated","busy","ok","idle","unknown"];
-  const spread=order.filter(k=>c.counts[k]).map(k=>(LOAD_LV[k]||LOAD_LV.unknown)[0]+" "+c.counts[k]);
-  const n=bes.filter(b=>b.load).length;
-  const why = n>1 ? spread.join(" · ")
-    : (st==="unknown" ? loadWhyShort(c.worst.load.state_reason)
-                      : (c.worst.load.state_reason||"")+partialNote(c.worst.load));
-  const tip = n>1
-    ? (leastBusy
-       ? ("backend "+n+"개 중 **가장 한가한** 등급으로 표시 — least-busy 라우팅이면 "
-          +"다음 요청은 여유 있는 backend 로 간다. 분포로 부분 포화를 함께 표시.")
-       : ("backend "+n+"개 중 **가장 나쁜** 등급으로 표시 — simple-shuffle 라우팅이면 "
-          +"포화된 backend 도 요청 일부를 받는다."))
-    : podTip(c.worst.load, uHide);
-  const sl=sumLoad(bes).load;
-  return '<div class="load" title="'+esc(tip)+'"><span class="lv '+lv[1]+'">'+lv[0]+'</span>'
-    +'<span class="why">'+esc(why)+'</span>'+inflightBit(sl)+kvBit(sl)+'</div>';
-}
 // 요청 수는 합, 사용률은 최댓값(더하는 값이 아니다).
 function sumLoad(bes){
   let run=null,q=null,kv=null,tp=null;
@@ -931,9 +1005,173 @@ function sumLoad(bes){
   return {load:{running:run, waiting:q, kv_cache_pct:kv, throughput:tp}};
 }
 
+// ── 부하 탭 전용 표 ──────────────────────────────────────────────────────
+// 상태 표와 같은 deployment 배열을 쓰지만 **질문이 다르다**. 상태 표는 목록이라
+// 이름순 고정이지만, 여기는 트리아지라 나쁜 등급이 위로 온다. 좁은 셀에 4조각을
+// 우겨넣던 LOAD 컬럼도 여기서는 각자의 컬럼을 갖는다(tok/s·표본 Pod 포함).
+function lvPill(st){
+  const lv = LOAD_LV[st] || LOAD_LV.unknown;
+  return '<span class="lv '+lv[1]+'">'+lv[0]+'</span>';
+}
+// 값 없음(-)과 0 을 반드시 구분한다 — per-user summary 모드나 조회 실패는 "0" 이
+// 아니라 "모름"이고, 그것을 0 으로 칠하면 한가한 것처럼 보인다.
+function numCell(v){
+  return v==null ? '<td class="num dim">-</td>'
+                 : '<td class="num">'+esc(fmtNum(v))+'</td>';
+}
+function qCell(v){
+  if(v==null) return '<td class="num dim">-</td>';
+  if(!v) return '<td class="num dim">0</td>';
+  return '<td class="num"><span class="q'+(v>=5?" hot":"")+'">'+esc(fmtNum(v))+'</span></td>';
+}
+function kvCell(pct){
+  if(pct==null) return '<td class="num dim">-</td>';
+  const p = Math.min(100, Math.round(pct));
+  return '<td class="num"><span class="use '+kvClass(p)+'">'
+    + '<span class="bar"><i style="width:'+p+'%"></i></span>'
+    + '<span class="num">'+p+'%</span></span></td>';
+}
+// 표본 Pod: 몇 개 중 몇 개를 실제로 읽었는지. 과소 집계를 숨기지 않는다.
+function podsCell(l, uHide, tipOverride){
+  if(!l) return '<td class="num dim">-</td>';
+  // 표본 출처(Pod 직접/Prometheus 경유/생략)와 Pod 별 수치는 podTip 이 낸다 —
+  // per-user 뷰에서는 Pod 주소를 빼고 요약만. 그룹 합계 행은 backend 가 여럿이라
+  // 단일 backend 기준인 podTip 대신 호출자가 준 설명을 쓴다.
+  const tipParts=[tipOverride!=null ? tipOverride : podTip(l, uHide)];
+  const ok=l.pods_sampled, bad=l.pods_failed;
+  if(bad) tipParts.unshift(bad+"개 Pod 이 응답하지 않아 과소 집계일 수 있음");
+  const tip=tipParts.filter(Boolean).join("\n");
+  const attr=tip?' title="'+esc(tip)+'"':'';
+  if(ok==null && bad==null)
+    return '<td class="num dim"'+attr+'>'+(l.partial?"일부":"-")+'</td>';
+  const tot=(ok||0)+(bad||0);
+  if(!tot) return '<td class="num dim"'+attr+'>-</td>';
+  return '<td class="num'+(bad?'':' dim')+'"'+attr+'>'+(ok||0)+'/'+tot+'</td>';
+}
+function whyCell(l, extra){
+  const st=(l&&l.state)||"unknown";
+  const txt = st==="unknown" ? loadWhyShort(l&&l.state_reason)
+                             : ((l&&l.state_reason)||"")+partialNote(l);
+  const full = (l&&l.state_reason)||"";
+  return '<td class="why"'+(full?' title="'+esc(full)+'"':'')+'>'
+    + esc([extra, txt].filter(Boolean).join(" · ") || "-") + '</td>';
+}
+// 모델 한 줄 = backend 롤업. 정렬 키(등급)도 여기서 함께 낸다.
+function sumPods(bes){
+  let ok=null, bad=null, partial=false, any=false;
+  bes.forEach(b=>{ const l=loadOf(b); if(!l) return;
+    any=true;
+    if(l.pods_sampled!=null) ok=(ok||0)+l.pods_sampled;
+    if(l.pods_failed!=null) bad=(bad||0)+l.pods_failed;
+    if(l.partial) partial=true; });
+  return any ? {pods_sampled:ok, pods_failed:bad, partial:partial} : null;
+}
+function loadGroups(deps, leastBusy){
+  const order=[], groups={};
+  deps.forEach(d=>{ if(!groups[d.model_name]){groups[d.model_name]=[];order.push(d.model_name);}
+    groups[d.model_name].push(d); });
+  return order.map(name=>{
+    const bes=groups[name], c=compositeLoad(bes, leastBusy);
+    const st=(c.worst&&c.worst.state)||"unknown";
+    return {name:name, bes:bes, state:st, counts:c.counts,
+            load:(c.worst&&c.worst.load)||null, sum:sumLoad(bes).load,
+            // 표본도 backend 전체 합 — 수치는 합·최댓값인데 표본만 대표 backend
+            // 것이면 "3/3 인데 처리 중 19" 처럼 근거가 어긋나 보인다.
+            pods:sumPods(bes),
+            rank:(LOAD_RANK[st]!=null?LOAD_RANK[st]:-1)};
+  });
+}
+function renderLoadPane(all, loadOn, uHide, leastBusy){
+  const tb=$("#loadtable"), cnt=$("#lf-count"), note=$("#load-note"), dot=$("#tab-load-dot");
+  const head=tb.querySelector("thead"), body=tb.querySelector("tbody");
+  if(!loadOn){
+    cnt.textContent=""; note.innerHTML=""; head.innerHTML="";
+    dot.className="tdot unk";
+    body.innerHTML='<tr><td class="empty">부하 수집이 꺼져 있습니다 '
+      + '(MONITOR_LOAD=false 이거나 이 키에 부하가 공개되지 않았습니다)</td></tr>';
+    return;
+  }
+  const groups = loadGroups(all, leastBusy);
+  // 탭 점: 탭을 열지 않아도 "지금 바쁜 게 있나"는 보이게 — 뷰를 갈랐다고 다른
+  // 탭의 이상 신호를 못 보게 만들면 분리가 오히려 손해다. 등급 없음(모름)만
+  // 있으면 unk 로 두고 idle 인 척하지 않는다.
+  let worst=-1;
+  groups.forEach(g=>{ if(g.rank>worst) worst=g.rank; });
+  const WORST_CLS={3:"full",2:"busy",1:"ok",0:"idle"};
+  dot.className = "tdot "+(WORST_CLS[worst]||"unk");
+  dot.title = worst>=2 ? "지금 바쁜 모델이 있습니다" : "";
+
+  const fq=($("#lf-search").value||"").trim().toLowerCase();
+  const fs=$("#lf-state").value;
+  const hay=g=>(g.name+" "+g.bes.map(b=>svcLabelOf(b)+" "+(b.api_base||"")).join(" ")).toLowerCase();
+  // '바쁜 것만'은 BUSY·FULL — 지금 손대야 할 것만. 모름(?)은 장애 후보가 아니라
+  // 관측 실패라 여기 섞지 않는다(상태 탭의 '이상만'이 PAUSED 를 빼는 것과 같은 결).
+  const stOk=g=> !fs || (fs==="!idle" ? (g.rank>=2) : g.state===fs);
+  const rows = groups.filter(g=>stOk(g) && (!fq || hay(g).includes(fq)));
+  // 나쁜 등급 먼저 → 대기 많은 순 → 이름순(결정적)
+  rows.sort((a,b)=> b.rank-a.rank
+    || ((b.sum.waiting||0)-(a.sum.waiting||0))
+    || a.name.localeCompare(b.name));
+  cnt.textContent = (fq||fs) ? rows.length+" / "+groups.length : String(groups.length);
+
+  // tok/s 는 per-user 뷰에 서버가 아예 실어 보내지 않는다(user_access 의 평탄화
+  // 목록에 없다) — 전 행이 "-" 인 컬럼을 세워두면 "0 인가 모름인가"만 헷갈린다.
+  const showTps = !uHide;
+  const NCOL = showTps ? 8 : 7;
+  head.innerHTML = "<tr><th>MODEL_NAME</th><th>등급</th><th class=\"num\">처리 중</th>"
+    + "<th class=\"num\">대기</th><th class=\"num\">KV 캐시</th>"
+    + (showTps ? "<th class=\"num\">TOK/S</th>" : "")
+    + "<th class=\"num\" title=\"실제로 게이지를 읽어온 Pod / 대상 Pod\">표본</th>"
+    + "<th>근거</th></tr>";
+  if(!groups.length){
+    body.innerHTML='<tr><td class="empty" colspan="'+NCOL+'">deployment 없음</td></tr>';
+  } else if(!rows.length){
+    body.innerHTML='<tr><td class="empty" colspan="'+NCOL+'">'
+      + (fq ? '“'+esc(fq)+'” 검색 결과 없음' : '필터 결과 없음')+'</td></tr>';
+  } else {
+    const order=["saturated","busy","ok","idle","unknown"];
+    body.innerHTML = rows.map(g=>{
+      const n=g.bes.length;
+      const spread = n>1
+        ? order.filter(k=>g.counts[k]).map(k=>(LOAD_LV[k]||LOAD_LV.unknown)[0]+" "+g.counts[k]).join(" · ")
+        : "";
+      let h='<tr class="grp-row"><td class="name">'+esc(g.name)
+        + '<span class="nbk">'+n+' backend'+(n>1?'s':'')+'</span></td>'
+        + '<td'+(n>1?' title="'+esc(leastBusy
+            ? "backend "+n+"개 중 가장 한가한 등급 — least-busy 라우팅이면 다음 요청은 여유 있는 backend 로 간다"
+            : "backend "+n+"개 중 가장 나쁜 등급 — simple-shuffle 라우팅이면 포화된 backend 도 요청 일부를 받는다")+'"':'')
+        + '>'+lvPill(g.state)+'</td>'
+        + numCell(g.sum.running) + qCell(g.sum.waiting)
+        + kvCell(g.sum.kv_cache_pct) + (showTps ? numCell(g.sum.throughput) : "")
+        + podsCell(n>1 ? g.pods : g.load, uHide,
+                    n>1 ? "backend "+n+"개 합계" : undefined)
+        // backend 가 여럿이면 근거는 등급 분포만 — 대표 backend 한 곳의 사유를
+        // 함께 적으면 어느 backend 얘기인지 알 수 없다(자식행에 각자 나온다).
+        + (n>1 ? '<td class="why">'+esc(spread||"-")+'</td>' : whyCell(g.load, ""));
+      h += '</tr>';
+      // backend 가 하나뿐이면 자식행은 부모행의 반복이라 접는다.
+      if(n>1) g.bes.forEach(b=>{
+        const l=loadOf(b);
+        h+='<tr class="child-row"><td class="leg"><span class="svc">'
+          + esc(svcLabelOf(b))+'</span></td>'
+          + '<td>'+lvPill((l&&l.state)||"unknown")+'</td>'
+          + numCell(l&&l.running) + qCell(l&&l.waiting)
+          + kvCell(l?l.kv_cache_pct:null) + (showTps ? numCell(l&&l.throughput) : "")
+          + podsCell(l, uHide) + whyCell(l, "") + '</tr>';
+      });
+      return h;
+    }).join("");
+  }
+  // 못 읽은 모델이 있으면 규모를 한 줄로 — 셀마다 hover 하지 않아도 보이게.
+  const unk = groups.filter(g=>g.state==="unknown").length;
+  note.innerHTML = unk
+    ? '<div class="note-banner">⚠ '+unk+'개 모델의 부하를 읽지 못했습니다 — '
+      + '근거 컬럼에 사유(깨울 위험·타임아웃·권한 등). 0 이 아니라 <b>모름</b>입니다.</div>'
+    : "";
+}
+
 // model_name 으로 묶은 tbody 행들(부모 그룹 행 + 자식 백엔드 행)
-function groupedRows(merged, shared, showBk, showGpu, showLoad, uHide,
-                    leastBusy){
+function groupedRows(merged, shared, showBk, showGpu, uHide){
   const order=[], groups={};
   merged.forEach(d=>{ if(!groups[d.model_name]){groups[d.model_name]=[];order.push(d.model_name);}
     groups[d.model_name].push(d); });
@@ -947,7 +1185,6 @@ function groupedRows(merged, shared, showBk, showGpu, showLoad, uHide,
     let html='<tr class="grp-row" data-model="'+attrId(name)+'" data-svcs="'+svcs+'"><td>'+compositePill(st,bes)+'</td>'
       +'<td class="name">'+esc(name)
         +'<span class="nbk">'+bes.length+' backend'+(bes.length>1?'s':'')+'</span></td>'
-      + (showLoad ? '<td>'+compositeLoadCell(bes,uHide,leastBusy)+'</td>' : '')
       +'<td>'+typeChips(net,eng)+'</td>';
     if(showBk){ html+='<td>'+aggCell(agg.r,agg.d)+'</td>';
       if(showGpu){const sg=sumGpu(bes); html+='<td>'+aggGpuCell(sg.g,sg.products)+'</td>';}
@@ -960,7 +1197,7 @@ function groupedRows(merged, shared, showBk, showGpu, showLoad, uHide,
       html+='<tr class="child-row" data-model="'+attrId(name)+'" data-svc="'+attrId(k)+'"><td>'+statusPill(b.status||"?",b)+'</td>'
         +'<td class="leg"><span class="svc">'+esc(svcLabel)+'</span>'
           +(sh?'<span class="shared">⇄ '+esc(others.join(", "))+'</span>':'')+'</td>'
-        + (showLoad ? '<td>'+loadCell(b,uHide)+'</td>' : '') + '<td></td>';
+        + '<td></td>';
       if(showBk){ html+='<td>'+backendCell(b)+'</td>';
         if(showGpu) html+='<td>'+gpuCell(b)+'</td>';
         html+='<td class="mono" style="font-size:12px;color:var(--muted)">'+esc(b.mode||"-")+'</td>'
@@ -1193,14 +1430,16 @@ function render(snap){
   }
   banner.innerHTML = bhtml;
   lastSnap = snap;
-  // summary cards
-  let cards = "";
+  // summary cards — **상태 카드와 부하 카드는 서로 다른 탭으로 나간다**.
+  // 둘을 한 줄에 세우면 카드가 10장까지 늘어 "무엇이 장애이고 무엇이 혼잡인지"가
+  // 시선에서 구분되지 않는다(v1.2.0 에서 실제로 그렇게 됐다).
+  let cards = "", lcards = "";
   // 등급 카드와 수치 카드의 게이트는 **다르다**. per-user 뷰의 summary 모드는
   // 등급만 오고 처리중/대기/KV 는 오지 않는다 — 한 플래그로 묶으면 그 모드에서
   // 카드가 통째로 사라져 "부하를 아예 모른다"처럼 보인다.
   if(s.load_state_known || s.load_known){
     const busy=s.models_busy||0, sat=s.models_saturated||0;
-    cards += card("지금 바쁜 모델",
+    lcards += card("지금 바쁜 모델",
       busy+'<span style="color:var(--faint);font-size:16px"> / '
       +(s.models_load_total||0)+'</span>',
       sat?"bad":(busy?"warn":"good"),
@@ -1208,11 +1447,11 @@ function render(snap){
                 : "큐 없음 · 여유");
   }
   if(s.load_known){
-    cards += card("처리 중", s.running||0, (s.running?"good":""), "in-flight 요청 합");
-    cards += card("대기", s.queued||0, (s.queued?"bad":""),
+    lcards += card("처리 중", s.running||0, (s.running?"good":""), "in-flight 요청 합");
+    lcards += card("대기", s.queued||0, (s.queued?"bad":""),
       s.queued? "지금 기다리는 요청" : "대기 없음");
     if(s.kv_max_pct!=null)
-      cards += card("KV 최대", Math.round(s.kv_max_pct)+"%",
+      lcards += card("KV 최대", Math.round(s.kv_max_pct)+"%",
         s.kv_max_pct>=95?"bad":(s.kv_max_pct>=80?"warn":"good"), "가장 붐비는 Pod");
   }
   // per-user 뷰: 맨 앞에 "내 키" 카드(접근 모델 수 / spend·예산 / rate limit·만료)
@@ -1264,18 +1503,27 @@ function render(snap){
       +'<div class="val gpuval">'+(s.gpu_total||0)+'</div>'+sub+'</div>';
   }
   $("#cards").innerHTML = cards;
+  // 부하가 켜져 있는데 아직 읽은 게이지가 없으면 빈 줄 대신 그 사실을 적는다.
+  // 꺼져 있으면 카드 자체를 두지 않는다(탭도 없어 도달할 수 없는 화면이다).
+  $("#load-cards").innerHTML = !snap.load_enabled ? ""
+    : (lcards || '<div class="card"><div class="label">지금 부하</div>'
+       + '<div class="val" style="font-size:15px;color:var(--faint)">수집 대기</div>'
+       + '<div class="sub">아직 읽은 게이지가 없습니다</div></div>');
 
   // deployments
   const showBk = !!snap.backend_count_enabled;
   const uHide = !!snap.user_view;   // per-user 뷰는 내부 컬럼(MODE/SRC/API_BASE) 숨김
   const showGpu = !!s.gpu_known && !uHide;   // GPU 컬럼도 내부정보 — user 뷰 숨김
-  // 부하 컬럼은 per-user 뷰에도 보여준다(내부 토폴로지가 아니라 "지금 쓸 수 있나" 정보).
-  // Pod 주소가 담긴 툴팁만 uHide 로 가린다(loadCell/podTip).
+  // 상태 표에는 부하를 싣지 않는다 — 한 셀에 등급·근거·처리중+대기·KV 를 우겨넣던
+  // LOAD 컬럼은 부하 탭의 전용 표로 옮겨 각자의 컬럼을 갖는다. 이 표의 질문은
+  // "떠 있나" 하나다.
   // 부하는 per-user 뷰에도 보여준다 — 내부 토폴로지가 아니라 "지금 이 모델을
   // 쓸 수 있나"의 답이다. 리댁션은 평탄한 스칼라만 남기므로(Pod 주소 제외)
-  // loadOf 가 같은 모양으로 되돌린다.
-  const showLoad = !!snap.load_enabled;
+  // loadOf 가 같은 모양으로 되돌린다. Pod 주소가 담긴 툴팁만 uHide 로 가린다.
+  const loadOn = !!snap.load_enabled;
+  $("#tab-load").hidden = !loadOn;
   renderLoadAge(snap);
+  applyTab();
   const leastBusy = String(snap.load_routing||"least-busy") !== "shuffle";
   const dt = $("#deployments");
   // status/net/engine 필터는 표와 그래프에 똑같이 적용한다(그래프도 필터된 집합만 그림).
@@ -1318,14 +1566,13 @@ function render(snap){
     $("#f-count").textContent = (fS||fN||fE||fQ)
       ? merged.length+" / "+all.length : all.length+"";
     let head = "<tr><th>STATUS</th><th>MODEL_NAME</th>";
-    if(showLoad) head += '<th title="지금 부하 — 등급 · 근거 · 처리중+대기 · KV">LOAD</th>';
     head += "<th>TYPE</th>";
     if(showBk) head += '<th>REPLICAS (ready/desired)</th>';
     if(showBk && showGpu) head += '<th>GPU</th>';
     if(showBk && !uHide) head += '<th>MODE</th><th>SRC</th>';
     if(!uHide) head += "<th>API_BASE</th>";
     head += "</tr>";
-    const ncol = 3 + (showLoad?1:0) + (showBk?1:0) + (showBk&&showGpu?1:0)
+    const ncol = 3 + (showBk?1:0) + (showBk&&showGpu?1:0)
       + (showBk&&!uHide?2:0) + (uHide?0:1);
     dt.querySelector("thead").innerHTML = head;
     // per-user 뷰(uHide)는 내부 컬럼을 숨긴 평면 행으로 그린다(그룹핑은 admin 전용).
@@ -1342,14 +1589,12 @@ function render(snap){
     } else if(grouped){
       // model_name 으로 묶어 표시. 공유 백엔드(여러 모델이 한 Service)는 SHARED 로
       // 명시하고, 헤드라인 Pod 합계(summary)는 이미 Service 기준 dedup 됨.
-      body = groupedRows(tableDeps, sharedMap(all), showBk, showGpu, showLoad,
-                         uHide, leastBusy);
+      body = groupedRows(tableDeps, sharedMap(all), showBk, showGpu, uHide);
     } else {
       body = tableDeps.map(d=>{
         let row = '<tr data-model="'+attrId(d.model_name)+'" data-svc="'+attrId(svcKeyOf(d))+'"><td>'
           +statusPill(d.status||"?",d)+"</td>"
           +'<td class="name">'+esc(d.model_name)+"</td>"
-          + (showLoad ? "<td>"+loadCell(d,uHide)+"</td>" : "")
           +'<td>'+typeChips(netOf(d),engOf(d))+"</td>";
         if(showBk) row += "<td>"+backendCell(d)+"</td>";
         if(showBk && showGpu) row += "<td>"+gpuCell(d)+"</td>";
@@ -1408,6 +1653,10 @@ function render(snap){
     gt.querySelector("tbody").innerHTML='<tr><td class="empty">model group 없음</td></tr>';
   }
 
+  // 부하 탭 — 상태 탭과 **같은 스냅샷**을 쓰되 자기 필터로 좁힌다. 숨어 있어도
+  // 매 렌더마다 함께 그린다(탭 전환에 재렌더가 필요 없고, 탭 점이 항상 최신).
+  renderLoadPane(all, loadOn, uHide, leastBusy);
+
   // 키 필수 모드: export(JSON/정지페이지) 버튼은 admin 키로 본 전체 뷰일 때만 노출.
   // 비-admin 키에는 대신 "내 뷰 JSON"(지금 렌더 중인 필터된 스냅샷 다운로드)을 노출.
   if(USER_VIEW){
@@ -1444,6 +1693,7 @@ function showUvError(msg){
     '<tr><td class="empty">키 검증 실패 — 표시할 데이터 없음</td></tr>';
   $("#dep-err").innerHTML = "";
   hideGraph();   // fail-closed: 이전 뷰의 라우팅 그래프도 남기지 않는다
+  clearLoadPane();
   hideExports(); // 이전 뷰의 export/내 뷰 JSON 버튼도 잔류 금지
   const gt=$("#groups");
   gt.querySelector("thead").innerHTML="";
@@ -1525,6 +1775,9 @@ document.addEventListener("visibilitychange", ()=>{
 // 필터 변경: 재수집 없이 마지막 스냅샷으로 즉시 다시 렌더 + sessionStorage 저장(F5 복원).
 // 검색은 타이핑마다(input) 즉시 반영 — 재수집 없이 표·그래프를 함께 좁힌다.
 function onFilterChange(){ saveFilters(); if(lastSnap) render(lastSnap); }
+// "/" 와 Esc 는 **보고 있는 탭**의 검색창에 걸어야 한다 — 숨은 탭의 입력창을
+// 잡으면 포커스가 화면 밖으로 사라지고 Esc 가 아무것도 안 지우는 것처럼 보인다.
+function curSearch(){ return $(effTab()==="load" ? "#lf-search" : "#f-search"); }
 $("#f-search").addEventListener("input", onFilterChange);
 $("#f-status").addEventListener("change", onFilterChange);
 $("#f-net").addEventListener("change", onFilterChange);
@@ -1553,6 +1806,22 @@ $("#deployments").addEventListener("click", (e)=>{
 });
 // 📌 pin 칩 클릭 → pin 해제(표 전체 복원). 칩은 매 렌더마다 새로 그려지므로 위임으로 1회만.
 $("#load-refresh").addEventListener("click", refreshLoadNow);
+// 탭 전환: 재수집도 재렌더도 없다(두 pane 은 이미 그려져 있고 [hidden] 만 바뀐다).
+$("#tab-status").addEventListener("click", ()=>setTab("status"));
+$("#tab-load").addEventListener("click", ()=>setTab("load"));
+// 좌우 방향키로 탭 이동(role=tablist 관례) — 마우스 없이도 뷰를 바꿀 수 있게.
+$(".tabs").addEventListener("keydown", (e)=>{
+  if(e.key!=="ArrowLeft" && e.key!=="ArrowRight") return;
+  if(!e.target.classList.contains("tab")) return;
+  e.preventDefault();
+  const to = (effTab()==="load") ? "status" : "load";
+  setTab(to);
+  const btn=$(to==="load" ? "#tab-load" : "#tab-status");
+  if(btn && !btn.hidden) btn.focus();
+});
+// 부하 탭 필터: 상태 탭과 별개다 — 재수집 없이 마지막 스냅샷으로 다시 그린다.
+$("#lf-search").addEventListener("input", onFilterChange);
+$("#lf-state").addEventListener("change", onFilterChange);
 $("#dep-label").addEventListener("click", (e)=>{
   if(e.target.closest("#pin-badge") && graphPin){
     graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
@@ -1561,13 +1830,13 @@ document.addEventListener("keydown", (e)=>{
   if(e.key!=="/" || e.ctrlKey || e.metaKey || e.altKey) return;
   const t=document.activeElement, tag=t&&t.tagName;
   if(tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT"||(t&&t.isContentEditable)) return;
-  const sb=$("#f-search"); if(sb){ e.preventDefault(); sb.focus(); sb.select(); }
+  const sb=curSearch(); if(sb){ e.preventDefault(); sb.focus(); sb.select(); }
 });
 // Esc: 검색어가 있으면 먼저 그것을 지우고(표·그래프 복원), 없으면 pin 해제.
 // (그래프 노드가 키보드 접근이 안 되므로 좁힘을 되돌릴 탈출구를 항상 제공.)
 document.addEventListener("keydown", (e)=>{
   if(e.key!=="Escape") return;
-  const sb=$("#f-search");
+  const sb=curSearch();
   if(sb && sb.value){ sb.value=""; onFilterChange(); return; }
   if(graphPin){ graphPin=null; saveGraphPin(); if(lastSnap) render(lastSnap); } });
 
@@ -1608,6 +1877,7 @@ if(USER_VIEW){
   });
 }
 loadFilters();   // F5 복원: 저장된 필터를 첫 렌더 전에 되살린다(pin 복원과 짝)
+applyTab();      // 저장된 탭도 첫 렌더 전에 반영(스냅샷 도착까지 엉뚱한 탭 깜빡임 방지)
 tick(); loop();
 </script>
 </body>
